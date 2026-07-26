@@ -63,13 +63,15 @@ def load_config(path: str | Path) -> dict[str, Any]:
         "log_interval",
         "validation_interval",
         "checkpoint_interval",
-        "max_wall_time_hours",
     )
     for key in positive_td3_values:
         if float(td3_bc[key]) <= 0:
             raise ValueError(f"td3_bc.{key} must be positive")
     if int(td3_bc["bc_warmup_steps"]) < 0:
         raise ValueError("td3_bc.bc_warmup_steps must be non-negative")
+    max_wall_time_hours = td3_bc.get("max_wall_time_hours")
+    if max_wall_time_hours is not None and float(max_wall_time_hours) <= 0:
+        raise ValueError("td3_bc.max_wall_time_hours must be null or positive")
     if not 0.0 <= float(td3_bc["discount"]) <= 1.0:
         raise ValueError("td3_bc.discount must be in [0,1]")
     if not 0.0 < float(td3_bc["tau"]) <= 1.0:

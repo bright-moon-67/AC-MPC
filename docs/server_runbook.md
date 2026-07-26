@@ -132,8 +132,9 @@ scripts/run_td3_bc_detached.sh \
   0 cuda 500000 256
 ```
 
-The launcher resumes `last.pt`. Configuration also stops at five hours, so the
-first reached limit wins. Monitor:
+The launcher resumes `last.pt` and has no default wall-time cutoff. It runs
+until the requested gradient-step target is reached or the user stops it.
+Monitor:
 
 ```bash
 tail -f runs/antmaze_umaze_td3_bc/seed_0/console.log

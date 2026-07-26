@@ -507,10 +507,15 @@ def main() -> None:
         if args.environment_evaluation_timeout_seconds is not None
         else td3_config["environment_evaluation_timeout_seconds"]
     )
-    max_wall_time_hours = float(
+    configured_max_wall_time = (
         args.max_wall_time_hours
         if args.max_wall_time_hours is not None
-        else td3_config["max_wall_time_hours"]
+        else td3_config.get("max_wall_time_hours")
+    )
+    max_wall_time_hours = (
+        None
+        if configured_max_wall_time is None
+        else float(configured_max_wall_time)
     )
     for name, value in {
         "gradient_steps": gradient_steps,
@@ -521,8 +526,10 @@ def main() -> None:
     }.items():
         if value < 1:
             raise ValueError(f"{name} must be positive")
-    if bc_warmup_steps < 0 or max_wall_time_hours <= 0:
-        raise ValueError("bc_warmup_steps must be non-negative and wall time positive")
+    if bc_warmup_steps < 0:
+        raise ValueError("bc_warmup_steps must be non-negative")
+    if max_wall_time_hours is not None and max_wall_time_hours <= 0:
+        raise ValueError("max_wall_time_hours must be positive when provided")
     if environment_evaluation_interval < 0:
         raise ValueError("environment_evaluation_interval must be non-negative")
     if environment_evaluation_episodes < 1:
@@ -714,7 +721,10 @@ def main() -> None:
     try:
         while gradient_step < gradient_steps:
             elapsed = elapsed_before + time.monotonic() - started
-            if elapsed >= max_wall_time_hours * 3600.0:
+            if (
+                max_wall_time_hours is not None
+                and elapsed >= max_wall_time_hours * 3600.0
+            ):
                 stop_reason = "max_wall_time"
                 break
             gradient_step += 1

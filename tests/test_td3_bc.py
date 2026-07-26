@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from antmaze_ac.config import load_config
 from antmaze_ac.koopman.model import DeepKoopman
 from antmaze_ac.rl.ac_koopman_policy import KoopmanLQRPolicy
 from antmaze_ac.rl.cost_actor import CostActor
@@ -121,6 +122,12 @@ def test_environment_evaluation_schedule_includes_near_initial_policy():
     assert environment_evaluation_due(2500, 2500)
     assert not environment_evaluation_due(2499, 2500)
     assert not environment_evaluation_due(2500, 0)
+
+
+def test_rl_config_has_no_default_wall_time_limit():
+    config = load_config("configs/antmaze_umaze.yaml")
+    assert config["td3_bc"]["max_wall_time_hours"] is None
+    assert "max_wall_time_hours" not in config["ppo"]
 
 
 def test_periodic_environment_evaluation_writes_paths_and_trend(

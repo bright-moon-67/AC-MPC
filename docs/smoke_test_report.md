@@ -50,7 +50,8 @@ zero-success episodes are not formal learning results.
   one complete legacy 700-step episode, a lightweight policy snapshot,
   per-step JSON/PNG/NPZ, periodic `history.jsonl`, and the wall-clock
   `trend.png` were all generated.
-- That one-episode integration smoke took approximately 16.67 seconds, with
+- The retained one-episode integration preview took approximately 17.07
+  seconds, with
   zero DARE retry/fallback and closed-loop spectral radius approximately
   `0.998231465`.
 
@@ -67,8 +68,10 @@ zero-success episodes are not formal learning results.
 - Python compile check: passed.
 - All shell launchers: `bash -n` passed.
 - YAML/config and schema/action support assertions: passed.
+- Verified Koopman retains its prompt-required five-hour cap while TD3+BC,
+  Actor-Critic PPO, and Delta-PPO have no default wall-time cutoff.
 - Python package dependency check: no broken requirements.
-- Test suite: **37 passed in 5.97 seconds** using
+- Test suite: **38 passed in 6.04 seconds** using
   `python -m pytest -q`.
 
 Formal offline training, long PPO training, five seeds, and 100-episode model

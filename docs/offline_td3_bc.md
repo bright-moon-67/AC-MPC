@@ -101,7 +101,7 @@ time. Step labels are printed beside each point. Per-step JSON/PNG/NPZ files
 are retained as key diagnostic nodes. Evaluation uses the same fixed episode
 seeds at every checkpoint, so trajectory changes are directly comparable.
 Its duration is recorded separately and excluded from `updates_per_second`,
-while remaining part of the five-hour process wall-time budget.
+while remaining visible in total process wall time.
 
 Override the cost/precision tradeoff from the command line:
 
@@ -115,6 +115,11 @@ python scripts/train_td3_bc.py ... \
 Set `--environment-evaluation-interval 0` only for interface smoke tests. A
 failed simulator subprocess is recorded with its error and does not discard
 the offline training state.
+
+Formal TD3+BC has no wall-time limit and runs until `gradient_steps` is
+reached. `--max-wall-time-hours` remains an optional positive override for
+smoke tests or explicitly budgeted exploratory runs. PPO and Delta-PPO are
+likewise controlled by `total_timesteps`, not a five-hour cutoff.
 
 Evaluate the deterministic offline policy on the original legacy environment:
 

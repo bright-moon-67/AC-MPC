@@ -114,8 +114,8 @@ td3_bc:
   policy_frequency: 2
   alpha: 2.5
   bc_weight: 1.0
-  # RTX 4060 measured ~0.37 updates/s: 2000 steps gives a substantial BC
-  # initialization while leaving most of a 5-hour run for the TD3 objective.
+  # RTX 4060 measured ~0.37 updates/s: 2000 steps provides a substantial BC
+  # initialization before introducing the TD3 objective.
   bc_warmup_steps: 2000
   max_delta_action: 2.0
   reward_scale: 1.0
@@ -132,7 +132,9 @@ td3_bc:
   environment_evaluation_plot_paths: 5
   environment_evaluation_device: same
   environment_evaluation_timeout_seconds: 1800
-  max_wall_time_hours: 5.0
+  # RL is step-limited rather than wall-time-limited. A positive CLI override
+  # remains available for smoke tests and temporary budgets.
+  max_wall_time_hours: null
 
 shaping:
   enabled: false

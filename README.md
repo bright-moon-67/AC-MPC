@@ -255,6 +255,10 @@ gradient-step 节点有轻量策略 checkpoint、JSON、路径 PNG/NPZ；
 `trend.png` 汇总 success rate、目标进度和最小目标距离。训练 smoke 可用
 `--environment-evaluation-interval 0` 显式关闭该阶段。
 
+RL 训练没有默认 5 小时墙钟上限：TD3+BC 运行到 `gradient_steps`，PPO 和
+Delta-PPO 运行到 `total_timesteps`。`--max-wall-time-hours` 只作为 TD3+BC
+smoke 或明确预算实验的可选覆盖。Koopman 的 5 小时限制仍按 prompt 保留。
+
 feed-forward PPO 训练强制 `gain_update_interval=1`。interval 2/5/10 的
 gain-hold 是有显式 controller state 的评估/latency 选项，不在普通 PPO
 minibatch 中缓存旧增益。
