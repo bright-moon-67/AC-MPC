@@ -1,4 +1,4 @@
-# Smoke test report — 2026-07-26
+# Smoke test report — 2026-07-27
 
 These checks validate interfaces and numerical health only. Short runs and
 zero-success episodes are not formal learning results.
@@ -35,8 +35,20 @@ zero-success episodes are not formal learning results.
 - Real CUDA training passed at batch sizes 16 and 256.
 - Checkpoint save and resume reproduced steps 1, 2, 3 without duplicate
   history.
-- A 10-step batch-256 profile reached approximately 0.688 updates/s after
-  removing per-step GPU synchronization.
+- Explicit and implicit DARE produced matching `P/K` and `A/B/Q/R` gradients;
+  affine `q/r` gradients and implicit gradcheck passed.
+- Deferred training diagnostics returned a NaN spectral placeholder while
+  preserving finite convergence/residual checks. Offline validation and the
+  gain-hold environment controller restored a finite spectral radius below 1
+  and then restored deferred mode.
+- A same-seed 10-step batch-256 CUDA comparison improved the step 2–10
+  interval from 0.692 to 1.046 updates/s (about 1.51x), and total runtime from
+  about 16.0 to 11.4 seconds.
+- The optimized checkpoint resumed from step 10 through step 12 with both
+  DARE modes preserved. A legacy-mode checkpoint was rejected under mismatched
+  optimized resume settings as intended.
+- A two-step CUDA run produced offline W&B history, status/sync metadata,
+  critic-only and actor-update metrics, validation, and all checkpoint types.
 - Validation BC MSE moved from 1.3294 to 1.3220 in the 10-step interface
   smoke; this is not a convergence claim.
 - DARE retry/fallback remained 0 / 0.
@@ -71,7 +83,7 @@ zero-success episodes are not formal learning results.
 - Verified Koopman retains its prompt-required five-hour cap while TD3+BC,
   Actor-Critic PPO, and Delta-PPO have no default wall-time cutoff.
 - Python package dependency check: no broken requirements.
-- Test suite: **38 passed in 6.04 seconds** using
+- Test suite: **43 passed in 5.77 seconds** using
   `python -m pytest -q`.
 
 Formal offline training, long PPO training, five seeds, and 100-episode model

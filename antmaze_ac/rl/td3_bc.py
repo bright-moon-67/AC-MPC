@@ -337,7 +337,11 @@ def offline_validation_metrics(
 ) -> dict[str, float]:
     policy.eval()
     critic.eval()
-    output = policy(batch.state)
+    # Training may defer the O(batch * n^3) eigendecomposition. Validation is
+    # deliberately infrequent and restores the full closed-loop stability
+    # check, then the context manager restores the hot-path setting.
+    with policy.full_dare_diagnostics():
+        output = policy(batch.state)
     q_value_1, q_value_2 = critic(batch.state, output.mean)
     return {
         "behavior_cloning_loss": float(

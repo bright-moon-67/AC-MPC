@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Iterator
 
 import torch
 from torch import nn
@@ -54,6 +56,8 @@ class KoopmanLQRPolicy(nn.Module):
         fallback_control_cost: float = 1.0,
         fallback_delta_limit: float = 1.0,
         mean_action_limit: float | None = None,
+        implicit_dare_backward: bool = False,
+        training_dare_spectral_radius_diagnostics: bool = True,
     ) -> None:
         super().__init__()
         if state_mean.shape != (koopman.state_dim,) or state_std.shape != (koopman.state_dim,):
@@ -95,6 +99,10 @@ class KoopmanLQRPolicy(nn.Module):
             # subspace as C, checked once above.
             "check_detectable": False,
             "fail_on_nonconvergence": fail_on_nonconvergence,
+            "compute_closed_loop_spectral_radius": bool(
+                training_dare_spectral_radius_diagnostics
+            ),
+            "implicit_backward": bool(implicit_dare_backward),
         }
         self.retry_dare_kwargs = {
             **self.dare_kwargs,
@@ -151,6 +159,10 @@ class KoopmanLQRPolicy(nn.Module):
                 "tolerance": max(float(dare_tolerance), 1e-10),
                 "max_iterations": max(int(retry_max_iterations), 1000),
                 "fail_on_nonconvergence": True,
+                # Construction verifies that the stateless fallback is
+                # genuinely stabilizing, independent of the training hot path.
+                "compute_closed_loop_spectral_radius": True,
+                "implicit_backward": False,
             },
         )
         self.register_buffer("fallback_gain", safe_lqr.gain.detach().clone())
@@ -163,6 +175,31 @@ class KoopmanLQRPolicy(nn.Module):
             "fallback_condition_number",
             safe_lqr.dare.condition_number.detach().clone(),
         )
+
+    @property
+    def implicit_dare_backward(self) -> bool:
+        return bool(self.dare_kwargs["implicit_backward"])
+
+    @property
+    def training_dare_spectral_radius_diagnostics(self) -> bool:
+        return bool(
+            self.dare_kwargs["compute_closed_loop_spectral_radius"]
+        )
+
+    @contextmanager
+    def full_dare_diagnostics(self) -> Iterator[None]:
+        """Temporarily enable the expensive closed-loop eigenvalue check."""
+
+        key = "compute_closed_loop_spectral_radius"
+        primary_setting = self.dare_kwargs[key]
+        retry_setting = self.retry_dare_kwargs[key]
+        self.dare_kwargs[key] = True
+        self.retry_dare_kwargs[key] = True
+        try:
+            yield
+        finally:
+            self.dare_kwargs[key] = primary_setting
+            self.retry_dare_kwargs[key] = retry_setting
 
     @staticmethod
     def _batch_valid(lqr: AffineLQRResult) -> torch.Tensor:
@@ -396,7 +433,10 @@ class GainHoldController:
         normalized = self.policy.normalize(observation)
         self.last_gain_recomputed = False
         if self.gain is None or self.phase % self.interval == 0:
-            output = self.policy(observation)
+            # Environment evaluation is infrequent and must retain the full
+            # stability diagnostic even when training defers batched eigvals.
+            with self.policy.full_dare_diagnostics():
+                output = self.policy(observation)
             self.last_lqr = output.lqr
             self.last_solver_retry = bool(torch.any(output.solver_retry_used))
             self.last_solver_fallback = bool(torch.any(output.solver_fallback_used))

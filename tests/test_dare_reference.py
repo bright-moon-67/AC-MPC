@@ -35,6 +35,26 @@ def test_batch_matches_individual():
         torch.testing.assert_close(batched.gain[index], individual.gain)
 
 
+def test_spectral_radius_can_be_deferred_without_skipping_residual_checks():
+    A, B, Q, R = system()
+    result = solve_dare(
+        A,
+        B,
+        Q,
+        R,
+        tolerance=1e-11,
+        max_iterations=5000,
+        jitter=0.0,
+        compute_closed_loop_spectral_radius=False,
+    )
+    assert bool(result.converged)
+    assert torch.isfinite(result.P).all()
+    assert torch.isfinite(result.gain).all()
+    assert torch.isfinite(result.relative_residual)
+    assert result.relative_residual < 1e-8
+    assert torch.isnan(result.closed_loop_spectral_radius)
+
+
 def test_near_unit_float32_system_is_promoted_and_stabilized():
     torch.manual_seed(9)
     A = torch.diag(torch.tensor([1.003, 1.001, 0.999, 0.97], dtype=torch.float32))

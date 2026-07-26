@@ -65,6 +65,25 @@ scripts/run_actor_single_detached.sh \
 - 若 GPU DARE 已很快而 MuJoCo stepping 成为新瓶颈，再考虑进程式异步环境。
   先测再改，因为多进程 MuJoCo 会增加初始化、IPC 和可复现性成本。
 
+## TD3+BC 的 DARE 热路径
+
+TD3+BC 的 batch=256 actor 更新原先还会对 256 个闭环矩阵逐个执行 FP64
+`eigvals`，并让 autograd 保留整个 SDA 迭代图。当前正式配置改为：
+
+- 前向仍用 FP64 structured doubling；
+- 反向通过闭环 Lyapunov 方程做隐式求导；
+- 训练 update 跳过谱分解，但继续检查收敛、相对残差、条件数和有限值；
+- offline validation、fallback 和真实环境评估恢复完整谱半径检查。
+
+RTX 4060 Laptop 同种子、batch=256 的 10-step 对照中，step 2–10 的训练区间
+从约 0.692 提升到 1.046 updates/s（约 1.51x），包含首尾完整 validation
+的总耗时从约 16.0 s 降到 11.4 s。两次运行的 loss、梯度范数、
+retry/fallback 指标一致，验证谱半径均约 0.99824。正式 5090 配置使用
+500k updates、batch 256、每 5,000 步 validation/checkpoint、每 25,000
+步 5-episode legacy 评估。参考服务器短基准约为 6.5 updates/s，正式运行
+计入采样、日志和周期评估后预计约 4–6 updates/s，即约 24–28 小时；
+迁移后仍应以目标机器实测吞吐为准。
+
 ## 轨迹诊断
 
 `evaluate_actor.py --plot-paths N` 会保存：

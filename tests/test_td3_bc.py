@@ -7,7 +7,7 @@ import torch
 
 from antmaze_ac.config import load_config
 from antmaze_ac.koopman.model import DeepKoopman
-from antmaze_ac.rl.ac_koopman_policy import KoopmanLQRPolicy
+from antmaze_ac.rl.ac_koopman_policy import GainHoldController, KoopmanLQRPolicy
 from antmaze_ac.rl.cost_actor import CostActor
 from antmaze_ac.rl.critic import Critic
 from antmaze_ac.rl.td3_bc import (
@@ -23,7 +23,11 @@ from scripts.train_td3_bc import (
 )
 
 
-def make_system():
+def make_system(
+    *,
+    implicit_dare_backward: bool = False,
+    training_dare_spectral_radius_diagnostics: bool = True,
+):
     torch.manual_seed(9)
     state_dim, action_dim = 3, 1
     koopman = DeepKoopman(state_dim, action_dim, lift_dim=1, hidden_dims=(4,))
@@ -45,6 +49,10 @@ def make_system():
         dare_tolerance=1e-8,
         dare_max_iterations=100,
         mean_action_limit=2.0,
+        implicit_dare_backward=implicit_dare_backward,
+        training_dare_spectral_radius_diagnostics=(
+            training_dare_spectral_radius_diagnostics
+        ),
     )
     policy.requires_grad_(False)
     policy.actor.requires_grad_(True)
@@ -117,6 +125,50 @@ def test_td3_bc_update_preserves_dare_actor_and_action_support():
     assert validation["dare_fallback_fraction"] == 0.0
 
 
+def test_td3_optimized_dare_modes_update_actor_and_restore_full_validation():
+    policy, critic, trainer = make_system(
+        implicit_dare_backward=True,
+        training_dare_spectral_radius_diagnostics=False,
+    )
+    batch = OfflineTransitionBatch(
+        state=torch.randn(8, 3),
+        action=torch.empty(8, 1).uniform_(-2.0, 2.0),
+        next_state=torch.randn(8, 3),
+        reward=torch.zeros(8),
+        done=torch.zeros(8),
+    )
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in policy.actor.named_parameters()
+    }
+    metrics = trainer.update(batch, gradient_step=2)
+    assert metrics["actor_updated"] == 1
+    assert any(
+        not torch.equal(before[name], parameter)
+        for name, parameter in policy.actor.named_parameters()
+    )
+
+    hot_path_output = policy(batch.state)
+    assert torch.isnan(
+        hot_path_output.lqr.dare.closed_loop_spectral_radius
+    ).all()
+    validation = offline_validation_metrics(policy, critic, batch)
+    assert validation["closed_loop_spectral_radius_max"] < 1.0
+    assert not policy.training_dare_spectral_radius_diagnostics
+    restored_hot_path_output = policy(batch.state)
+    assert torch.isnan(
+        restored_hot_path_output.lqr.dare.closed_loop_spectral_radius
+    ).all()
+    controller = GainHoldController(policy)
+    controller.act(batch.state[0])
+    assert controller.last_lqr is not None
+    assert torch.isfinite(
+        controller.last_lqr.dare.closed_loop_spectral_radius
+    ).all()
+    assert controller.last_lqr.dare.closed_loop_spectral_radius < 1.0
+    assert not policy.training_dare_spectral_radius_diagnostics
+
+
 def test_environment_evaluation_schedule_includes_near_initial_policy():
     assert environment_evaluation_due(1, 2500)
     assert environment_evaluation_due(2500, 2500)
@@ -127,6 +179,13 @@ def test_environment_evaluation_schedule_includes_near_initial_policy():
 def test_rl_config_has_no_default_wall_time_limit():
     config = load_config("configs/antmaze_umaze.yaml")
     assert config["td3_bc"]["max_wall_time_hours"] is None
+    assert config["td3_bc"]["implicit_dare_backward"] is True
+    assert (
+        config["td3_bc"]["training_dare_spectral_radius_diagnostics"]
+        is False
+    )
+    assert config["td3_bc"]["validation_interval"] == 5000
+    assert config["td3_bc"]["environment_evaluation_interval"] == 25000
     assert "max_wall_time_hours" not in config["ppo"]
 
 

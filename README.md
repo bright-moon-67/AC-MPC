@@ -236,7 +236,7 @@ scripts/run_td3_bc_detached.sh \
   runs/antmaze_umaze_fulla_formal/koopman/best_validation.pt \
   runs/antmaze_umaze_td3_bc/seed_0 0 cuda 500000 256
 
-# 默认第 1 步及之后每 2500 步做 5 个固定 seed 的真实 legacy episode；
+# 默认第 1 步及之后每 25000 步做 5 个固定 seed 的真实 legacy episode；
 # 每个节点保存路径，trend.png 按训练墙钟时间持续更新
 
 # 评估 TD3+BC，并保存前 10 个 episode 路径
@@ -254,6 +254,11 @@ TD3+BC 的训练期真实评估保存在输出目录的 `periodic_evaluation/`�
 gradient-step 节点有轻量策略 checkpoint、JSON、路径 PNG/NPZ；
 `trend.png` 汇总 success rate、目标进度和最小目标距离。训练 smoke 可用
 `--environment-evaluation-interval 0` 显式关闭该阶段。
+
+正式 TD3+BC 默认保持 FP64 SDA/仿射求解/残差验证，启用隐式 Lyapunov
+backward，并只在训练热路径跳过逐样本闭环特征值分解；offline validation、
+fallback 初始化和真实环境评估仍做完整谱半径检查。两个模式写入 checkpoint，
+resume 时强制一致。W&B 默认离线记录。
 
 RL 训练没有默认 5 小时墙钟上限：TD3+BC 运行到 `gradient_steps`，PPO 和
 Delta-PPO 运行到 `total_timesteps`。`--max-wall-time-hours` 只作为 TD3+BC
@@ -287,11 +292,12 @@ scripts/run_legacy.sh python scripts/benchmark_inference.py \
   --backend legacy
 ```
 
-当前单元/集成测试为 35 passed，覆盖 wrapper、episode 数据边界、schema-v1
+当前单元/集成测试为 43 passed，覆盖 wrapper、episode 数据边界、schema-v1
 兼容读取、动作重构、
 K=20 Koopman rollout/backward、SDA 与 SciPy reference、near-unit-circle
-float32 case、PBH/detectability、non-convergence 两种模式、DARE gradcheck、
-affine linear cost、actor 梯度、固定无状态 fallback、gain-hold、PPO smoke
+float32 case、PBH/detectability、non-convergence 两种模式、
+显式/隐式 DARE P/K 与 A/B/Q/R 梯度对照、DARE gradcheck、
+affine q/r 梯度、actor 梯度、固定无状态 fallback、gain-hold、PPO smoke
 、TD3+BC twin-Q/BC 更新以及正式训练/评估守护流程的 checkpoint 完整性检查。
 
 正式 benchmark 必须重新测 encoder、actor、DARE、feedback 和 total 的

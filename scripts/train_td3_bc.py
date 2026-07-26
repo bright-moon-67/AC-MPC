@@ -44,6 +44,71 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def initialize_wandb(
+    config: dict[str, Any],
+    output: Path,
+    seed: int,
+    requested_mode: str | None,
+):
+    """Start a persistent-ID, offline-by-default TD3+BC tracking run."""
+
+    tracking = config.get("tracking", {})
+    if tracking.get("provider") != "wandb":
+        return None
+    try:
+        import wandb
+    except ImportError as error:
+        raise ImportError(
+            "Install the 'tracking' extra to enable required W&B logging"
+        ) from error
+
+    mode = requested_mode or tracking.get("mode", "offline")
+    if mode == "auto":
+        try:
+            mode = "online" if bool(wandb.Api(timeout=5).api_key) else "offline"
+        except Exception:
+            mode = "offline"
+    if mode not in {"online", "offline", "disabled"}:
+        raise ValueError(f"Unsupported W&B mode {mode!r}")
+    run_id_path = output / "wandb_run_id.txt"
+    run_id = (
+        run_id_path.read_text(encoding="utf-8").strip()
+        if run_id_path.exists()
+        else wandb.util.generate_id()
+    )
+    run = wandb.init(
+        project=tracking["project"],
+        entity=tracking.get("entity"),
+        name=f"antmaze-umaze-td3-bc-seed{seed}",
+        id=run_id,
+        resume="allow",
+        mode=mode,
+        dir=str(output),
+        config=config,
+        job_type="td3-bc-training",
+        tags=["antmaze-umaze-v2", "td3-bc", "koopman-lqr", "formal"],
+    )
+    run_id_path.write_text(run.id + "\n", encoding="utf-8")
+    tracking_status = {
+        "provider": "wandb",
+        "mode": mode,
+        "run_id": run.id,
+        "run_name": run.name,
+        "project": tracking["project"],
+        "url": run.url,
+        "sync_command": (
+            None
+            if mode == "online"
+            else f"wandb sync {Path(run.dir).resolve().parent}"
+        ),
+    }
+    (output / "wandb_status.json").write_text(
+        json.dumps(tracking_status, indent=2),
+        encoding="utf-8",
+    )
+    return run
+
+
 def finite_mean(
     values: list[torch.Tensor | float | int | None],
 ) -> float | None:
@@ -426,6 +491,24 @@ def main() -> None:
     parser.add_argument("--validation-interval", type=int, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument(
+        "--implicit-dare-backward",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use the FP64 implicit Lyapunov backward for DARE. "
+            "Defaults to td3_bc.implicit_dare_backward."
+        ),
+    )
+    parser.add_argument(
+        "--full-dare-diagnostics-every-step",
+        action="store_true",
+        help=(
+            "Compute batched closed-loop eigenvalues on every update. "
+            "Offline validation, fallback construction, and environment "
+            "evaluation always retain this diagnostic."
+        ),
+    )
+    parser.add_argument(
         "--environment-evaluation-interval",
         type=int,
         default=None,
@@ -440,6 +523,12 @@ def main() -> None:
         default=None,
     )
     parser.add_argument("--max-wall-time-hours", type=float, default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["auto", "online", "offline", "disabled"],
+        default=None,
+        help="Override tracking.mode; the formal config defaults to offline.",
+    )
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
 
@@ -479,6 +568,15 @@ def main() -> None:
         args.checkpoint_interval
         if args.checkpoint_interval is not None
         else td3_config["checkpoint_interval"]
+    )
+    implicit_dare_backward = bool(
+        td3_config["implicit_dare_backward"]
+        if args.implicit_dare_backward is None
+        else args.implicit_dare_backward
+    )
+    training_dare_spectral_radius_diagnostics = bool(
+        args.full_dare_diagnostics_every_step
+        or td3_config["training_dare_spectral_radius_diagnostics"]
     )
     environment_evaluation_interval = int(
         args.environment_evaluation_interval
@@ -556,6 +654,10 @@ def main() -> None:
         args.koopman_checkpoint,
         device,
         mean_action_limit=max_delta_action,
+        implicit_dare_backward=implicit_dare_backward,
+        training_dare_spectral_radius_diagnostics=(
+            training_dare_spectral_radius_diagnostics
+        ),
     )
     if train_data.state.shape[1] != policy.koopman.state_dim:
         raise ValueError("Offline state dimension does not match Koopman checkpoint")
@@ -614,6 +716,10 @@ def main() -> None:
         raise FileExistsError(
             f"{history_path} already exists; use a new output or --resume"
         )
+    (output / "resolved_config.json").write_text(
+        json.dumps(config, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     expected_koopman_sha = sha256(args.koopman_checkpoint)
     gradient_step = 0
@@ -627,6 +733,31 @@ def main() -> None:
             raise ValueError("Resume checkpoint references a different Koopman model")
         if int(payload["seed"]) != seed:
             raise ValueError("Resume seed does not match --seed")
+        saved_runtime = payload.get("runtime", {})
+        saved_implicit_dare_backward = bool(
+            saved_runtime.get("implicit_dare_backward", False)
+        )
+        saved_training_spectral_diagnostics = bool(
+            saved_runtime.get(
+                "training_dare_spectral_radius_diagnostics",
+                True,
+            )
+        )
+        if saved_implicit_dare_backward != implicit_dare_backward:
+            raise ValueError(
+                "Resume checkpoint implicit DARE backward mode does not match "
+                "the requested run. Use --implicit-dare-backward or "
+                "--no-implicit-dare-backward to match the checkpoint."
+            )
+        if (
+            saved_training_spectral_diagnostics
+            != training_dare_spectral_radius_diagnostics
+        ):
+            raise ValueError(
+                "Resume checkpoint training DARE spectral diagnostic mode "
+                "does not match the requested run. Legacy checkpoints require "
+                "--full-dare-diagnostics-every-step."
+            )
         policy.load_state_dict(payload["policy"])
         target_policy.actor.load_state_dict(payload["target_actor"])
         critic.load_state_dict(payload["critic"])
@@ -650,6 +781,7 @@ def main() -> None:
             gradient_step,
         )
 
+    wandb_run = initialize_wandb(config, output, seed, args.wandb_mode)
     validation_batch = sample_transition_batch(
         validation_data,
         int(td3_config["validation_batch_size"]),
@@ -680,6 +812,10 @@ def main() -> None:
         "bc_warmup_steps": bc_warmup_steps,
         "max_delta_action": max_delta_action,
         "max_wall_time_hours": max_wall_time_hours,
+        "implicit_dare_backward": implicit_dare_backward,
+        "training_dare_spectral_radius_diagnostics": (
+            training_dare_spectral_radius_diagnostics
+        ),
         "dataset_schema_version": 2,
         "environment_evaluation_interval": environment_evaluation_interval,
         "environment_evaluation_episodes": environment_evaluation_episodes,
@@ -821,6 +957,34 @@ def main() -> None:
                 }
                 with history_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(row, sort_keys=True) + "\n")
+                if wandb_run is not None:
+                    wandb_metrics = {
+                        "elapsed_seconds": elapsed,
+                        "updates_per_second": row["updates_per_second"],
+                        "environment_evaluation_seconds_total": (
+                            environment_evaluation_seconds_total
+                        ),
+                        **{
+                            f"train/{key}": value
+                            for key, value in row["train"].items()
+                        },
+                    }
+                    if validation is not None:
+                        wandb_metrics.update(
+                            {
+                                f"validation/{key}": value
+                                for key, value in validation.items()
+                            }
+                        )
+                    if environment_evaluation is not None:
+                        wandb_metrics.update(
+                            {
+                                f"environment/{key}": value
+                                for key, value in environment_evaluation.items()
+                                if isinstance(value, (int, float))
+                            }
+                        )
+                    wandb_run.log(wandb_metrics, step=gradient_step)
                 print(json.dumps(row, sort_keys=True), flush=True)
                 interval_metrics = {}
                 interval_started = time.perf_counter()
@@ -859,6 +1023,9 @@ def main() -> None:
             "emergency_checkpoint_sha256": sha256(output / "emergency.pt"),
         }
         status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+        if wandb_run is not None:
+            wandb_run.summary.update(status)
+            wandb_run.finish(exit_code=1)
         raise
 
     elapsed = elapsed_before + time.monotonic() - started
@@ -883,8 +1050,34 @@ def main() -> None:
         "last_checkpoint_sha256": sha256(output / "last.pt"),
         "koopman_checkpoint_sha256": expected_koopman_sha,
         "device": str(device),
+        "implicit_dare_backward": implicit_dare_backward,
+        "training_dare_spectral_radius_diagnostics": (
+            training_dare_spectral_radius_diagnostics
+        ),
     }
     status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    if wandb_run is not None:
+        wandb_run.summary.update(status)
+        if config["tracking"].get("log_checkpoint_artifact", True):
+            artifact = __import__("wandb").Artifact(
+                name=f"antmaze-umaze-td3-bc-seed{seed}-checkpoints",
+                type="model",
+                metadata=status,
+            )
+            artifact_paths = [
+                output / "last.pt",
+                output / "best_bc_validation.pt",
+                output / "training_status.json",
+                output / "resolved_config.json",
+            ]
+            for artifact_path in artifact_paths:
+                if artifact_path.exists():
+                    artifact.add_file(
+                        str(artifact_path),
+                        name=artifact_path.name,
+                    )
+            wandb_run.log_artifact(artifact)
+        wandb_run.finish()
     print(json.dumps(status, indent=2), flush=True)
 
 

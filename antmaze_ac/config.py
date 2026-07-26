@@ -69,6 +69,12 @@ def load_config(path: str | Path) -> dict[str, Any]:
             raise ValueError(f"td3_bc.{key} must be positive")
     if int(td3_bc["bc_warmup_steps"]) < 0:
         raise ValueError("td3_bc.bc_warmup_steps must be non-negative")
+    for key in (
+        "implicit_dare_backward",
+        "training_dare_spectral_radius_diagnostics",
+    ):
+        if not isinstance(td3_bc[key], bool):
+            raise ValueError(f"td3_bc.{key} must be boolean")
     max_wall_time_hours = td3_bc.get("max_wall_time_hours")
     if max_wall_time_hours is not None and float(max_wall_time_hours) <= 0:
         raise ValueError("td3_bc.max_wall_time_hours must be null or positive")

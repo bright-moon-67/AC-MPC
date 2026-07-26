@@ -121,13 +121,17 @@ td3_bc:
   reward_scale: 1.0
   reward_bias: 0.0
   max_grad_norm: 1.0
-  log_interval: 50
-  validation_interval: 500
-  checkpoint_interval: 1000
-  # Pause offline updates about once per local training hour and evaluate a
-  # frozen snapshot in the original D4RL/Gym 0.23 simulator. Step 1 provides
-  # the near-initial baseline. Set the interval to 0 for interface-only smoke.
-  environment_evaluation_interval: 2500
+  # Keep all Riccati numerics in FP64, but use the algebraically equivalent
+  # Lyapunov implicit gradient and defer batched eigvals from the hot path.
+  # Full spectral checks remain enabled for validation/fallback/env rollouts.
+  implicit_dare_backward: true
+  training_dare_spectral_radius_diagnostics: false
+  log_interval: 100
+  validation_interval: 5000
+  checkpoint_interval: 5000
+  # This cadence targets the formal 500k-step 5090 run. Step 1 still records
+  # the near-initial simulator baseline. Use 0 for interface-only smoke tests.
+  environment_evaluation_interval: 25000
   environment_evaluation_episodes: 5
   environment_evaluation_plot_paths: 5
   environment_evaluation_device: same

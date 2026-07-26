@@ -112,6 +112,176 @@ def dare_residual(A: torch.Tensor, B: torch.Tensor, Q: torch.Tensor, R: torch.Te
     return residual[0] if single else residual
 
 
+def _structured_doubling_solution(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Q: torch.Tensor,
+    regularized_r: torch.Tensor,
+    *,
+    tolerance: float,
+    max_iterations: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return the FP64 SDA value Hessian without choosing a backward mode."""
+
+    batch, n = A.shape[0], A.shape[-1]
+    identity_n = torch.eye(
+        n,
+        dtype=A.dtype,
+        device=A.device,
+    ).expand(batch, n, n)
+    doubling_a = A
+    doubling_g = B @ torch.linalg.solve(regularized_r, B.mT)
+    P = 0.5 * (Q + Q.mT)
+    converged = torch.zeros(batch, dtype=torch.bool, device=A.device)
+    iterations = 0
+    for iterations in range(1, max_iterations + 1):
+        h_g_system = identity_n + P @ doubling_g
+        g_h_system = identity_n + doubling_g @ P
+        next_a = doubling_a @ torch.linalg.solve(g_h_system, doubling_a)
+        next_g = (
+            doubling_g
+            + doubling_a
+            @ doubling_g
+            @ torch.linalg.solve(h_g_system, doubling_a.mT)
+        )
+        next_p = (
+            P
+            + doubling_a.mT
+            @ torch.linalg.solve(h_g_system, P @ doubling_a)
+        )
+        next_g = 0.5 * (next_g + next_g.mT)
+        next_p = 0.5 * (next_p + next_p.mT)
+        difference = torch.linalg.matrix_norm(
+            next_p - P,
+            ord="fro",
+            dim=(-2, -1),
+        )
+        scale = 1.0 + torch.linalg.matrix_norm(
+            next_p,
+            ord="fro",
+            dim=(-2, -1),
+        )
+        converged = difference <= tolerance * scale
+        doubling_a = next_a
+        doubling_g = next_g
+        P = next_p
+        if bool(torch.all(converged)):
+            break
+    return P, converged, iterations
+
+
+def _solve_discrete_lyapunov_doubling(
+    closed_loop: torch.Tensor,
+    forcing: torch.Tensor,
+    *,
+    tolerance: float = 1e-12,
+    max_iterations: int = 100,
+) -> torch.Tensor:
+    """Solve ``X - A X A' = forcing`` by quadratic doubling."""
+
+    transition = closed_loop
+    solution = 0.5 * (forcing + forcing.mT)
+    converged = torch.zeros(
+        solution.shape[0],
+        dtype=torch.bool,
+        device=solution.device,
+    )
+    for _ in range(max_iterations):
+        next_solution = (
+            solution + transition @ solution @ transition.mT
+        )
+        next_solution = 0.5 * (next_solution + next_solution.mT)
+        difference = torch.linalg.matrix_norm(
+            next_solution - solution,
+            ord="fro",
+            dim=(-2, -1),
+        )
+        scale = 1.0 + torch.linalg.matrix_norm(
+            next_solution,
+            ord="fro",
+            dim=(-2, -1),
+        )
+        converged = difference <= tolerance * scale
+        solution = next_solution
+        transition = transition @ transition
+        if bool(torch.all(converged)):
+            break
+    if not bool(torch.all(converged)):
+        failed = torch.nonzero(~converged, as_tuple=False).flatten().tolist()
+        raise RuntimeError(
+            "Implicit DARE Lyapunov backward did not converge for batch "
+            f"indices {failed}"
+        )
+    if not torch.isfinite(solution).all():
+        raise FloatingPointError("Implicit DARE Lyapunov backward produced NaN or Inf")
+    return solution
+
+
+class _ImplicitDARE(torch.autograd.Function):
+    """Implicit sensitivity of the stabilizing DARE solution."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        Q: torch.Tensor,
+        R: torch.Tensor,
+        tolerance: float,
+        max_iterations: int,
+        jitter: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, m = A.shape[0], B.shape[-1]
+        identity_r = torch.eye(
+            m,
+            dtype=A.dtype,
+            device=A.device,
+        ).expand(batch, m, m)
+        regularized_r = R + float(jitter) * identity_r
+        P, converged, iterations = _structured_doubling_solution(
+            A,
+            B,
+            Q,
+            regularized_r,
+            tolerance=float(tolerance),
+            max_iterations=int(max_iterations),
+        )
+        bt_p = B.mT @ P
+        gain = torch.linalg.solve(regularized_r + bt_p @ B, bt_p @ A)
+        ctx.save_for_backward(A, B, P, gain)
+        iteration_tensor = torch.tensor(
+            iterations,
+            dtype=torch.int64,
+            device=A.device,
+        )
+        ctx.mark_non_differentiable(converged, iteration_tensor)
+        return P, converged, iteration_tensor
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_P: torch.Tensor | None,
+        _grad_converged: torch.Tensor | None,
+        _grad_iterations: torch.Tensor | None,
+    ):
+        if grad_P is None:
+            return (None,) * 7
+        A, B, P, gain = ctx.saved_tensors
+        closed_loop = A - B @ gain
+        symmetric_grad = 0.5 * (grad_P + grad_P.mT)
+        adjoint = _solve_discrete_lyapunov_doubling(
+            closed_loop,
+            symmetric_grad,
+        )
+        symmetric_adjoint = adjoint + adjoint.mT
+        direct_transition_gradient = P @ closed_loop @ symmetric_adjoint
+        grad_A = direct_transition_gradient
+        grad_B = -direct_transition_gradient @ gain.mT
+        grad_Q = 0.5 * (adjoint + adjoint.mT)
+        grad_R = gain @ grad_Q @ gain.mT
+        return grad_A, grad_B, grad_Q, grad_R, None, None, None
+
+
 def solve_dare(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -124,6 +294,8 @@ def solve_dare(
     check_stabilizable: bool = True,
     check_detectable: bool = True,
     fail_on_nonconvergence: bool = True,
+    compute_closed_loop_spectral_radius: bool = True,
+    implicit_backward: bool = False,
 ) -> DAREResult:
     """Solve batched DARE with differentiable structured doubling.
 
@@ -162,42 +334,31 @@ def solve_dare(
     Q = Q.to(work_dtype)
     R = R.to(work_dtype)
     batch = A.shape[0]
-    identity_n = torch.eye(n, dtype=work_dtype, device=A.device).expand(batch, n, n)
     identity_r = torch.eye(m, dtype=work_dtype, device=A.device).expand(batch, m, m)
     regularized_r = R + float(jitter) * identity_r
 
-    # SDA initialization for
-    # P = Q + A' P A - A' P B (R + B' P B)^-1 B' P A.
-    doubling_a = A
-    doubling_g = B @ torch.linalg.solve(regularized_r, B.mT)
-    P = 0.5 * (Q + Q.mT)
-    converged = torch.zeros(A.shape[0], dtype=torch.bool, device=A.device)
-    iterations = 0
-    for iterations in range(1, max_iterations + 1):
-        h_g_system = identity_n + P @ doubling_g
-        g_h_system = identity_n + doubling_g @ P
-        next_a = doubling_a @ torch.linalg.solve(g_h_system, doubling_a)
-        next_g = (
-            doubling_g
-            + doubling_a
-            @ doubling_g
-            @ torch.linalg.solve(h_g_system, doubling_a.mT)
+    if implicit_backward and torch.is_grad_enabled() and any(
+        matrix.requires_grad for matrix in (A, B, Q, R)
+    ):
+        P, converged, iteration_tensor = _ImplicitDARE.apply(
+            A,
+            B,
+            Q,
+            R,
+            float(tolerance),
+            int(max_iterations),
+            float(jitter),
         )
-        next_p = (
-            P
-            + doubling_a.mT
-            @ torch.linalg.solve(h_g_system, P @ doubling_a)
+        iterations = int(iteration_tensor.item())
+    else:
+        P, converged, iterations = _structured_doubling_solution(
+            A,
+            B,
+            Q,
+            regularized_r,
+            tolerance=float(tolerance),
+            max_iterations=int(max_iterations),
         )
-        next_g = 0.5 * (next_g + next_g.mT)
-        next_p = 0.5 * (next_p + next_p.mT)
-        difference = torch.linalg.matrix_norm(next_p - P, ord="fro", dim=(-2, -1))
-        scale = 1.0 + torch.linalg.matrix_norm(next_p, ord="fro", dim=(-2, -1))
-        converged = difference <= tolerance * scale
-        doubling_a = next_a
-        doubling_g = next_g
-        P = next_p
-        if bool(torch.all(converged)):
-            break
 
     bt_p = B.mT @ P
     system = regularized_r + bt_p @ B
@@ -208,17 +369,30 @@ def solve_dare(
         1.0 + torch.linalg.matrix_norm(P, ord="fro", dim=(-2, -1))
     )
     condition = torch.linalg.cond(system)
-    spectral_radius = torch.max(torch.abs(torch.linalg.eigvals(closed_loop)), dim=-1).values.real
+    if compute_closed_loop_spectral_radius:
+        spectral_radius = torch.max(
+            torch.abs(torch.linalg.eigvals(closed_loop)),
+            dim=-1,
+        ).values.real
+    else:
+        spectral_radius = torch.full(
+            (batch,),
+            float("nan"),
+            dtype=work_dtype,
+            device=A.device,
+        )
+    finite_values = (
+        P,
+        gain,
+        residual,
+        relative_residual,
+        condition,
+    )
+    if compute_closed_loop_spectral_radius:
+        finite_values = (*finite_values, spectral_radius)
     finite = all(
         torch.isfinite(value).all()
-        for value in (
-            P,
-            gain,
-            residual,
-            relative_residual,
-            condition,
-            spectral_radius,
-        )
+        for value in finite_values
     )
     if not finite:
         raise FloatingPointError("DARE produced NaN or Inf")
@@ -229,17 +403,21 @@ def solve_dare(
             f"residuals={residual.detach().cpu().tolist()}"
         )
     validation_tolerance = max(100.0 * float(tolerance), 1e-8)
-    valid_solution = (relative_residual <= validation_tolerance) & (
-        spectral_radius < 1.0
-    )
+    valid_solution = relative_residual <= validation_tolerance
+    if compute_closed_loop_spectral_radius:
+        valid_solution = valid_solution & (spectral_radius < 1.0)
     if fail_on_nonconvergence and not bool(torch.all(valid_solution)):
         failed = torch.nonzero(~valid_solution, as_tuple=False).flatten().tolist()
         raise RuntimeError(
             "DARE returned a non-stabilizing or inaccurate solution for batch "
             f"indices {failed}; relative_residuals="
-            f"{relative_residual.detach().cpu().tolist()}, "
-            "closed_loop_spectral_radius="
-            f"{spectral_radius.detach().cpu().tolist()}"
+            f"{relative_residual.detach().cpu().tolist()}"
+            + (
+                ", closed_loop_spectral_radius="
+                f"{spectral_radius.detach().cpu().tolist()}"
+                if compute_closed_loop_spectral_radius
+                else ""
+            )
         )
     converged = converged & valid_solution
 

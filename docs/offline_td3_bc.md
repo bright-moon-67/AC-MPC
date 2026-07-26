@@ -59,6 +59,32 @@ action-value objective. Koopman parameters stay frozen. Target actor and
 critics use Polyak averaging. The default training reward remains the original
 D4RL sparse `0/1` reward (`reward_scale=1`, `reward_bias=0`).
 
+## FP64 DARE training optimization
+
+The forward Riccati solution remains FP64 structured doubling. The affine
+steady-state solve, residual checks, and implicit Lyapunov backward are also
+FP64; this must not be replaced by a pure-FP32 DARE because the learned
+closed-loop modes lie close to the unit circle.
+
+The formal TD3+BC path enables an algebraically equivalent implicit DARE
+backward and omits batched closed-loop `eigvals` only from the per-update hot
+path. SDA convergence, relative residual, condition number, and finite `P/K`
+checks remain active. Offline validation, fixed fallback construction, and
+legacy environment evaluation temporarily restore the full spectral-radius
+diagnostic. Therefore training rows report a finite spectral radius whenever
+validation runs, while an unevaluated hot-path result intentionally carries a
+NaN placeholder for that field.
+
+Both solver modes are stored in checkpoint `runtime` metadata and must match
+on resume. Checkpoints made before these fields existed are treated as
+explicit-backward/full-diagnostics runs. To resume one intentionally, use:
+
+```bash
+python scripts/train_td3_bc.py ... \
+  --no-implicit-dare-backward \
+  --full-dare-diagnostics-every-step
+```
+
 ## Commands
 
 Rebuild the canonical dataset:
@@ -81,7 +107,7 @@ scripts/run_td3_bc_detached.sh \
 ```
 
 During training, the default configuration pauses updates at gradient step 1
-and every 2,500 steps, evaluates five fixed-seed episodes in the original
+and every 25,000 steps, evaluates five fixed-seed episodes in the original
 legacy `antmaze-umaze-v2` simulator, and plots all five paths. This produces:
 
 ```text
@@ -120,6 +146,8 @@ Formal TD3+BC has no wall-time limit and runs until `gradient_steps` is
 reached. `--max-wall-time-hours` remains an optional positive override for
 smoke tests or explicitly budgeted exploratory runs. PPO and Delta-PPO are
 likewise controlled by `total_timesteps`, not a five-hour cutoff.
+W&B uses offline mode by default; `wandb_status.json` records the persistent
+run ID and exact later `wandb sync` command.
 
 Evaluate the deterministic offline policy on the original legacy environment:
 
@@ -148,6 +176,8 @@ fresh. TD3 action-value critics are not copied into PPO's state-value critic.
 `last.pt`, `best_bc_validation.pt`, and periodic
 `recovery_step_XXXXXXXX.pt` contain actor/target actor, twin critics/targets,
 both optimizers, RNG state, Koopman checkpoint hash, config, and dataset schema.
+The runtime metadata also records the implicit-backward and training spectral
+diagnostic modes.
 `history.jsonl` records TD3 losses, BC error, Q values, gradient norms, DARE
 retry/fallback rates, relative residual, closed-loop spectral radius, and
 throughput. Rows at rollout-evaluation steps also contain the compact legacy

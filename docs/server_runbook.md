@@ -116,7 +116,7 @@ python scripts/train_td3_bc.py \
   --device cuda --seed 0 --gradient-steps 4 --batch-size 256 \
   --bc-warmup-steps 4 --log-interval 2 --validation-interval 4 \
   --checkpoint-interval 4 --max-wall-time-hours 0.1 \
-  --environment-evaluation-interval 0
+  --environment-evaluation-interval 0 --wandb-mode offline
 ```
 
 The TD3+BC smoke must report finite losses, zero DARE fallback, a relative
@@ -142,8 +142,10 @@ tail -f runs/antmaze_umaze_td3_bc/seed_0/history.jsonl
 nvidia-smi
 ```
 
-The default run evaluates five fixed-seed legacy episodes at step 1 and every
-2,500 gradient steps. Inspect the continuously updated convergence plot and
+The default 5090-oriented run uses batch 256, implicit FP64 DARE backward,
+logs every 100 steps, validates/checkpoints every 5,000 steps, and evaluates
+five fixed-seed legacy episodes at step 1 and every 25,000 gradient steps.
+W&B is offline by default. Inspect the continuously updated convergence plot and
 the newest per-step paths:
 
 ```bash
@@ -155,7 +157,14 @@ The key files are `trend.png`, `history.jsonl`, and
 rollouts run, avoiding policy/checkpoint races.
 
 Before increasing batch size, profile 256/512/1024. The differentiable DARE
-uses float64 internally, so server FP64 throughput matters.
+keeps FP64 structured doubling, residual validation, affine solve, and
+Lyapunov backward. Do not switch it to pure FP32: the near-unit-circle Koopman
+system can appear converged while returning an inaccurate, unstable gain.
+
+An optimized checkpoint cannot silently resume with the old solver mode.
+Legacy checkpoints require both `--no-implicit-dare-backward` and
+`--full-dare-diagnostics-every-step`; start a fresh output to use the new
+default modes.
 
 Evaluate without online fine-tuning:
 

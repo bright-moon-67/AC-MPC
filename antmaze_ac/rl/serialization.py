@@ -17,6 +17,8 @@ def make_policy(
     device: torch.device,
     *,
     mean_action_limit: float | None = None,
+    implicit_dare_backward: bool = False,
+    training_dare_spectral_radius_diagnostics: bool = True,
 ) -> tuple[KoopmanLQRPolicy, dict]:
     koopman, payload = load_checkpoint(koopman_checkpoint, map_location=device)
     config = payload["config"]
@@ -70,6 +72,10 @@ def make_policy(
         fallback_control_cost=control["dare_fallback_control_cost"],
         fallback_delta_limit=control["dare_fallback_delta_limit"],
         mean_action_limit=mean_action_limit,
+        implicit_dare_backward=implicit_dare_backward,
+        training_dare_spectral_radius_diagnostics=(
+            training_dare_spectral_radius_diagnostics
+        ),
     ).to(device)
     return policy, payload
 
@@ -111,10 +117,22 @@ def load_td3_bc_checkpoint(path: str | Path, device: torch.device):
     if td3_payload.get("method") != "td3_bc_koopman_lqr":
         raise ValueError(f"{path} is not a Koopman-LQR TD3+BC checkpoint")
     action_limit = float(td3_payload["runtime"]["max_delta_action"])
+    runtime = td3_payload.get("runtime", {})
     policy, koopman_payload = make_policy(
         td3_payload["koopman_checkpoint"],
         device,
         mean_action_limit=action_limit,
+        # Checkpoints predating the optimized solver used explicit backward and
+        # full eigvalue diagnostics, so those are the compatibility defaults.
+        implicit_dare_backward=bool(
+            runtime.get("implicit_dare_backward", False)
+        ),
+        training_dare_spectral_radius_diagnostics=bool(
+            runtime.get(
+                "training_dare_spectral_radius_diagnostics",
+                True,
+            )
+        ),
     )
     policy.load_state_dict(td3_payload["policy"])
     return policy, td3_payload, koopman_payload
