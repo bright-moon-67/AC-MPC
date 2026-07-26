@@ -115,7 +115,8 @@ python scripts/train_td3_bc.py \
   --output /tmp/acmpc_td3_bc_smoke \
   --device cuda --seed 0 --gradient-steps 4 --batch-size 256 \
   --bc-warmup-steps 4 --log-interval 2 --validation-interval 4 \
-  --checkpoint-interval 4 --max-wall-time-hours 0.1
+  --checkpoint-interval 4 --max-wall-time-hours 0.1 \
+  --environment-evaluation-interval 0
 ```
 
 The TD3+BC smoke must report finite losses, zero DARE fallback, a relative
@@ -139,6 +140,18 @@ tail -f runs/antmaze_umaze_td3_bc/seed_0/console.log
 tail -f runs/antmaze_umaze_td3_bc/seed_0/history.jsonl
 nvidia-smi
 ```
+
+The default run evaluates five fixed-seed legacy episodes at step 1 and every
+2,500 gradient steps. Inspect the continuously updated convergence plot and
+the newest per-step paths:
+
+```bash
+ls -lt runs/antmaze_umaze_td3_bc/seed_0/periodic_evaluation/
+```
+
+The key files are `trend.png`, `history.jsonl`, and
+`step_XXXXXXXX_legacy_5ep_paths.png`. The offline updater pauses while these
+rollouts run, avoiding policy/checkpoint races.
 
 Before increasing batch size, profile 256/512/1024. The differentiable DARE
 uses float64 internally, so server FP64 throughput matters.

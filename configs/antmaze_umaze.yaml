@@ -124,6 +124,14 @@ td3_bc:
   log_interval: 50
   validation_interval: 500
   checkpoint_interval: 1000
+  # Pause offline updates about once per local training hour and evaluate a
+  # frozen snapshot in the original D4RL/Gym 0.23 simulator. Step 1 provides
+  # the near-initial baseline. Set the interval to 0 for interface-only smoke.
+  environment_evaluation_interval: 2500
+  environment_evaluation_episodes: 5
+  environment_evaluation_plot_paths: 5
+  environment_evaluation_device: same
+  environment_evaluation_timeout_seconds: 1800
   max_wall_time_hours: 5.0
 
 shaping:

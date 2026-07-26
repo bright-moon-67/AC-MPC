@@ -42,7 +42,8 @@ u_t=\operatorname{clip}(u_{t-1}+v_t,-1,1).
 开发/Koopman 环境：
 
 ```bash
-conda run -n soft_vla_cuda python -m pip install -e '.[test,d4rl-data,modern-env,tracking]'
+conda run -n soft_vla_cuda python -m pip install -e \
+  '.[test,d4rl-data,modern-env,plots,tracking]'
 conda run -n soft_vla_cuda pytest -q
 ```
 
@@ -235,6 +236,9 @@ scripts/run_td3_bc_detached.sh \
   runs/antmaze_umaze_fulla_formal/koopman/best_validation.pt \
   runs/antmaze_umaze_td3_bc/seed_0 0 cuda 500000 256
 
+# 默认第 1 步及之后每 2500 步做 5 个固定 seed 的真实 legacy episode；
+# 每个节点保存路径，trend.png 按训练墙钟时间持续更新
+
 # 评估 TD3+BC，并保存前 10 个 episode 路径
 scripts/run_legacy.sh python scripts/evaluate_actor.py \
   --checkpoint runs/antmaze_umaze_td3_bc/seed_0/last.pt \
@@ -245,6 +249,11 @@ scripts/run_legacy.sh python scripts/evaluate_actor.py \
 scripts/run_evaluation_formal_detached.sh actor \
   runs/antmaze_umaze_formal/actor 1 cuda
 ```
+
+TD3+BC 的训练期真实评估保存在输出目录的 `periodic_evaluation/`：每个
+gradient-step 节点有轻量策略 checkpoint、JSON、路径 PNG/NPZ；
+`trend.png` 汇总 success rate、目标进度和最小目标距离。训练 smoke 可用
+`--environment-evaluation-interval 0` 显式关闭该阶段。
 
 feed-forward PPO 训练强制 `gain_update_interval=1`。interval 2/5/10 的
 gain-hold 是有显式 controller state 的评估/latency 选项，不在普通 PPO

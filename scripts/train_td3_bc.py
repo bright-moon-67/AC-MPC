@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import random
+import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -87,6 +90,327 @@ def reconcile_history(path: Path, gradient_step: int) -> int:
     return removed
 
 
+def environment_evaluation_due(gradient_step: int, interval: int) -> bool:
+    """Evaluate the near-initial policy and then at fixed gradient-step intervals."""
+
+    return interval > 0 and (
+        gradient_step == 1 or gradient_step % interval == 0
+    )
+
+
+def lightweight_evaluation_checkpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fields required to reconstruct and evaluate the TD3+BC policy."""
+
+    retained = (
+        "format_version",
+        "method",
+        "policy",
+        "koopman_checkpoint",
+        "koopman_checkpoint_sha256",
+        "gradient_step",
+        "seed",
+        "elapsed_seconds",
+        "best_validation_behavior_cloning_loss",
+        "config",
+        "runtime",
+    )
+    return {key: payload[key] for key in retained}
+
+
+def _write_jsonl_replacing_step(path: Path, row: dict[str, Any]) -> None:
+    step = int(row["gradient_step"])
+    retained: list[dict[str, Any]] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            previous = json.loads(line)
+            if int(previous["gradient_step"]) < step:
+                retained.append(previous)
+    retained.append(row)
+    temporary = path.with_suffix(".jsonl.tmp")
+    temporary.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in retained),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def save_environment_evaluation_trend(history_path: Path, output: Path) -> None:
+    """Update the compact wall-clock convergence plot from successful evaluations."""
+
+    if not history_path.exists():
+        return
+    rows = [
+        json.loads(line)
+        for line in history_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rows = [row for row in rows if row.get("status") == "ok"]
+    if not rows:
+        if output.exists():
+            output.unlink()
+        return
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    elapsed_hours = np.asarray(
+        [float(row["training_elapsed_seconds"]) / 3600.0 for row in rows]
+    )
+    success = np.asarray([float(row["success_mean"]) for row in rows])
+    progress = np.asarray(
+        [float(row["goal_progress_fraction_mean"]) for row in rows]
+    )
+    minimum_distance = np.asarray(
+        [float(row["minimum_goal_distance_mean"]) for row in rows]
+    )
+
+    figure, axes = plt.subplots(1, 3, figsize=(13.2, 3.8), squeeze=False)
+    panels = (
+        (success, "success rate", (0.0, 1.02)),
+        (progress, "goal progress fraction", None),
+        (minimum_distance, "minimum goal distance", None),
+    )
+    for axis, (values, title, limits) in zip(axes.flat, panels):
+        axis.plot(elapsed_hours, values, marker="o", linewidth=1.6)
+        for x_value, y_value, row in zip(elapsed_hours, values, rows):
+            axis.annotate(
+                f"{int(row['gradient_step'])}",
+                (x_value, y_value),
+                xytext=(3, 4),
+                textcoords="offset points",
+                fontsize=7,
+            )
+        axis.set_xlabel("training process wall time (hours)")
+        axis.set_title(title)
+        axis.grid(alpha=0.25)
+        axis.set_xlim(0.0, max(0.1, float(elapsed_hours.max()) * 1.05))
+        if limits is not None:
+            axis.set_ylim(*limits)
+    figure.suptitle("Periodic legacy AntMaze evaluation (labels = gradient step)")
+    figure.tight_layout()
+    temporary = output.with_name(f"{output.stem}.tmp{output.suffix}")
+    figure.savefig(temporary, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+    temporary.replace(output)
+
+
+def reconcile_environment_evaluations(
+    evaluation_root: Path,
+    gradient_step: int,
+) -> int:
+    """Remove evaluation artifacts newer than a resume checkpoint."""
+
+    if not evaluation_root.exists():
+        return 0
+    step_pattern = re.compile(r"^step_(\d{8})(?:_|\.pt)")
+    removed = 0
+    for path in evaluation_root.iterdir():
+        match = step_pattern.match(path.name)
+        if match is not None and int(match.group(1)) > gradient_step:
+            path.unlink()
+            removed += 1
+
+    history_path = evaluation_root / "history.jsonl"
+    if history_path.exists():
+        retained = []
+        for line in history_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if int(row["gradient_step"]) <= gradient_step:
+                retained.append(row)
+        history_path.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in retained),
+            encoding="utf-8",
+        )
+        trend_path = evaluation_root / "trend.png"
+        if trend_path.exists() and not retained:
+            trend_path.unlink()
+        elif retained:
+            save_environment_evaluation_trend(history_path, trend_path)
+    return removed
+
+
+def run_environment_evaluation(
+    *,
+    project_root: Path,
+    output: Path,
+    gradient_step: int,
+    training_elapsed_seconds: float,
+    checkpoint_payload: dict[str, Any],
+    episodes: int,
+    plot_paths: int,
+    device: str,
+    seed_offset: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Synchronously evaluate a frozen snapshot in the original legacy simulator."""
+
+    evaluation_root = output / "periodic_evaluation"
+    evaluation_root.mkdir(parents=True, exist_ok=True)
+    prefix = f"step_{gradient_step:08d}_legacy_{episodes}ep"
+    checkpoint_path = evaluation_root / f"step_{gradient_step:08d}.pt"
+    report_path = evaluation_root / f"{prefix}.json"
+    plot_path = evaluation_root / f"{prefix}_paths.png"
+    checkpoint_temporary = checkpoint_path.with_suffix(".pt.tmp")
+    torch.save(
+        lightweight_evaluation_checkpoint(checkpoint_payload),
+        checkpoint_temporary,
+    )
+    checkpoint_temporary.replace(checkpoint_path)
+
+    command = [
+        str(project_root / "scripts/run_legacy.sh"),
+        "python",
+        str(project_root / "scripts/evaluate_actor.py"),
+        "--checkpoint",
+        str(checkpoint_path),
+        "--method",
+        "td3_bc",
+        "--episodes",
+        str(episodes),
+        "--backend",
+        "legacy",
+        "--device",
+        device,
+        "--seed-offset",
+        str(seed_offset),
+        "--plot-paths",
+        str(plot_paths),
+        "--path-plot-output",
+        str(plot_path),
+        "--output",
+        str(report_path),
+    ]
+    print(
+        json.dumps(
+            {
+                "event": "periodic_environment_evaluation_started",
+                "gradient_step": gradient_step,
+                "episodes": episodes,
+                "checkpoint": str(checkpoint_path.resolve()),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    started = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        subprocess.run(
+            command,
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report.get("resolved_backend") != "legacy":
+            raise RuntimeError("Periodic evaluation did not use the legacy backend")
+        if int(report.get("episodes", 0)) != episodes:
+            raise RuntimeError("Periodic evaluation episode count mismatch")
+        if report.get("checkpoint_sha256") != sha256(checkpoint_path):
+            raise RuntimeError("Periodic evaluation checkpoint digest mismatch")
+        required_finite = (
+            "success_mean",
+            "return_mean",
+            "d4rl_normalized_score",
+            "goal_progress_fraction_mean",
+            "minimum_goal_distance_mean",
+            "final_goal_distance_mean",
+        )
+        if not all(math.isfinite(float(report[key])) for key in required_finite):
+            raise FloatingPointError("Periodic evaluation contains NaN or Inf")
+        if plot_paths > 0:
+            path_data = plot_path.with_suffix(".npz")
+            if not plot_path.exists() or not path_data.exists():
+                raise FileNotFoundError("Periodic trajectory PNG/NPZ was not created")
+        summary = {
+            "status": "ok",
+            "gradient_step": gradient_step,
+            "training_elapsed_seconds": training_elapsed_seconds,
+            "episodes": episodes,
+            "success_mean": float(report["success_mean"]),
+            "return_mean": float(report["return_mean"]),
+            "d4rl_normalized_score": float(report["d4rl_normalized_score"]),
+            "goal_progress_fraction_mean": float(
+                report["goal_progress_fraction_mean"]
+            ),
+            "minimum_goal_distance_mean": float(
+                report["minimum_goal_distance_mean"]
+            ),
+            "final_goal_distance_mean": float(report["final_goal_distance_mean"]),
+            "dare_failure_count": report["dare_failure_count"],
+            "dare_retry_count": report["dare_retry_count"],
+            "closed_loop_spectral_radius_max": report[
+                "closed_loop_spectral_radius_max"
+            ],
+            "checkpoint": str(checkpoint_path.resolve()),
+            "checkpoint_sha256": report["checkpoint_sha256"],
+            "report": str(report_path.resolve()),
+            "path_plot_png": report.get("path_plot_png"),
+            "path_data_npz": report.get("path_data_npz"),
+        }
+    except (
+        FileNotFoundError,
+        FloatingPointError,
+        json.JSONDecodeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as error:
+        stderr = getattr(error, "stderr", None)
+        summary = {
+            "status": "error",
+            "gradient_step": gradient_step,
+            "training_elapsed_seconds": training_elapsed_seconds,
+            "episodes": episodes,
+            "checkpoint": str(checkpoint_path.resolve()),
+            "checkpoint_sha256": sha256(checkpoint_path),
+            "report": str(report_path.resolve()),
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "stderr_tail": stderr[-4000:] if isinstance(stderr, str) else None,
+        }
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    summary["evaluation_seconds"] = time.perf_counter() - started
+    history_path = evaluation_root / "history.jsonl"
+    _write_jsonl_replacing_step(history_path, summary)
+    save_environment_evaluation_trend(
+        history_path,
+        evaluation_root / "trend.png",
+    )
+    print(
+        json.dumps(
+            {
+                "event": "periodic_environment_evaluation_finished",
+                "gradient_step": gradient_step,
+                "status": summary["status"],
+                "evaluation_seconds": summary["evaluation_seconds"],
+                "success_mean": summary.get("success_mean"),
+                "goal_progress_fraction_mean": summary.get(
+                    "goal_progress_fraction_mean"
+                ),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--koopman-checkpoint", required=True)
@@ -101,10 +425,25 @@ def main() -> None:
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--validation-interval", type=int, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
+    parser.add_argument(
+        "--environment-evaluation-interval",
+        type=int,
+        default=None,
+        help="Gradient-step interval for legacy rollouts; 0 disables them.",
+    )
+    parser.add_argument("--environment-evaluation-episodes", type=int, default=None)
+    parser.add_argument("--environment-evaluation-plot-paths", type=int, default=None)
+    parser.add_argument("--environment-evaluation-device", default=None)
+    parser.add_argument(
+        "--environment-evaluation-timeout-seconds",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--max-wall-time-hours", type=float, default=None)
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
 
+    project_root = Path(__file__).resolve().parents[1]
     config = load_config(args.config)
     td3_config = config["td3_bc"]
     device = resolve_device(args.device)
@@ -141,6 +480,33 @@ def main() -> None:
         if args.checkpoint_interval is not None
         else td3_config["checkpoint_interval"]
     )
+    environment_evaluation_interval = int(
+        args.environment_evaluation_interval
+        if args.environment_evaluation_interval is not None
+        else td3_config["environment_evaluation_interval"]
+    )
+    environment_evaluation_episodes = int(
+        args.environment_evaluation_episodes
+        if args.environment_evaluation_episodes is not None
+        else td3_config["environment_evaluation_episodes"]
+    )
+    environment_evaluation_plot_paths = int(
+        args.environment_evaluation_plot_paths
+        if args.environment_evaluation_plot_paths is not None
+        else td3_config["environment_evaluation_plot_paths"]
+    )
+    environment_evaluation_device = str(
+        args.environment_evaluation_device
+        if args.environment_evaluation_device is not None
+        else td3_config["environment_evaluation_device"]
+    )
+    if environment_evaluation_device == "same":
+        environment_evaluation_device = str(device)
+    environment_evaluation_timeout_seconds = float(
+        args.environment_evaluation_timeout_seconds
+        if args.environment_evaluation_timeout_seconds is not None
+        else td3_config["environment_evaluation_timeout_seconds"]
+    )
     max_wall_time_hours = float(
         args.max_wall_time_hours
         if args.max_wall_time_hours is not None
@@ -157,6 +523,16 @@ def main() -> None:
             raise ValueError(f"{name} must be positive")
     if bc_warmup_steps < 0 or max_wall_time_hours <= 0:
         raise ValueError("bc_warmup_steps must be non-negative and wall time positive")
+    if environment_evaluation_interval < 0:
+        raise ValueError("environment_evaluation_interval must be non-negative")
+    if environment_evaluation_episodes < 1:
+        raise ValueError("environment_evaluation_episodes must be positive")
+    if not 0 <= environment_evaluation_plot_paths <= environment_evaluation_episodes:
+        raise ValueError(
+            "environment_evaluation_plot_paths must be between zero and episodes"
+        )
+    if environment_evaluation_timeout_seconds <= 0:
+        raise ValueError("environment_evaluation_timeout_seconds must be positive")
 
     data_root = Path(args.data)
     train_data = load_npz_dataset(data_root / "train.npz")
@@ -262,6 +638,10 @@ def main() -> None:
         reconcile_history(history_path, gradient_step)
         if status_path.exists():
             status_path.unlink()
+        reconcile_environment_evaluations(
+            output / "periodic_evaluation",
+            gradient_step,
+        )
 
     validation_batch = sample_transition_batch(
         validation_data,
@@ -275,6 +655,17 @@ def main() -> None:
         str,
         list[torch.Tensor | float | int | None],
     ] = {}
+    interval_environment_evaluation_seconds = 0.0
+    environment_evaluation_seconds_total = 0.0
+    periodic_history_path = output / "periodic_evaluation/history.jsonl"
+    if periodic_history_path.exists():
+        environment_evaluation_seconds_total = sum(
+            float(json.loads(line).get("evaluation_seconds", 0.0))
+            for line in periodic_history_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        )
 
     runtime = {
         "gradient_steps": gradient_steps,
@@ -283,6 +674,16 @@ def main() -> None:
         "max_delta_action": max_delta_action,
         "max_wall_time_hours": max_wall_time_hours,
         "dataset_schema_version": 2,
+        "environment_evaluation_interval": environment_evaluation_interval,
+        "environment_evaluation_episodes": environment_evaluation_episodes,
+        "environment_evaluation_plot_paths": environment_evaluation_plot_paths,
+        "environment_evaluation_device": environment_evaluation_device,
+        "environment_evaluation_timeout_seconds": (
+            environment_evaluation_timeout_seconds
+        ),
+        "environment_evaluation_seconds_total": (
+            environment_evaluation_seconds_total
+        ),
     }
 
     def checkpoint_payload(elapsed_seconds: float) -> dict[str, Any]:
@@ -344,15 +745,50 @@ def main() -> None:
                     best_validation_bc = validation_bc
                     is_best = True
 
+            environment_evaluation = None
+            if environment_evaluation_due(
+                gradient_step,
+                environment_evaluation_interval,
+            ):
+                elapsed_at_snapshot = (
+                    elapsed_before + time.monotonic() - started
+                )
+                environment_evaluation = run_environment_evaluation(
+                    project_root=project_root,
+                    output=output,
+                    gradient_step=gradient_step,
+                    training_elapsed_seconds=elapsed_at_snapshot,
+                    checkpoint_payload=checkpoint_payload(elapsed_at_snapshot),
+                    episodes=environment_evaluation_episodes,
+                    plot_paths=environment_evaluation_plot_paths,
+                    device=environment_evaluation_device,
+                    seed_offset=100_000 + seed * 1_000,
+                    timeout_seconds=environment_evaluation_timeout_seconds,
+                )
+                evaluation_seconds = float(
+                    environment_evaluation["evaluation_seconds"]
+                )
+                interval_environment_evaluation_seconds += evaluation_seconds
+                environment_evaluation_seconds_total += evaluation_seconds
+                runtime["environment_evaluation_seconds_total"] = (
+                    environment_evaluation_seconds_total
+                )
+
             should_log = (
                 gradient_step == 1
                 or gradient_step % log_interval == 0
                 or gradient_step == gradient_steps
+                or environment_evaluation is not None
             )
             if should_log:
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
-                interval_seconds = time.perf_counter() - interval_started
+                interval_seconds = max(
+                    time.perf_counter()
+                    - interval_started
+                    - interval_environment_evaluation_seconds,
+                    1e-12,
+                )
                 elapsed = elapsed_before + time.monotonic() - started
                 row = {
                     "method": "td3_bc_koopman_lqr",
@@ -368,12 +804,17 @@ def main() -> None:
                         for key, values in interval_metrics.items()
                     },
                     "validation": validation,
+                    "environment_evaluation": environment_evaluation,
+                    "environment_evaluation_seconds_total": (
+                        environment_evaluation_seconds_total
+                    ),
                 }
                 with history_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(row, sort_keys=True) + "\n")
                 print(json.dumps(row, sort_keys=True), flush=True)
                 interval_metrics = {}
                 interval_started = time.perf_counter()
+                interval_environment_evaluation_seconds = 0.0
 
             should_checkpoint = (
                 gradient_step % checkpoint_interval == 0
@@ -421,6 +862,14 @@ def main() -> None:
         "elapsed_seconds": elapsed,
         "stop_reason": stop_reason,
         "best_validation_behavior_cloning_loss": best_validation_bc,
+        "environment_evaluation_seconds_total": (
+            environment_evaluation_seconds_total
+        ),
+        "environment_evaluation_history": (
+            str(periodic_history_path.resolve())
+            if periodic_history_path.exists()
+            else None
+        ),
         "last_checkpoint_sha256": sha256(output / "last.pt"),
         "koopman_checkpoint_sha256": expected_koopman_sha,
         "device": str(device),

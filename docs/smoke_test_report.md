@@ -46,6 +46,13 @@ zero-success episodes are not formal learning results.
   `0.9982375126594561`.
 - A deterministic legacy 700-step evaluation and trajectory PNG/NPZ
   generation completed.
+- Training-integrated periodic evaluation passed after one real CUDA update:
+  one complete legacy 700-step episode, a lightweight policy snapshot,
+  per-step JSON/PNG/NPZ, periodic `history.jsonl`, and the wall-clock
+  `trend.png` were all generated.
+- That one-episode integration smoke took approximately 16.67 seconds, with
+  zero DARE retry/fallback and closed-loop spectral radius approximately
+  `0.998231465`.
 
 ## PPO paths
 
@@ -61,7 +68,7 @@ zero-success episodes are not formal learning results.
 - All shell launchers: `bash -n` passed.
 - YAML/config and schema/action support assertions: passed.
 - Python package dependency check: no broken requirements.
-- Test suite: **35 passed in 5.19 seconds** using
+- Test suite: **37 passed in 5.97 seconds** using
   `python -m pytest -q`.
 
 Formal offline training, long PPO training, five seeds, and 100-episode model

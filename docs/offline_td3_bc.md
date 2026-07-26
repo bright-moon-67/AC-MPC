@@ -80,6 +80,42 @@ scripts/run_td3_bc_detached.sh \
   0 cuda 500000 256
 ```
 
+During training, the default configuration pauses updates at gradient step 1
+and every 2,500 steps, evaluates five fixed-seed episodes in the original
+legacy `antmaze-umaze-v2` simulator, and plots all five paths. This produces:
+
+```text
+periodic_evaluation/
+  history.jsonl
+  trend.png
+  step_00000001.pt
+  step_00000001_legacy_5ep.json
+  step_00000001_legacy_5ep_paths.png
+  step_00000001_legacy_5ep_paths.npz
+  ...
+```
+
+`trend.png` is overwritten atomically after each evaluation and shows success
+rate, goal-progress fraction, and minimum goal distance against process wall
+time. Step labels are printed beside each point. Per-step JSON/PNG/NPZ files
+are retained as key diagnostic nodes. Evaluation uses the same fixed episode
+seeds at every checkpoint, so trajectory changes are directly comparable.
+Its duration is recorded separately and excluded from `updates_per_second`,
+while remaining part of the five-hour process wall-time budget.
+
+Override the cost/precision tradeoff from the command line:
+
+```bash
+python scripts/train_td3_bc.py ... \
+  --environment-evaluation-interval 5000 \
+  --environment-evaluation-episodes 10 \
+  --environment-evaluation-plot-paths 10
+```
+
+Set `--environment-evaluation-interval 0` only for interface smoke tests. A
+failed simulator subprocess is recorded with its error and does not discard
+the offline training state.
+
 Evaluate the deterministic offline policy on the original legacy environment:
 
 ```bash
@@ -109,6 +145,8 @@ fresh. TD3 action-value critics are not copied into PPO's state-value critic.
 both optimizers, RNG state, Koopman checkpoint hash, config, and dataset schema.
 `history.jsonl` records TD3 losses, BC error, Q values, gradient norms, DARE
 retry/fallback rates, relative residual, closed-loop spectral radius, and
-throughput. BC validation error is a supervised diagnostic rather than an
-offline estimate of environment return; formal selection still requires
-fixed-policy legacy evaluation.
+throughput. Rows at rollout-evaluation steps also contain the compact legacy
+evaluation summary and cumulative evaluation overhead. BC validation error is
+a supervised diagnostic rather than an offline estimate of environment
+return; the periodic legacy rollouts provide learning diagnostics, while
+formal model selection still requires the independent 100-episode evaluation.
