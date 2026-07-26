@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "antmaze-koopman-ac"
+version = "0.1.0"
+description = "Incremental-action Deep Koopman and actor-critic LQR for D4RL AntMaze"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {text = "MIT"}
+dependencies = [
+  "numpy>=1.23.5,<3",
+  "PyYAML>=6",
+  "torch>=2.1",
+  "gymnasium>=0.29",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "scipy>=1.11"]
+rl = ["stable-baselines3>=2.3"]
+plots = ["matplotlib>=3.8"]
+d4rl-data = ["h5py>=3.10"]
+modern-env = ["gymnasium-robotics>=1.4", "mujoco>=3.2"]
+tracking = ["wandb>=0.24"]
+
+[tool.setuptools.packages.find]
+include = ["antmaze_ac*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

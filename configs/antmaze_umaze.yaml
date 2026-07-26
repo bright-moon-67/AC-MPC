@@ -1,0 +1,149 @@
+experiment:
+  env_id: antmaze-umaze-v2
+  seed: 42
+  formal_seeds: [0, 1, 2, 3, 4]
+  output_dir: runs/antmaze_umaze
+  expected_observation_dim: 29
+  expected_action_dim: 8
+  references:
+    deep_koopman_commit: fe8b5dabd7de1778f1919be2b88015f13e7a0460
+    deep_koopman_variant: motion_control_training/koopman/experiments/fullA_history_v2
+    acmpc_commit: c59e53aec11c1fffa8b69d99b0ee7879ba7ccb28
+    acmpc_sb3_commit: 152c353863d3b05fb5feed4deb37b952bb4beb7b
+    acmpc_mpc_commit: 63732fa85ab2a151045493c4e67653210ca3d7ff
+
+data:
+  history: 1
+  train_fraction: 0.8
+  validation_fraction: 0.1
+  test_fraction: 0.1
+  normalization_epsilon: 1.0e-6
+
+koopman:
+  architecture: fullA_history_v2_adapted
+  lift_dim: 32
+  K_step: 20
+  encoder_hidden_dims: [256, 256]
+  encoder_activation: silu
+  max_epochs: 1000
+  max_wall_time_hours: 5
+  stop_condition: first_reached
+  batch_size: 4096
+  eval_batch_size: 4096
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  checkpoint_interval: 25
+  rollout_discount: 0.99
+  target_latent_std: 1.0
+  spectral_radius_limit: 1.0
+  loss_weights:
+    linear: 10.0
+    rollout: 1.0
+    stability: 0.01
+    latent_std: 0.1
+    identity: 0.0001
+    controllability_svd: 0.0
+    augmentation: 0.0
+    reconstruction: 1.0
+
+control:
+  gain_update_interval: 1
+  dare_tolerance: 1.0e-7
+  dare_max_iterations: 500
+  dare_jitter: 1.0e-6
+  # Runtime recovery mirrors mpc.pytorch's non-fatal unconverged path while
+  # keeping this feed-forward PPO policy exactly reconstructable.
+  dare_fail_on_nonconvergence: true
+  dare_retry_max_iterations: 1000
+  dare_retry_jitter_multiplier: 100.0
+  dare_fallback_state_cost: 1.0
+  dare_fallback_control_cost: 1.0
+  dare_fallback_delta_limit: 1.0
+  dare_max_fallback_fraction_per_rollout: 0.05
+  dare_max_consecutive_failure_rollouts: 3
+  stage_cost_epsilon: 1.0e-4
+  previous_action_cost_scale: 0.001
+  delta_action_cost_scale: 0.001
+  q_max: 100.0
+  p_max: 10.0
+
+actor:
+  hidden_dims: [512, 512, 512]
+  activation: gelu
+  critic_hidden_dims: [512, 512]
+  critic_activation: gelu
+  log_std_init: 0.0
+
+delta_ppo_baseline:
+  hidden_dims: [512, 512]
+  activation: relu
+  log_std_init: 0.0
+
+ppo:
+  total_timesteps: 1000000
+  rollout_steps: 2048
+  # Local RTX 4060 profile: batched DARE rollout is the dominant speedup.
+  # Keep total transitions/update unchanged; each environment contributes 128.
+  num_envs: 16
+  minibatch_size: 256
+  update_epochs: 10
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  value_coefficient: 0.5
+  entropy_coefficient: 0.0
+  max_grad_norm: 0.5
+  checkpoint_interval_updates: 10
+
+# Independent offline pretraining path. It preserves CostActor -> differentiable
+# DARE -> delta action and can initialize, but does not replace, formal PPO.
+td3_bc:
+  gradient_steps: 500000
+  batch_size: 256
+  validation_batch_size: 1024
+  critic_hidden_dims: [512, 512]
+  critic_activation: relu
+  actor_learning_rate: 0.0003
+  critic_learning_rate: 0.0003
+  discount: 0.99
+  tau: 0.005
+  policy_noise: 0.2
+  noise_clip: 0.5
+  policy_frequency: 2
+  alpha: 2.5
+  bc_weight: 1.0
+  # RTX 4060 measured ~0.37 updates/s: 2000 steps gives a substantial BC
+  # initialization while leaving most of a 5-hour run for the TD3 objective.
+  bc_warmup_steps: 2000
+  max_delta_action: 2.0
+  reward_scale: 1.0
+  reward_bias: 0.0
+  max_grad_norm: 1.0
+  log_interval: 50
+  validation_interval: 500
+  checkpoint_interval: 1000
+  max_wall_time_hours: 5.0
+
+shaping:
+  enabled: false
+  type: potential_shortest_path
+  coefficient: 1.0
+  note: "Independent optional ablation; all reported final metrics use the original sparse reward."
+
+evaluation:
+  rollout_horizons: [1, 5, 10, 20, 25]
+  episodes: 100
+  benchmark_iterations: 1000
+  benchmark_warmup: 50
+  control_period_ms: 50.0
+  gain_update_intervals: [1, 2, 5, 10]
+
+tracking:
+  provider: wandb
+  project: antmaze-koopman-ac
+  entity: null
+  mode: offline
+  run_name: antmaze-umaze-fulla-history-v2-seed42
+  log_checkpoint_artifact: true
