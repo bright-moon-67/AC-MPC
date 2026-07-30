@@ -29,3 +29,8 @@ wandb/
 *.npz
 *.npy
 *.jsonl
+
+# Local research notes and generated reports are never published.
+/docs/
+/private_notes/
+*.private.md
