@@ -74,6 +74,7 @@ def main() -> None:
         args.koopman_checkpoint,
         device,
         mean_action_limit=args.mean_action_limit,
+        policy_observation_dim=62,
     )
     config = koopman_payload["config"]
     if config["control"]["gain_update_interval"] != 1:
@@ -202,6 +203,8 @@ def main() -> None:
             "backend": "manisoft",
             "device": str(device),
             "runtime": {
+                "policy_observation_dim": 62,
+                "goal_error_dim": 3,
                 "num_envs": num_envs,
                 "rollout_steps": rollout_steps,
                 "minibatch_size": minibatch_size,

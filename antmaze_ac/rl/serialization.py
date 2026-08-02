@@ -17,6 +17,7 @@ def make_policy(
     device: torch.device,
     *,
     mean_action_limit: float | None = None,
+    policy_observation_dim: int | None = None,
     implicit_dare_backward: bool = False,
     training_dare_spectral_radius_diagnostics: bool = True,
 ) -> tuple[KoopmanLQRPolicy, dict]:
@@ -38,6 +39,16 @@ def make_policy(
     for key, value in recovery_defaults.items():
         control.setdefault(key, value)
     state_stats = payload["normalizers"]["state"]
+    policy_observation_dim = int(
+        koopman.state_dim
+        if policy_observation_dim is None
+        else policy_observation_dim
+    )
+    if policy_observation_dim < koopman.state_dim:
+        raise ValueError(
+            "policy_observation_dim must be at least the Koopman state dimension"
+        )
+    extra_observation_dim = policy_observation_dim - koopman.state_dim
     actor = CostActor(
         koopman.state_dim,
         koopman.action_dim,
@@ -49,18 +60,25 @@ def make_policy(
         previous_action_cost_scale=control["previous_action_cost_scale"],
         delta_action_cost_scale=control["delta_action_cost_scale"],
         activation=actor_config["activation"],
+        observation_dim=policy_observation_dim,
     )
     critic = Critic(
-        koopman.state_dim,
+        policy_observation_dim,
         actor_config["critic_hidden_dims"],
         actor_config["critic_activation"],
     )
+    state_mean = torch.tensor(state_stats["mean"], dtype=torch.float32)
+    state_std = torch.tensor(state_stats["std"], dtype=torch.float32)
+    if extra_observation_dim:
+        # ManiSoft appends already normalized goal-error features.
+        state_mean = torch.cat((state_mean, torch.zeros(extra_observation_dim)))
+        state_std = torch.cat((state_std, torch.ones(extra_observation_dim)))
     policy = KoopmanLQRPolicy(
         koopman,
         actor,
         critic,
-        torch.tensor(state_stats["mean"], dtype=torch.float32),
-        torch.tensor(state_stats["std"], dtype=torch.float32),
+        state_mean,
+        state_std,
         log_std_init=actor_config["log_std_init"],
         dare_tolerance=control["dare_tolerance"],
         dare_max_iterations=control["dare_max_iterations"],
@@ -82,7 +100,12 @@ def make_policy(
 
 def load_actor_checkpoint(path: str | Path, device: torch.device):
     actor_payload = torch.load(path, map_location=device, weights_only=False)
-    policy, koopman_payload = make_policy(actor_payload["koopman_checkpoint"], device)
+    runtime = actor_payload.get("runtime", {})
+    policy, koopman_payload = make_policy(
+        actor_payload["koopman_checkpoint"],
+        device,
+        policy_observation_dim=runtime.get("policy_observation_dim"),
+    )
     policy.load_state_dict(actor_payload["policy"])
     return policy, actor_payload, koopman_payload
 

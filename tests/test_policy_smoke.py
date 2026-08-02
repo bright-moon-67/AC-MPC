@@ -58,6 +58,42 @@ def test_policy_shapes_and_actor_gradient():
     assert not controller.last_gain_recomputed
 
 
+def test_policy_accepts_goal_features_without_changing_koopman_state():
+    torch.manual_seed(1)
+    koopman = DeepKoopman(3, 1, lift_dim=1, hidden_dims=(4,))
+    with torch.no_grad():
+        koopman.A.copy_(torch.eye(4) * 0.7)
+        koopman.B.fill_(0.2)
+    actor = CostActor(
+        3,
+        1,
+        hidden_dims=(8,),
+        q_max=2.0,
+        p_max=1.0,
+        observation_dim=6,
+    )
+    policy = KoopmanLQRPolicy(
+        koopman,
+        actor,
+        Critic(6, hidden_dims=(8,)),
+        torch.zeros(6),
+        torch.ones(6),
+        dare_tolerance=1e-8,
+        dare_max_iterations=1000,
+    )
+
+    observations = torch.randn(4, 6)
+    q_diag, p = actor(observations)
+    assert q_diag.shape == (4, 4)
+    assert p.shape == (4, 4)
+    output = policy(observations)
+    assert output.mean.shape == (4, 1)
+    assert output.value.shape == (4,)
+    assert GainHoldController(policy, gain_update_interval=2).act(
+        observations[0]
+    ).shape == (1,)
+
+
 def test_policy_uses_reconstructable_fallback_after_failed_retry():
     torch.manual_seed(3)
     koopman = DeepKoopman(3, 1, lift_dim=1, hidden_dims=(4,))

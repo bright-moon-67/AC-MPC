@@ -60,8 +60,14 @@ class KoopmanLQRPolicy(nn.Module):
         training_dare_spectral_radius_diagnostics: bool = True,
     ) -> None:
         super().__init__()
-        if state_mean.shape != (koopman.state_dim,) or state_std.shape != (koopman.state_dim,):
-            raise ValueError("State normalization shape does not match Koopman state dimension")
+        if actor.state_dim != koopman.state_dim:
+            raise ValueError("Actor cost state dimension does not match Koopman state dimension")
+        policy_observation_dim = actor.observation_dim
+        if (
+            state_mean.shape != (policy_observation_dim,)
+            or state_std.shape != (policy_observation_dim,)
+        ):
+            raise ValueError("State normalization shape does not match policy observation dimension")
         self.koopman = koopman.freeze_dynamics()
         self.actor = actor
         self.critic = critic
@@ -343,7 +349,8 @@ class KoopmanLQRPolicy(nn.Module):
         )
         lqr, solver_valid, solver_retry_used = self._solve_with_recovery(cost)
         solver_fallback_used = ~solver_valid
-        lifted = self.koopman.lift(normalized)
+        dynamics_state = normalized[..., : self.koopman.state_dim]
+        lifted = self.koopman.lift(dynamics_state)
         gain = lqr.gain.unsqueeze(0) if lqr.gain.ndim == 2 else lqr.gain
         feedforward = lqr.feedforward.unsqueeze(0) if lqr.feedforward.ndim == 1 else lqr.feedforward
         lifted_for_control = lifted.to(gain.dtype)
@@ -447,7 +454,8 @@ class GainHoldController:
                 self.gain = self.gain[0]
                 self.feedforward = self.feedforward[0]
         assert self.gain is not None and self.feedforward is not None
-        lifted = self.policy.koopman.lift(normalized)
+        dynamics_state = normalized[..., : self.policy.koopman.state_dim]
+        lifted = self.policy.koopman.lift(dynamics_state)
         action = (
             -(self.gain @ lifted.to(self.gain.dtype).unsqueeze(-1)).squeeze(-1)
             - self.feedforward

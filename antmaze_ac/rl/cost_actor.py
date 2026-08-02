@@ -44,15 +44,26 @@ class CostActor(nn.Module):
         previous_action_cost_scale: float = 1e-2,
         delta_action_cost_scale: float = 1e-3,
         activation: str = "gelu",
+        observation_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
+        self.observation_dim = int(
+            self.state_dim if observation_dim is None else observation_dim
+        )
+        if self.observation_dim < self.state_dim:
+            raise ValueError("observation_dim must be at least state_dim")
         self.cost_dim = self.state_dim + self.action_dim
         self.epsilon = float(epsilon)
         self.q_max = float(q_max)
         self.p_max = float(p_max)
-        self.network = _mlp(self.state_dim, hidden_dims, 2 * self.cost_dim, activation)
+        self.network = _mlp(
+            self.observation_dim,
+            hidden_dims,
+            2 * self.cost_dim,
+            activation,
+        )
         final = self.network[-1]
         assert isinstance(final, nn.Linear)
         nn.init.zeros_(final.weight)
