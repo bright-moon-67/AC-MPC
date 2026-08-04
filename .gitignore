@@ -34,3 +34,4 @@ wandb/
 /docs/
 /private_notes/
 *.private.md
+prompt.md

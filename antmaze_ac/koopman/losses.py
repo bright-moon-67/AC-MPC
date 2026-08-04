@@ -73,11 +73,13 @@ def koopman_loss(
     target_latent_std: float = 1.0,
     svd_min_singular_value: float = 0.0,
 ) -> KoopmanLoss:
-    """fullA_history_v2 open-loop loss adapted to prompt history=1.
+    """fullA_history_v2 open-loop loss for supplied state/action windows.
 
     Only the initial true state is lifted for prediction. Future lifted states
     are generated recursively by the full-A linear model, while true future
-    states are encoded solely to construct lifted alignment targets.
+    states are encoded solely to construct lifted alignment targets. History
+    augmentation, when desired, belongs to the caller's state construction;
+    this loss does not append history channels itself.
     """
 
     if states.ndim != 3 or delta_actions.ndim != 3:

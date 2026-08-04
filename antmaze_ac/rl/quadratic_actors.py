@@ -68,7 +68,9 @@ class DirectQuadraticActorOutput:
 class DirectQuadraticActor(nn.Module):
     """State-conditioned quadratic-Q actor with an analytic greedy action.
 
-    The network predicts only ``L_uu``, ``H_uz`` and ``h_u``. It constructs
+    The cost-map network can be conditioned either on the raw observation
+    (the legacy behavior) or on its externally computed Koopman lift. It
+    predicts only ``L_uu``, ``H_uz`` and ``h_u``. It constructs
     ``H_uu=L_uu L_uu' + epsilon I`` and solves an ``action_dim`` system:
 
     ``u* = -H_uu^{-1}(H_uz z + h_u)``.
@@ -86,6 +88,7 @@ class DirectQuadraticActor(nn.Module):
         action_dim: int,
         hidden_dims: Sequence[int] = (256, 256),
         *,
+        conditioning: str = "observation",
         activation: str = "gelu",
         cholesky_epsilon: float = 1e-4,
         cholesky_off_diagonal_scale: float = 1.0,
@@ -104,10 +107,15 @@ class DirectQuadraticActor(nn.Module):
             raise ValueError("Quadratic output scales must be positive")
         if max_action is not None and max_action <= 0:
             raise ValueError("max_action must be positive when provided")
+        if conditioning not in {"observation", "lifted"}:
+            raise ValueError(
+                "conditioning must be either 'observation' or 'lifted'"
+            )
 
         self.observation_dim = int(observation_dim)
         self.lifted_dim = int(lifted_dim)
         self.action_dim = int(action_dim)
+        self.conditioning = conditioning
         self.cholesky_epsilon = float(cholesky_epsilon)
         self.cholesky_off_diagonal_scale = float(
             cholesky_off_diagonal_scale
@@ -122,8 +130,13 @@ class DirectQuadraticActor(nn.Module):
             + self.action_dim * self.lifted_dim
             + self.action_dim
         )
+        head_input_dim = (
+            self.observation_dim
+            if self.conditioning == "observation"
+            else self.lifted_dim
+        )
         self.network = _mlp(
-            self.observation_dim,
+            head_input_dim,
             hidden_dims,
             output_dim,
             activation,
@@ -146,7 +159,12 @@ class DirectQuadraticActor(nn.Module):
             raise ValueError("Wrong lifted-state dimension")
 
         triangular_size = self.action_dim * (self.action_dim + 1) // 2
-        raw = self.network(observation)
+        head_input = (
+            observation
+            if self.conditioning == "observation"
+            else lifted_state
+        )
+        raw = self.network(head_input)
         raw_triangular = raw[..., :triangular_size]
         cross_start = triangular_size
         cross_stop = cross_start + self.action_dim * self.lifted_dim
@@ -203,6 +221,192 @@ class DirectQuadraticActor(nn.Module):
             action=action,
             raw_action=quadratic.action,
             quadratic=quadratic,
+            cholesky_factor=cholesky,
+        )
+
+
+@dataclass
+class MinimalDirectQuadraticActorOutput:
+    """Output of the reduced action-quadratic policy head."""
+
+    action: torch.Tensor
+    raw_action: torch.Tensor
+    action_hessian: torch.Tensor
+    action_linear: torch.Tensor
+    cholesky_factor: torch.Tensor
+
+    @torch.no_grad()
+    def condition_diagnostics(self) -> dict[str, torch.Tensor]:
+        """Return per-sample SPD/conditioning diagnostics on demand.
+
+        Eigenvalues are deliberately not computed in ``forward`` because that
+        would add a comparatively expensive operation to every BC update.
+        """
+
+        eigenvalues = torch.linalg.eigvalsh(self.action_hessian)
+        return {
+            "minimum_eigenvalue": eigenvalues[..., 0],
+            "maximum_eigenvalue": eigenvalues[..., -1],
+            "condition_number": eigenvalues[..., -1] / eigenvalues[..., 0],
+            "trace": self.action_hessian.diagonal(dim1=-2, dim2=-1).sum(-1),
+        }
+
+
+class MinimalDirectQuadraticActor(nn.Module):
+    """Minimal direct-``H`` actor with a unique global Hessian scale.
+
+    A shallow head emits only the lower triangle of ``L_uu`` and the already
+    combined action-linear term ``g_u``.  It therefore has
+
+    ``action_dim * (action_dim + 1) / 2 + action_dim``
+
+    outputs (35 for PandaReach), rather than emitting the unidentifiable full
+    ``H_uz`` block.  The policy is
+
+    ``H_uu = normalize_trace(L_uu L_uu' + epsilon I)`` and
+    ``u* = -H_uu^{-1} g_u``.
+
+    Trace normalization fixes the common scalar freedom
+    ``(c H_uu, c g_u)`` while preserving positive definiteness.  It does not
+    make the remaining matrix shape identifiable from action-only BC, nor
+    does it supply Bellman consistency or closed-loop/OOD guarantees.
+
+    The module uses the lifted tensor exactly as supplied.  The retained
+    PandaReach ``H1-min35-lifted`` route passes direct ``psi(x)``; checkpoint
+    metadata and the saved-run evaluator enforce that coordinate convention.
+    """
+
+    def __init__(
+        self,
+        observation_dim: int,
+        lifted_dim: int,
+        action_dim: int,
+        hidden_dims: Sequence[int] = (128,),
+        *,
+        context_dim: int = 0,
+        conditioning: str = "lifted",
+        activation: str = "gelu",
+        cholesky_epsilon: float = 1e-4,
+        cholesky_off_diagonal_scale: float = 1.0,
+        action_linear_scale: float = 1.0,
+        max_action: float | None = None,
+    ) -> None:
+        super().__init__()
+        if observation_dim < 1 or lifted_dim < 1 or action_dim < 1:
+            raise ValueError("Actor dimensions must be positive")
+        if context_dim < 0:
+            raise ValueError("context_dim must be non-negative")
+        if cholesky_epsilon <= 0:
+            raise ValueError("cholesky_epsilon must be positive")
+        if cholesky_off_diagonal_scale <= 0 or action_linear_scale <= 0:
+            raise ValueError("Quadratic output scales must be positive")
+        if max_action is not None and max_action <= 0:
+            raise ValueError("max_action must be positive when provided")
+        if conditioning not in {"observation", "lifted"}:
+            raise ValueError(
+                "conditioning must be either 'observation' or 'lifted'"
+            )
+
+        self.observation_dim = int(observation_dim)
+        self.lifted_dim = int(lifted_dim)
+        self.action_dim = int(action_dim)
+        self.context_dim = int(context_dim)
+        self.conditioning = conditioning
+        self.cholesky_epsilon = float(cholesky_epsilon)
+        self.cholesky_off_diagonal_scale = float(
+            cholesky_off_diagonal_scale
+        )
+        self.action_linear_scale = float(action_linear_scale)
+        self.max_action = None if max_action is None else float(max_action)
+
+        self.triangular_size = self.action_dim * (self.action_dim + 1) // 2
+        self.output_dim = self.triangular_size + self.action_dim
+        head_input_dim = self.context_dim + (
+            self.observation_dim
+            if self.conditioning == "observation"
+            else self.lifted_dim
+        )
+        self.network = _mlp(
+            head_input_dim,
+            hidden_dims,
+            self.output_dim,
+            activation,
+        )
+        _zero_final_layer(self.network)
+
+        rows, columns = torch.tril_indices(self.action_dim, self.action_dim)
+        self.register_buffer("triangular_rows", rows)
+        self.register_buffer("triangular_columns", columns)
+        self.register_buffer("triangular_diagonal", rows == columns)
+
+    def forward(
+        self,
+        observation: torch.Tensor,
+        lifted_state: torch.Tensor,
+        context: torch.Tensor | None = None,
+    ) -> MinimalDirectQuadraticActorOutput:
+        if observation.shape[-1] != self.observation_dim:
+            raise ValueError("Wrong observation dimension")
+        if lifted_state.shape[-1] != self.lifted_dim:
+            raise ValueError("Wrong lifted-state dimension")
+
+        head_input = (
+            observation
+            if self.conditioning == "observation"
+            else lifted_state
+        )
+        if self.context_dim:
+            if context is None or context.shape[-1] != self.context_dim:
+                raise ValueError("Wrong or missing context dimension")
+            if context.shape[:-1] != head_input.shape[:-1]:
+                raise ValueError("Context batch shape does not match actor input")
+            head_input = torch.cat((head_input, context), dim=-1)
+        elif context is not None:
+            raise ValueError("This actor was constructed without context")
+        raw = self.network(head_input)
+        raw_triangular = raw[..., : self.triangular_size]
+        raw_action_linear = raw[..., self.triangular_size :]
+
+        triangular = (
+            self.cholesky_off_diagonal_scale * torch.tanh(raw_triangular)
+        )
+        diagonal = (
+            F.softplus(raw_triangular[..., self.triangular_diagonal])
+            + self.cholesky_epsilon
+        )
+        triangular = triangular.clone()
+        triangular[..., self.triangular_diagonal] = diagonal
+        cholesky = raw.new_zeros(
+            *raw.shape[:-1], self.action_dim, self.action_dim
+        )
+        cholesky[
+            ..., self.triangular_rows, self.triangular_columns
+        ] = triangular
+
+        identity = torch.eye(
+            self.action_dim, dtype=raw.dtype, device=raw.device
+        )
+        unnormalized_hessian = (
+            cholesky @ cholesky.mT + self.cholesky_epsilon * identity
+        )
+        trace = unnormalized_hessian.diagonal(dim1=-2, dim2=-1).sum(-1)
+        action_hessian = (
+            float(self.action_dim)
+            * unnormalized_hessian
+            / trace[..., None, None]
+        )
+        action_linear = (
+            self.action_linear_scale * torch.tanh(raw_action_linear)
+        )
+        raw_action = -torch.linalg.solve(
+            action_hessian, action_linear.unsqueeze(-1)
+        ).squeeze(-1)
+        action = _smooth_action_bound(raw_action, self.max_action)
+        return MinimalDirectQuadraticActorOutput(
+            action=action,
+            raw_action=raw_action,
+            action_hessian=action_hessian,
+            action_linear=action_linear,
             cholesky_factor=cholesky,
         )
 
