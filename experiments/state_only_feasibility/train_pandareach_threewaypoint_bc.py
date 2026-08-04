@@ -1,4 +1,4 @@
-"""Train and evaluate B0, H1-min and BC-KMPC on PandaReach3."""
+"""Train and evaluate five BC actors on the ordered PandaReach3 task."""
 
 from __future__ import annotations
 
@@ -19,7 +19,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from antmaze_ac.koopman.model import DeepKoopman
 from antmaze_ac.rl.koopman_mpc_actor import KoopmanMPCActor
-from antmaze_ac.rl.quadratic_actors import MinimalDirectQuadraticActor
+from antmaze_ac.rl.quadratic_actors import (
+    LowRankValueActor,
+    MinimalDirectQuadraticActor,
+)
 from experiments.state_only_feasibility.collect_pandareach_threewaypoint import (
     _state_from_observation,
 )
@@ -38,6 +41,7 @@ class BCConfig:
     gradient_clip: float = 1.0
     hidden_dim: int = 128
     b0_hidden_dim: int = 188
+    ab_rank: int = 4
     kmpc_horizon: int = 10
     kmpc_solver_iterations: int = 20
     kmpc_sequence_weight: float = 0.25
@@ -65,6 +69,26 @@ class B0Actor(nn.Module):
         return self.action_limit * torch.tanh(
             self.network(torch.cat((state, context), dim=-1))
         )
+
+
+TASK_CONTEXT_DIM = 12
+WAYPOINT_COUNT = 3
+
+
+def _task_context(data: dict[str, np.ndarray]) -> np.ndarray:
+    """Build [G1,G2,G3, one-hot(active waypoint)] for every transition."""
+
+    episode_waypoints = data["episode_waypoints"][data["episode_id"]]
+    active_index = data["active_waypoint_index"].astype(np.int64)
+    if episode_waypoints.shape[1:] != (WAYPOINT_COUNT, 3):
+        raise ValueError("Expected three XYZ waypoints per episode")
+    if np.any((active_index < 0) | (active_index >= WAYPOINT_COUNT)):
+        raise ValueError("active waypoint index is outside the task range")
+    progress = np.eye(WAYPOINT_COUNT, dtype=np.float32)[active_index]
+    return np.concatenate(
+        (episode_waypoints.reshape(len(episode_waypoints), -1), progress),
+        axis=-1,
+    ).astype(np.float32)
 
 
 def load_koopman(path: Path, device: torch.device) -> tuple[DeepKoopman, dict]:
@@ -117,8 +141,11 @@ def _actor_action(
         # B0 is the raw-state baseline: it deliberately does not use the
         # Koopman lift.  The other routes receive ``lifted`` below.
         return actor(normalized_state, context), None
-    if name == "H1-min":
+    if name in {"H1-min", "H1-min-raw"}:
         return actor(normalized_state, lifted, context).action, None
+    if name == "AB-PQ":
+        output = actor(torch.cat((lifted, context), dim=-1), lifted)
+        return output.action, None
     output = actor(lifted, context)
     return output.action, output.action_sequence
 
@@ -251,12 +278,17 @@ def _train_actor(
 def _normalizers(
     data: dict[str, np.ndarray], train_mask: np.ndarray, checkpoint: dict
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    center = np.asarray(checkpoint["normalizer"]["center"], dtype=np.float32)
-    scale = np.asarray(checkpoint["normalizer"]["scale"], dtype=np.float32)
-    goals = data["active_goal_position"][train_mask].astype(np.float64)
-    goal_center = goals.mean(0).astype(np.float32)
-    goal_scale = np.maximum(goals.std(0), 1e-4).astype(np.float32)
-    return center, scale, goal_center, goal_scale
+    def _cpu_array(value: Any) -> np.ndarray:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value, dtype=np.float32)
+
+    center = _cpu_array(checkpoint["normalizer"]["center"])
+    scale = _cpu_array(checkpoint["normalizer"]["scale"])
+    contexts = _task_context(data)[train_mask].astype(np.float64)
+    context_center = contexts.mean(0).astype(np.float32)
+    context_scale = np.maximum(contexts.std(0), 1e-4).astype(np.float32)
+    return center, scale, context_center, context_scale
 
 
 def closed_loop_evaluation(
@@ -265,8 +297,8 @@ def closed_loop_evaluation(
     koopman: DeepKoopman,
     center: np.ndarray,
     scale: np.ndarray,
-    goal_center: np.ndarray,
-    goal_scale: np.ndarray,
+    context_center: np.ndarray,
+    context_scale: np.ndarray,
     config: BCConfig,
     device: torch.device,
 ) -> dict[str, Any]:
@@ -295,23 +327,31 @@ def closed_loop_evaluation(
             action_count = 0
             for step in range(config.max_episode_steps):
                 physical = _state_from_observation(observation)
-                goal = np.asarray(
-                    observation["extra"]["active_goal"], dtype=np.float32
-                ).reshape(3)
+                waypoints = np.asarray(
+                    observation["extra"]["waypoints"], dtype=np.float32
+                ).reshape(WAYPOINT_COUNT, 3)
+                active_index = int(
+                    np.asarray(
+                        observation["extra"]["active_waypoint_index"]
+                    ).reshape(-1)[0]
+                )
+                context_raw = np.concatenate(
+                    (waypoints.reshape(-1), np.eye(WAYPOINT_COUNT, dtype=np.float32)[active_index])
+                )
                 state_tensor = torch.as_tensor(
                     (physical - center) / scale,
                     dtype=torch.float32,
                     device=device,
                 ).unsqueeze(0)
-                goal_tensor = torch.as_tensor(
-                    (goal - goal_center) / goal_scale,
+                context_tensor = torch.as_tensor(
+                    (context_raw - context_center) / context_scale,
                     dtype=torch.float32,
                     device=device,
                 ).unsqueeze(0)
                 with torch.no_grad():
                     lifted = koopman.lift(state_tensor)
                     action, _ = _actor_action(
-                        name, actor, state_tensor, lifted, goal_tensor
+                        name, actor, state_tensor, lifted, context_tensor
                     )
                 action_rad = action.squeeze(0).cpu().numpy()
                 bound_count += int(
@@ -361,6 +401,7 @@ def train(
     output_dir: Path,
     config: BCConfig,
     device_name: str = "auto",
+    actor_names: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     random.seed(config.seed)
     np.random.seed(config.seed)
@@ -377,18 +418,18 @@ def train(
         split: np.isin(episode, data[f"{split}_episode_ids"])
         for split in ("train", "validation", "test")
     }
-    center, scale, goal_center, goal_scale = _normalizers(
+    center, scale, context_center, context_scale = _normalizers(
         data, masks["train"], checkpoint
     )
     normalized_state = ((data["state"] - center) / scale).astype(np.float32)
-    normalized_goal = (
-        (data["active_goal_position"] - goal_center) / goal_scale
+    normalized_context = (
+        (_task_context(data) - context_center) / context_scale
     ).astype(np.float32)
     future, future_mask = _future_targets(data, config.kmpc_horizon)
     loaders = {
         split: _make_loader(
             normalized_state,
-            normalized_goal,
+            normalized_context,
             data["action"],
             future,
             future_mask,
@@ -401,7 +442,7 @@ def train(
     }
     builders = {
         "B0": lambda: B0Actor(
-            koopman.state_dim + 3,
+            koopman.state_dim + TASK_CONTEXT_DIM,
             config.b0_hidden_dim,
             config.action_limit_rad,
         ),
@@ -410,8 +451,30 @@ def train(
             lifted_dim=koopman.lifted_dim,
             action_dim=7,
             hidden_dims=(config.hidden_dim,),
-            context_dim=3,
+            context_dim=TASK_CONTEXT_DIM,
             conditioning="lifted",
+            max_action=config.action_limit_rad,
+        ),
+        "H1-min-raw": lambda: MinimalDirectQuadraticActor(
+            observation_dim=koopman.state_dim,
+            lifted_dim=koopman.lifted_dim,
+            action_dim=7,
+            hidden_dims=(config.hidden_dim,),
+            context_dim=TASK_CONTEXT_DIM,
+            conditioning="observation",
+            max_action=config.action_limit_rad,
+        ),
+        "AB-PQ": lambda: LowRankValueActor(
+            observation_dim=koopman.lifted_dim + TASK_CONTEXT_DIM,
+            A=koopman.A,
+            B=koopman.B,
+            R=torch.eye(7, device=device, dtype=koopman.A.dtype),
+            base_hessian=torch.eye(
+                koopman.lifted_dim, device=device, dtype=koopman.A.dtype
+            ),
+            rank=config.ab_rank,
+            hidden_dims=(config.hidden_dim,),
+            value_linear_scale=1.0,
             max_action=config.action_limit_rad,
         ),
         "BC-KMPC": lambda: KoopmanMPCActor(
@@ -419,13 +482,18 @@ def train(
             B=koopman.B,
             C=koopman.C,
             horizon=config.kmpc_horizon,
-            context_dim=3,
+            context_dim=TASK_CONTEXT_DIM,
             hidden_dims=(config.hidden_dim,),
             action_low=-config.action_limit_rad,
             action_high=config.action_limit_rad,
             solver_iterations=config.kmpc_solver_iterations,
         ),
     }
+    if actor_names is not None:
+        unknown = sorted(set(actor_names) - set(builders))
+        if unknown:
+            raise ValueError(f"Unknown actor names: {unknown}")
+        builders = {name: builders[name] for name in actor_names}
     output_dir.mkdir(parents=True, exist_ok=True)
     reports: dict[str, Any] = {}
     for offset, (name, builder) in enumerate(builders.items()):
@@ -456,8 +524,8 @@ def train(
                     koopman,
                     center,
                     scale,
-                    goal_center,
-                    goal_scale,
+                    context_center,
+                    context_scale,
                     config,
                     device,
                 ),
@@ -471,10 +539,10 @@ def train(
             "normalizer": {
                 "state_center": center,
                 "state_scale": scale,
-                "goal_center": goal_center,
-                "goal_scale": goal_scale,
+                "context_center": context_center,
+                "context_scale": context_scale,
             },
-            "koopman_path": str(koopman_path.resolve()),
+            "koopman_path": str(koopman_path),
             "report": actor_report,
         }
         torch.save(checkpoint_payload, output_dir / f"{name}.pt")
@@ -482,10 +550,19 @@ def train(
         print(json.dumps({name: actor_report}, sort_keys=True), flush=True)
     report = {
         "kind": "pandareach_threewaypoint_bc_comparison",
-        "dataset_path": str(dataset_path.resolve()),
-        "koopman_path": str(koopman_path.resolve()),
+        "dataset_path": str(dataset_path),
+        "koopman_path": str(koopman_path),
         "config": asdict(config),
-        "actor_input": "[psi(normalize([q,qdot,tcp])), normalize(G_j)]",
+        "actor_input": (
+            "B0: [normalize(x), normalize(c)]; "
+            "H1-min/AB-PQ/BC-KMPC: "
+            "[psi(normalize(x)), normalize(c)]"
+            "; H1-min-raw: [normalize(x), normalize(c)]"
+        ),
+        "context": {
+            "definition": "[G1,G2,G3,onehot(active_waypoint_index)]",
+            "dimension": TASK_CONTEXT_DIM,
+        },
         "data_split": {
             split: {
                 "episodes": int(len(data[f"{split}_episode_ids"])),
@@ -516,7 +593,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=Path,
         default=Path(
-            "runs/pandareach_threewaypoint/data/pandareach_dls_100.npz"
+            "runs/pandareach_threewaypoint/data/pandareach_dls_500.npz"
         ),
     )
     parser.add_argument(
@@ -532,6 +609,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--evaluation-episodes", type=int, default=100)
     parser.add_argument("--kmpc-horizon", type=int, default=10)
+    parser.add_argument(
+        "--actors",
+        nargs="+",
+        choices=("B0", "H1-min", "H1-min-raw", "AB-PQ", "BC-KMPC"),
+        default=None,
+        help="Train only the selected actor routes (default: all routes).",
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -548,6 +632,7 @@ def main() -> None:
             kmpc_horizon=args.kmpc_horizon,
         ),
         args.device,
+        tuple(args.actors) if args.actors is not None else None,
     )
     print(json.dumps(report["actors"], indent=2))
 
