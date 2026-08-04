@@ -1,4 +1,4 @@
-"""Short PPO interface/gradient smoke test for all three PandaReach3 actors."""
+"""Short PPO interface/gradient smoke test for all PandaReach3 actors."""
 
 from __future__ import annotations
 
@@ -16,7 +16,10 @@ from torch import nn
 from torch.distributions import Normal
 
 from antmaze_ac.rl.koopman_mpc_actor import KoopmanMPCActor
-from antmaze_ac.rl.quadratic_actors import MinimalDirectQuadraticActor
+from antmaze_ac.rl.quadratic_actors import (
+    LowRankValueActor,
+    MinimalDirectQuadraticActor,
+)
 from experiments.state_only_feasibility.collect_pandareach_threewaypoint import (
     _state_from_observation,
     _numpy,
@@ -28,6 +31,8 @@ from experiments.state_only_feasibility.maniskill_pandareach import (
 from experiments.state_only_feasibility.train_pandareach_threewaypoint_bc import (
     B0Actor,
     BCConfig,
+    TASK_CONTEXT_DIM,
+    WAYPOINT_COUNT,
     load_koopman,
 )
 
@@ -71,24 +76,38 @@ def _load_actor(
 ) -> tuple[str, nn.Module, Any, dict[str, np.ndarray], BCConfig]:
     payload = torch.load(actor_path, map_location=device, weights_only=False)
     actor_name = str(payload.get("name"))
-    if actor_name not in {"B0", "H1-min", "BC-KMPC"}:
+    if actor_name not in {"B0", "H1-min", "H1-min-raw", "AB-PQ", "BC-KMPC"}:
         raise ValueError(f"Unsupported PPO smoke actor {actor_name!r}")
     config = BCConfig(**payload["config"])
     koopman, _ = load_koopman(koopman_path, device)
     if actor_name == "B0":
         actor = B0Actor(
-            koopman.state_dim + 3,
+            koopman.state_dim + TASK_CONTEXT_DIM,
             config.b0_hidden_dim,
             config.action_limit_rad,
         )
-    elif actor_name == "H1-min":
+    elif actor_name in {"H1-min", "H1-min-raw"}:
         actor = MinimalDirectQuadraticActor(
-            observation_dim=17,
+            observation_dim=koopman.state_dim,
             lifted_dim=koopman.lifted_dim,
             action_dim=7,
             hidden_dims=(config.hidden_dim,),
-            context_dim=3,
-            conditioning="lifted",
+            context_dim=TASK_CONTEXT_DIM,
+            conditioning=("lifted" if actor_name == "H1-min" else "observation"),
+            max_action=config.action_limit_rad,
+        )
+    elif actor_name == "AB-PQ":
+        actor = LowRankValueActor(
+            observation_dim=koopman.lifted_dim + TASK_CONTEXT_DIM,
+            A=koopman.A,
+            B=koopman.B,
+            R=torch.eye(7, device=device, dtype=koopman.A.dtype),
+            base_hessian=torch.eye(
+                koopman.lifted_dim, device=device, dtype=koopman.A.dtype
+            ),
+            rank=config.ab_rank,
+            hidden_dims=(config.hidden_dim,),
+            value_linear_scale=1.0,
             max_action=config.action_limit_rad,
         )
     else:
@@ -97,7 +116,7 @@ def _load_actor(
             B=koopman.B,
             C=koopman.C,
             horizon=config.kmpc_horizon,
-            context_dim=3,
+            context_dim=TASK_CONTEXT_DIM,
             hidden_dims=(config.hidden_dim,),
             action_low=-config.action_limit_rad,
             action_high=config.action_limit_rad,
@@ -106,7 +125,12 @@ def _load_actor(
     actor = actor.to(device)
     actor.load_state_dict(payload["actor_state"])
     normalizer = {
-        key: np.asarray(value, dtype=np.float32)
+        key: np.asarray(
+            value.detach().cpu().numpy()
+            if isinstance(value, torch.Tensor)
+            else value,
+            dtype=np.float32,
+        )
         for key, value in payload["normalizer"].items()
     }
     return actor_name, actor, koopman, normalizer, config
@@ -119,14 +143,27 @@ def _features(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     state = _state_from_observation(observation)
-    goal = _numpy(observation["extra"]["active_goal"]).reshape(3)
+    waypoints = _numpy(observation["extra"]["waypoints"]).reshape(
+        WAYPOINT_COUNT, 3
+    )
+    active_index = int(
+        _numpy(observation["extra"]["active_waypoint_index"])
+        .reshape(-1)[0]
+    )
+    context_raw = np.concatenate(
+        (
+            waypoints.reshape(-1),
+            np.eye(WAYPOINT_COUNT, dtype=np.float32)[active_index],
+        )
+    )
     normalized_state = torch.as_tensor(
         (state - normalizer["state_center"]) / normalizer["state_scale"],
         dtype=torch.float32,
         device=device,
     ).unsqueeze(0)
     context = torch.as_tensor(
-        (goal - normalizer["goal_center"]) / normalizer["goal_scale"],
+        (context_raw - normalizer["context_center"])
+        / normalizer["context_scale"],
         dtype=torch.float32,
         device=device,
     ).unsqueeze(0)
@@ -144,8 +181,10 @@ def _actor_mean(
 ) -> torch.Tensor:
     if actor_name == "B0":
         return actor(normalized_state, context)
-    if actor_name == "H1-min":
+    if actor_name in {"H1-min", "H1-min-raw"}:
         return actor(normalized_state, lifted, context).action
+    if actor_name == "AB-PQ":
+        return actor(torch.cat((lifted, context), dim=-1), lifted).action
     return actor(lifted, context).action
 
 
@@ -166,7 +205,7 @@ def run_smoke(
     actor_name, actor, koopman, normalizer, bc_config = _load_actor(
         actor_path, koopman_path, device
     )
-    value = ValueNetwork(koopman.lifted_dim + 3).to(device)
+    value = ValueNetwork(koopman.lifted_dim + TASK_CONTEXT_DIM).to(device)
     log_std = nn.Parameter(
         torch.full(
             (7,), np.log(config.initial_std_rad), dtype=torch.float32, device=device
@@ -285,27 +324,22 @@ def run_smoke(
             actor_gradient_norms: list[float] = []
             policy_losses: list[float] = []
             value_losses: list[float] = []
-            generator = torch.Generator().manual_seed(config.seed + update)
+            generator = torch.Generator(device=device).manual_seed(
+                config.seed + update
+            )
             for _ in range(config.optimization_epochs):
                 order = torch.randperm(
                     config.rollout_steps, generator=generator, device=device
                 )
                 for start in range(0, config.rollout_steps, config.minibatch_size):
                     index = order[start : start + config.minibatch_size]
-                    if actor_name == "H1-min":
-                        mean = actor(
-                            normalized_state_batch[index],
-                            lifted_batch[index],
-                            context_batch[index],
-                        ).action
-                    else:
-                        mean = _actor_mean(
-                            actor_name,
-                            actor,
-                            normalized_state_batch[index],
-                            lifted_batch[index],
-                            context_batch[index],
-                        )
+                    mean = _actor_mean(
+                        actor_name,
+                        actor,
+                        normalized_state_batch[index],
+                        lifted_batch[index],
+                        context_batch[index],
+                    )
                     distribution = Normal(mean, log_std.exp().expand_as(mean))
                     log_probability = distribution.log_prob(
                         action_batch[index]
@@ -362,6 +396,9 @@ def run_smoke(
                     "minimum_actor_gradient_norm": float(
                         np.min(actor_gradient_norms)
                     ),
+                    "maximum_actor_gradient_norm": float(
+                        np.max(actor_gradient_norms)
+                    ),
                     "log_std": log_std.detach().cpu().tolist(),
                 }
             )
@@ -375,13 +412,15 @@ def run_smoke(
             "short interface/numerical/gradient smoke only; not a PPO "
             "convergence or performance result"
         ),
-        "actor_path": str(actor_path.resolve()),
-        "koopman_path": str(koopman_path.resolve()),
+        "actor_path": str(actor_path),
+        "koopman_path": str(koopman_path),
         "device": str(device),
         "config": asdict(config),
         "updates": update_reports,
         "finite_nonzero_cost_map_gradients": all(
-            row["minimum_actor_gradient_norm"] > 0 for row in update_reports
+            np.isfinite(row["maximum_actor_gradient_norm"])
+            and row["maximum_actor_gradient_norm"] > 0
+            for row in update_reports
         ),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -404,7 +443,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--actor",
         type=Path,
-        default=Path("runs/pandareach_threewaypoint/bc/BC-KMPC.pt"),
+        default=Path(
+            "runs/pandareach_threewaypoint/bc_context12/BC-KMPC.pt"
+        ),
     )
     parser.add_argument(
         "--koopman",
