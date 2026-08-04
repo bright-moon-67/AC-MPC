@@ -77,7 +77,7 @@ def _load_actor(
     koopman, _ = load_koopman(koopman_path, device)
     if actor_name == "B0":
         actor = B0Actor(
-            koopman.lifted_dim + 3,
+            koopman.state_dim + 3,
             config.b0_hidden_dim,
             config.action_limit_rad,
         )
@@ -143,7 +143,7 @@ def _actor_mean(
     context: torch.Tensor,
 ) -> torch.Tensor:
     if actor_name == "B0":
-        return actor(lifted, context)
+        return actor(normalized_state, context)
     if actor_name == "H1-min":
         return actor(normalized_state, lifted, context).action
     return actor(lifted, context).action

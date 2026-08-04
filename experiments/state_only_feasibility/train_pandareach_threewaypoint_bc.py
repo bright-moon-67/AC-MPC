@@ -61,9 +61,9 @@ class B0Actor(nn.Module):
             nn.Linear(hidden_dim, 7),
         )
 
-    def forward(self, lifted: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, state: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         return self.action_limit * torch.tanh(
-            self.network(torch.cat((lifted, context), dim=-1))
+            self.network(torch.cat((state, context), dim=-1))
         )
 
 
@@ -114,7 +114,9 @@ def _actor_action(
     context: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if name == "B0":
-        return actor(lifted, context), None
+        # B0 is the raw-state baseline: it deliberately does not use the
+        # Koopman lift.  The other routes receive ``lifted`` below.
+        return actor(normalized_state, context), None
     if name == "H1-min":
         return actor(normalized_state, lifted, context).action, None
     output = actor(lifted, context)
@@ -399,7 +401,7 @@ def train(
     }
     builders = {
         "B0": lambda: B0Actor(
-            koopman.lifted_dim + 3,
+            koopman.state_dim + 3,
             config.b0_hidden_dim,
             config.action_limit_rad,
         ),
