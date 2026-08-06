@@ -238,6 +238,7 @@ class PandaReachEnv(BaseEnv):
             )
 
             self.agent.reset(trial_qpos)
+            self._sync_gpu_kinematics()
             trial_goal = self.agent.tcp_pose.p[tcp_index].clone()
             distance = torch.linalg.norm(trial_goal - start_tcp, dim=-1)
             trial_valid = (
@@ -271,8 +272,17 @@ class PandaReachEnv(BaseEnv):
             )
 
         self.agent.reset(start_qpos)
+        self._sync_gpu_kinematics()
         self._goal_sampling_attempts_used = attempts_used
         return goal, goal_qpos
+
+    def _sync_gpu_kinematics(self) -> None:
+        """Make link poses reflect qpos writes during GPU episode setup."""
+
+        if self.gpu_sim_enabled:
+            self.scene._gpu_apply_all()
+            self.scene.px.gpu_update_articulation_kinematics()
+            self.scene._gpu_fetch_all()
 
     @property
     def oracle_goal_qpos(self) -> torch.Tensor:
@@ -352,10 +362,12 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
     distinct Cartesian regions while retaining a reachability certificate.
     """
 
-    SUPPORTED_REWARD_MODES = ("sparse", "none")
+    SUPPORTED_REWARD_MODES = ("sparse", "dense", "none")
     waypoint_count = 3
     waypoint_joint_jitter = 0.02
     waypoint_event_reward = 0.2
+    dense_distance_penalty_scale = 0.05
+    dense_waypoint_completion_reward = 1.0
     waypoint_qpos_centers = np.array(
         [
             [
@@ -394,16 +406,34 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
         *args: Any,
         waypoint_joint_jitter: float | None = None,
         waypoint_event_reward: float | None = None,
+        dense_distance_penalty_scale: float | None = None,
+        dense_waypoint_completion_reward: float | None = None,
         **kwargs: Any,
     ) -> None:
         if waypoint_joint_jitter is not None:
             self.waypoint_joint_jitter = float(waypoint_joint_jitter)
         if waypoint_event_reward is not None:
             self.waypoint_event_reward = float(waypoint_event_reward)
+        if dense_distance_penalty_scale is not None:
+            self.dense_distance_penalty_scale = float(
+                dense_distance_penalty_scale
+            )
+        if dense_waypoint_completion_reward is not None:
+            self.dense_waypoint_completion_reward = float(
+                dense_waypoint_completion_reward
+            )
         if self.waypoint_joint_jitter <= 0:
             raise ValueError("waypoint_joint_jitter must be positive")
         if self.waypoint_event_reward < 0:
             raise ValueError("waypoint_event_reward must be non-negative")
+        if self.dense_distance_penalty_scale < 0:
+            raise ValueError(
+                "dense_distance_penalty_scale must be non-negative"
+            )
+        if self.dense_waypoint_completion_reward <= 0:
+            raise ValueError(
+                "dense_waypoint_completion_reward must be positive"
+            )
         super().__init__(*args, **kwargs)
 
     def _load_scene(self, options: dict) -> None:
@@ -481,10 +511,12 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
             for waypoint_index in range(self.waypoint_count):
                 trial_qpos[:, :7] = candidates[:, waypoint_index]
                 self.agent.reset(trial_qpos)
+                self._sync_gpu_kinematics()
                 waypoints[:, waypoint_index] = self.agent.tcp_pose.p[
                     tcp_index
                 ].clone()
             self.agent.reset(start_qpos)
+            self._sync_gpu_kinematics()
 
             if not hasattr(self, "_waypoints"):
                 self._waypoints = torch.full(
@@ -595,6 +627,29 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
             + self.waypoint_event_reward * info["waypoint_passed"].float()
         )
 
+    def compute_dense_reward(
+        self,
+        obs: Any,
+        action: torch.Tensor,
+        info: dict,
+    ):
+        """Penalize current-goal distance and reward every passed waypoint.
+
+        ``waypoint_passed`` covers the first two stages and ``success`` covers
+        the final stage, so each ordered waypoint produces one positive event.
+        Distance is evaluated after a stage transition and always refers to
+        the currently active goal.
+        """
+
+        completion = (
+            info["waypoint_passed"].float() + info["success"].float()
+        )
+        return (
+            -self.dense_distance_penalty_scale
+            * info["active_waypoint_distance"]
+            + self.dense_waypoint_completion_reward * completion
+        )
+
 
 class PandaArmOnlyActionWrapper(gym.ActionWrapper):
     """Expose only the seven arm actions and keep the gripper fully open."""
@@ -603,14 +658,20 @@ class PandaArmOnlyActionWrapper(gym.ActionWrapper):
         super().__init__(env)
         if not isinstance(env.action_space, gym.spaces.Box):
             raise TypeError("PandaReach requires a continuous Box action space")
-        if env.action_space.shape != (8,):
+        if not env.action_space.shape or env.action_space.shape[-1] != 8:
             raise ValueError(
-                "Expected Panda pd_joint_delta_pos action shape (8,), "
+                "Expected Panda pd_joint_delta_pos action trailing shape 8, "
                 f"got {env.action_space.shape}"
             )
         self.action_space = gym.spaces.Box(
-            low=np.asarray(env.action_space.low[:-1], dtype=np.float32),
-            high=np.asarray(env.action_space.high[:-1], dtype=np.float32),
+            low=np.asarray(env.action_space.low[..., :-1], dtype=np.float32),
+            high=np.asarray(env.action_space.high[..., :-1], dtype=np.float32),
+            dtype=np.float32,
+        )
+        single_action_space = env.get_wrapper_attr("single_action_space")
+        self.single_action_space = gym.spaces.Box(
+            low=np.asarray(single_action_space.low[:-1], dtype=np.float32),
+            high=np.asarray(single_action_space.high[:-1], dtype=np.float32),
             dtype=np.float32,
         )
 
