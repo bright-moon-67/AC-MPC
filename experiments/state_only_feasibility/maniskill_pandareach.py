@@ -368,6 +368,11 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
     waypoint_event_reward = 0.2
     dense_distance_penalty_scale = 0.05
     dense_waypoint_completion_reward = 1.0
+    # Final-success radius (defaults to goal_threshold) and whether success
+    # additionally requires the robot to be static. Both are configurable so
+    # the success criterion can be relaxed independently of waypoint passing.
+    success_goal_threshold = 0.01
+    require_robot_static = True
     waypoint_qpos_centers = np.array(
         [
             [
@@ -408,6 +413,8 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
         waypoint_event_reward: float | None = None,
         dense_distance_penalty_scale: float | None = None,
         dense_waypoint_completion_reward: float | None = None,
+        success_goal_threshold: float | None = None,
+        require_robot_static: bool | None = None,
         **kwargs: Any,
     ) -> None:
         if waypoint_joint_jitter is not None:
@@ -435,6 +442,17 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
                 "dense_waypoint_completion_reward must be positive"
             )
         super().__init__(*args, **kwargs)
+        # The final-success radius defaults to the waypoint-passing threshold.
+        # Set it after the base class because goal_threshold is set there.
+        if success_goal_threshold is not None:
+            if success_goal_threshold <= 0:
+                raise ValueError("success_goal_threshold must be positive")
+            self.success_goal_threshold = float(success_goal_threshold)
+        else:
+            self.success_goal_threshold = self.goal_threshold
+        self.require_robot_static = (
+            True if require_robot_static is None else bool(require_robot_static)
+        )
 
     def _load_scene(self, options: dict) -> None:
         super()._load_scene(options)
@@ -599,11 +617,18 @@ class PandaReachThreeWaypointEnv(PandaReachEnv):
         active_after = self.active_waypoint
         active_distance = torch.linalg.norm(tcp - active_after, dim=-1)
         final_stage = self._active_waypoint_index == self.waypoint_count - 1
-        is_robot_static = self.agent.is_static(0.2)
+        if self.require_robot_static:
+            is_robot_static = self.agent.is_static(0.2)
+            static_ok = is_robot_static
+        else:
+            is_robot_static = torch.ones_like(
+                final_stage, dtype=torch.bool
+            )
+            static_ok = True
         success = (
             final_stage
-            & (active_distance <= self.goal_threshold)
-            & is_robot_static
+            & (active_distance <= self.success_goal_threshold)
+            & static_ok
         )
         return {
             "success": success,

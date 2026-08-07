@@ -7,12 +7,18 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from antmaze_ac.control.differentiable_dare import (
+    detectability_diagnostic,
+    stabilizability_diagnostic,
+)
+from antmaze_ac.control.quadratic_cost import physical_to_lifted_cost
 from antmaze_ac.control.quadratic_greedy import (
     QuadraticGreedyResult,
     greedy_action_from_low_rank_value,
     greedy_action_from_quadratic,
     low_rank_quadratic_value,
 )
+from antmaze_ac.control.steady_state_lqr import affine_lqr
 
 
 def _activation(name: str) -> type[nn.Module]:
@@ -568,4 +574,216 @@ class LowRankValueActor(nn.Module):
             diagonal,
             factors,
             value_linear,
+        )
+
+
+@dataclass
+class KoopmanLQRActorOutput:
+    """Result of the differentiable affine DARE-LQR cost-map head."""
+
+    action: torch.Tensor
+    raw_action: torch.Tensor
+    quadratic_diagonal: torch.Tensor
+    linear_term: torch.Tensor
+    state_hessian: torch.Tensor
+    control_hessian: torch.Tensor
+    gain: torch.Tensor
+    feedforward: torch.Tensor
+    value_hessian: torch.Tensor
+    closed_loop_spectral_radius: torch.Tensor | None
+
+
+class KoopmanLQRActor(nn.Module):
+    r"""Physical-cost affine LQR actor through a differentiable DARE.
+
+    A cost-map network conditioned on the current Koopman lift and task
+    context emits the diagonal stage cost and signed linear term ONLY for
+    the physical state-action pair ``w=[x, u]`` (17+7 dimensions), not for
+    the lifted coordinates (which would add ``lift_dim`` extra parameters):
+
+    ``stage cost:  .5 x' diag(Q_x) x + .5 u' diag(Q_u) u + p_x' x + p_u' u``.
+
+    The physical cost is mapped into the lifted space through the frozen
+    readout ``C`` (``Q_z = C' diag(Q_x) C``, ``q_z = p_x C``, ``R = diag(Q_u)``,
+    ``r = p_u``) and solved with the project's differentiable DARE
+    (``affine_lqr``), giving the infinite-horizon stabilizing gain ``K`` and
+    feedforward ``d`` with ``u = -K z - d``. Because the cost is recomputed
+    from the current state/context at every control step, the closed-loop law
+    is time-varying. The 24 diagonal cost weights ``[Q_x, Q_u]`` are
+    parameterized KMPC-style as ``exp(s * centered(tanh(raw)))`` (per-sample
+    geometric mean exactly one, so the unidentifiable global cost scale is
+    removed while the Q-vs-R tradeoff stays learnable); ``p_x``/``p_u`` are
+    ``s_p * tanh(raw)``.
+
+    Construction requires ``(A, B)`` stabilizable and ``(A, C)`` detectable
+    (the unstable Koopman modes must be observable through the physical
+    readout), so the PSD lifted cost ``Q_z`` still yields a stabilizing
+    closed loop.
+    """
+
+    def __init__(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        *,
+        context_dim: int = 0,
+        hidden_dims: Sequence[int] = (128,),
+        activation: str = "gelu",
+        quadratic_log_scale: float = 1.5,
+        linear_scale: float = 10.0,
+        dare_tolerance: float = 1e-7,
+        dare_max_iterations: int = 200,
+        max_action: float | None = None,
+        check_stabilizable: bool = True,
+        check_detectable: bool = True,
+    ) -> None:
+        super().__init__()
+        if A.ndim != 2 or A.shape[0] != A.shape[1]:
+            raise ValueError("A must be a square matrix")
+        lifted_dim = A.shape[0]
+        if B.ndim != 2 or B.shape[0] != lifted_dim:
+            raise ValueError("B must have shape [lifted_dim, action_dim]")
+        action_dim = B.shape[1]
+        if C.ndim != 2 or C.shape[1] != lifted_dim:
+            raise ValueError("C must have shape [physical_dim, lifted_dim]")
+        physical_dim = C.shape[0]
+        if context_dim < 0:
+            raise ValueError("context_dim must be non-negative")
+        if quadratic_log_scale <= 0 or linear_scale <= 0:
+            raise ValueError("Cost-map scales must be positive")
+        if dare_tolerance <= 0 or dare_max_iterations < 1:
+            raise ValueError("Invalid DARE tolerance or iteration count")
+        if max_action is not None and max_action <= 0:
+            raise ValueError("max_action must be positive when provided")
+        if check_stabilizable:
+            failures = stabilizability_diagnostic(A, B)
+            if failures:
+                raise RuntimeError(
+                    "Frozen Koopman dynamics are not stabilizable for KLQR: "
+                    + "; ".join(failures)
+                )
+        if check_detectable:
+            failures = detectability_diagnostic(A, C)
+            if failures:
+                raise RuntimeError(
+                    "Frozen Koopman readout cannot detect unstable modes for "
+                    "KLQR (physical Q_z would not stabilize them): "
+                    + "; ".join(failures)
+                )
+
+        self.lifted_dim = int(lifted_dim)
+        self.action_dim = int(action_dim)
+        self.physical_dim = int(physical_dim)
+        self.cost_dim = int(physical_dim) + int(action_dim)
+        self.context_dim = int(context_dim)
+        self.quadratic_log_scale = float(quadratic_log_scale)
+        self.linear_scale = float(linear_scale)
+        self.max_action = None if max_action is None else float(max_action)
+
+        self.register_buffer("A", A.detach().clone())
+        self.register_buffer("B", B.detach().clone())
+        self.register_buffer("C", C.detach().clone())
+        # (A, B) stabilizability and (A, C) detectability are checked once in
+        # __init__; per-sample PBH scans are unnecessary. The implicit-DARE
+        # backward is the project's optimized gradient path.
+        self.dare_kwargs = {
+            "tolerance": float(dare_tolerance),
+            "max_iterations": int(dare_max_iterations),
+            "check_stabilizable": False,
+            "check_detectable": False,
+            "fail_on_nonconvergence": True,
+            "compute_closed_loop_spectral_radius": False,
+            "implicit_backward": True,
+        }
+        output_dim = 2 * self.cost_dim
+        self.network = _mlp(
+            self.lifted_dim + self.context_dim,
+            hidden_dims,
+            output_dim,
+            activation,
+        )
+        _zero_final_layer(self.network)
+
+    def forward(
+        self,
+        lifted_state: torch.Tensor,
+        context: torch.Tensor | None = None,
+        *,
+        spectral_radius: bool = False,
+    ) -> KoopmanLQRActorOutput:
+        if lifted_state.shape[-1] != self.lifted_dim:
+            raise ValueError("Wrong lifted-state dimension")
+        batch_shape = lifted_state.shape[:-1]
+        network_input = lifted_state
+        if self.context_dim:
+            if context is None or context.shape[-1] != self.context_dim:
+                raise ValueError("Wrong or missing context dimension")
+            if context.shape[:-1] != batch_shape:
+                raise ValueError("Context batch shape does not match lifted state")
+            network_input = torch.cat((lifted_state, context), dim=-1)
+        elif context is not None:
+            raise ValueError("This actor was constructed without context")
+        raw = self.network(network_input)
+        raw_quadratic = raw[..., : self.cost_dim]
+        raw_linear = raw[..., self.cost_dim :]
+        # KMPC-style per-sample centering: the geometric mean of the 24 cost
+        # weights is exactly one. The global cost scale is unidentifiable for
+        # the LQR policy (K and d are invariant to a uniform scaling of
+        # Q, R, q, r), so removing it stabilizes BC without losing the
+        # learnable Q-vs-R tradeoff or the per-dimension weights.
+        centered_log_weights = torch.tanh(raw_quadratic) - torch.tanh(
+            raw_quadratic
+        ).mean(dim=-1, keepdim=True)
+        quadratic = torch.exp(
+            self.quadratic_log_scale * centered_log_weights
+        )
+        linear = self.linear_scale * torch.tanh(raw_linear)
+
+        A = self.A.expand(*batch_shape, -1, -1)
+        B = self.B.expand(*batch_shape, -1, -1)
+        # C stays 2D: physical_to_lifted_cost broadcasts it against the batch.
+        lifted = physical_to_lifted_cost(
+            self.C,
+            quadratic,
+            linear,
+            self.physical_dim,
+        )
+        dare_kwargs = {
+            **self.dare_kwargs,
+            "compute_closed_loop_spectral_radius": bool(spectral_radius),
+        }
+        result = affine_lqr(
+            A,
+            B,
+            lifted.state_hessian,
+            lifted.control_hessian,
+            q=lifted.state_linear,
+            r=lifted.control_linear,
+            **dare_kwargs,
+        )
+        # solve_dare promotes to float64 internally; cast the LQR outputs back
+        # to the model dtype (the environment runs in float32).
+        gain = result.gain.to(lifted_state.dtype)
+        feedforward = result.feedforward.to(lifted_state.dtype)
+        value_hessian = result.value_hessian.to(lifted_state.dtype)
+        raw_action = -(
+            (gain @ lifted_state.unsqueeze(-1)).squeeze(-1) + feedforward
+        )
+        action = _smooth_action_bound(raw_action, self.max_action)
+        return KoopmanLQRActorOutput(
+            action=action,
+            raw_action=raw_action,
+            quadratic_diagonal=quadratic,
+            linear_term=linear,
+            state_hessian=lifted.state_hessian,
+            control_hessian=lifted.control_hessian,
+            gain=gain,
+            feedforward=feedforward,
+            value_hessian=value_hessian,
+            closed_loop_spectral_radius=(
+                result.dare.closed_loop_spectral_radius
+                if spectral_radius
+                else None
+            ),
         )

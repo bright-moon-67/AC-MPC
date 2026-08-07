@@ -17,8 +17,8 @@ from torch.distributions import Normal
 
 from antmaze_ac.rl.koopman_mpc_actor import KoopmanMPCActor
 from antmaze_ac.rl.quadratic_actors import (
+    KoopmanLQRActor,
     LowRankValueActor,
-    MinimalDirectQuadraticActor,
 )
 from experiments.state_only_feasibility.collect_pandareach_threewaypoint import (
     _state_from_observation,
@@ -29,8 +29,8 @@ from experiments.state_only_feasibility.maniskill_pandareach import (
     PandaReachThreeWaypointEnv,
 )
 from experiments.state_only_feasibility.train_pandareach_threewaypoint_bc import (
-    B0Actor,
     BCConfig,
+    StandardPPOActor,
     TASK_CONTEXT_DIM,
     WAYPOINT_COUNT,
     load_koopman,
@@ -76,24 +76,23 @@ def _load_actor(
 ) -> tuple[str, nn.Module, Any, dict[str, np.ndarray], BCConfig]:
     payload = torch.load(actor_path, map_location=device, weights_only=False)
     actor_name = str(payload.get("name"))
-    if actor_name not in {"B0", "H1-min", "H1-min-raw", "AB-PQ", "BC-KMPC"}:
+    if actor_name not in {"PPO", "KLQR", "AB-PQ", "BC-KMPC"}:
         raise ValueError(f"Unsupported PPO smoke actor {actor_name!r}")
     config = BCConfig(**payload["config"])
     koopman, _ = load_koopman(koopman_path, device)
-    if actor_name == "B0":
-        actor = B0Actor(
+    if actor_name == "PPO":
+        actor = StandardPPOActor(
             koopman.state_dim + TASK_CONTEXT_DIM,
-            config.b0_hidden_dim,
+            config.ppo_hidden_dim,
             config.action_limit_rad,
         )
-    elif actor_name in {"H1-min", "H1-min-raw"}:
-        actor = MinimalDirectQuadraticActor(
-            observation_dim=koopman.state_dim,
-            lifted_dim=koopman.lifted_dim,
-            action_dim=7,
-            hidden_dims=(config.hidden_dim,),
+    elif actor_name == "KLQR":
+        actor = KoopmanLQRActor(
+            A=koopman.A,
+            B=koopman.B,
+            C=koopman.C,
             context_dim=TASK_CONTEXT_DIM,
-            conditioning=("lifted" if actor_name == "H1-min" else "observation"),
+            hidden_dims=(config.hidden_dim,),
             max_action=config.action_limit_rad,
         )
     elif actor_name == "AB-PQ":
@@ -179,10 +178,10 @@ def _actor_mean(
     lifted: torch.Tensor,
     context: torch.Tensor,
 ) -> torch.Tensor:
-    if actor_name == "B0":
+    if actor_name == "PPO":
         return actor(normalized_state, context)
-    if actor_name in {"H1-min", "H1-min-raw"}:
-        return actor(normalized_state, lifted, context).action
+    if actor_name == "KLQR":
+        return actor(lifted, context).action
     if actor_name == "AB-PQ":
         return actor(torch.cat((lifted, context), dim=-1), lifted).action
     return actor(lifted, context).action
