@@ -13,7 +13,7 @@ max_parallel="${PPO_MAX_PARALLEL:-2}"
 max_wall_time_minutes="${PPO_MAX_WALL_TIME_MINUTES:-}"
 seed="${PPO_SEED:-20280804}"
 koopman="${PPO_KOOPMAN:-${project_root}/runs/pandareach_threewaypoint/koopman/best.pt}"
-read -r -a methods <<< "${PPO_METHODS:-B0 H1-min H1-min-raw AB-PQ BC-KMPC}"
+read -r -a methods <<< "${PPO_METHODS:-PPO KLQR AB-PQ BC-KMPC}"
 
 if [[ -f /etc/vulkan/icd.d/nvidia_icd.json ]]; then
     export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/etc/vulkan/icd.d/nvidia_icd.json}"
@@ -40,18 +40,7 @@ for method in "${methods[@]}"; do
         fi
         running=$((running - 1))
     done
-    run_name="${method}"
-    if [[ "${method}" == "B0" ]]; then
-        # The standard raw-state 256x256 B0 is intentionally incompatible
-        # with checkpoints from the earlier one-layer/Koopman-critic route.
-        run_name="B0-standard-dense"
-    elif [[ "${method}" == "H1-min" || "${method}" == "H1-min-raw" ]]; then
-        # Preserve earlier zero/unstable final-layer runs. The closed-loop
-        # stable nonzero initialization and dense reward use fresh runs.
-        run_name="${method}-stable-dense"
-    else
-        run_name="${method}-dense"
-    fi
+    run_name="${method}-dense"
     method_dir="${output_root}/${run_name}/seed_${seed}"
     mkdir -p "${method_dir}"
     (

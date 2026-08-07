@@ -1,9 +1,16 @@
-"""Train a PandaReach3 actor from scratch with vectorized PPO.
+"""Train a PandaReach3 actor with vectorized PPO.
 
-This is the formal counterpart to ``train_pandareach_threewaypoint_ppo_smoke``.
-It intentionally does not require a BC actor checkpoint: every policy route is
-randomly initialized while the frozen Koopman lift is loaded from its dynamics
-checkpoint.
+Two initialization paths are supported:
+
+* ``--bc-checkpoint`` (recommended): the policy is initialized from a
+  BC-pretrained actor checkpoint and fine-tuned with a small actor learning
+  rate. The BC dataset normalizers are reused and the PPO random init is
+  skipped. This replaces the failed from-scratch H1-min actor-LR sweep, whose
+  ``2e-6`` final-layer ``g_u`` gain pinned the policy mean near zero.
+* from-scratch: every policy route is randomly initialized while the frozen
+  Koopman lift is loaded from its dynamics checkpoint. The former ``2e-6``
+  H1-min final-layer gain has been removed; H1-min from-scratch is no longer
+  the intended path.
 """
 
 from __future__ import annotations
@@ -29,8 +36,8 @@ from torch.distributions import Normal
 
 from antmaze_ac.rl.koopman_mpc_actor import KoopmanMPCActor
 from antmaze_ac.rl.quadratic_actors import (
+    KoopmanLQRActor,
     LowRankValueActor,
-    MinimalDirectQuadraticActor,
 )
 from experiments.state_only_feasibility.maniskill_pandareach import (
     PandaArmOnlyActionWrapper,
@@ -38,8 +45,10 @@ from experiments.state_only_feasibility.maniskill_pandareach import (
 )
 from experiments.state_only_feasibility.train_pandareach_threewaypoint_bc import (
     BCConfig,
+    StandardPPOActor,
     TASK_CONTEXT_DIM,
     WAYPOINT_COUNT,
+    _orthogonal_linear,
     load_koopman,
 )
 from experiments.state_only_feasibility.train_pandareach_threewaypoint_ppo_smoke import (
@@ -47,47 +56,8 @@ from experiments.state_only_feasibility.train_pandareach_threewaypoint_ppo_smoke
 )
 
 
-ACTOR_NAMES = ("B0", "H1-min", "H1-min-raw", "AB-PQ", "BC-KMPC")
-H1_MIN_FINAL_GAIN = 2e-6
+ACTOR_NAMES = ("PPO", "KLQR", "AB-PQ", "BC-KMPC")
 TRAINING_SPEC_VERSION = "dense_current_distance_waypoint_v2_scale005"
-
-
-def _orthogonal_linear(layer: nn.Linear, gain: float) -> None:
-    nn.init.orthogonal_(layer.weight, gain=gain)
-    nn.init.zeros_(layer.bias)
-
-
-class StandardPPOActor(nn.Module):
-    """Conventional two-layer MLP Gaussian-mean actor for the B0 baseline."""
-
-    def __init__(
-        self,
-        state_dim: int,
-        context_dim: int,
-        action_dim: int,
-        action_scale: float,
-    ) -> None:
-        super().__init__()
-        self.action_scale = float(action_scale)
-        self.network = nn.Sequential(
-            nn.Linear(state_dim + context_dim, 256),
-            nn.Tanh(),
-            nn.Linear(256, 256),
-            nn.Tanh(),
-            nn.Linear(256, action_dim),
-        )
-        _orthogonal_linear(self.network[0], math.sqrt(2.0))
-        _orthogonal_linear(self.network[2], math.sqrt(2.0))
-        _orthogonal_linear(self.network[4], 0.01)
-
-    def forward(
-        self, state: torch.Tensor, context: torch.Tensor
-    ) -> torch.Tensor:
-        # PPO evaluates the unclipped Gaussian sample. Only the simulator-side
-        # action is clipped, matching the common continuous-control setup.
-        return self.action_scale * self.network(
-            torch.cat((state, context), dim=-1)
-        )
 
 
 class StandardPPOValue(nn.Module):
@@ -137,6 +107,11 @@ class PPOConfig:
     max_wall_time_seconds: float | None = None
     max_episode_steps: int = 220
     goal_threshold: float = 0.01
+    # Final-success radius (defaults to goal_threshold) and whether success
+    # also requires a static robot. Relaxing these loosens only the final
+    # success criterion, not waypoint passing.
+    success_goal_threshold: float | None = None
+    require_robot_static: bool = True
     reward_mode: str = "dense"
     dense_distance_penalty_scale: float = 0.05
     dense_waypoint_completion_reward: float = 1.0
@@ -207,6 +182,8 @@ def _make_env(config: PPOConfig):
             render_backend="none",
             max_episode_steps=config.max_episode_steps,
             goal_threshold=config.goal_threshold,
+            success_goal_threshold=config.success_goal_threshold,
+            require_robot_static=config.require_robot_static,
             dense_distance_penalty_scale=(
                 config.dense_distance_penalty_scale
             ),
@@ -273,23 +250,30 @@ def _features(
 
 
 def _build_actor(
-    name: str, koopman: Any, actor_config: BCConfig, device: torch.device
+    name: str,
+    koopman: Any,
+    actor_config: BCConfig,
+    device: torch.device,
 ) -> nn.Module:
-    if name == "B0":
+    if name == "PPO":
+        # Standard raw-state PPO actor (256x256 Tanh MLP, linear mean output,
+        # no Koopman). Identical architecture in BC and PPO, so the
+        # BC-pretrained weights transfer directly into fine-tuning.
         actor: nn.Module = StandardPPOActor(
-            state_dim=koopman.state_dim,
-            context_dim=TASK_CONTEXT_DIM,
-            action_dim=7,
-            action_scale=actor_config.action_limit_rad,
+            koopman.state_dim + TASK_CONTEXT_DIM,
+            actor_config.ppo_hidden_dim,
+            actor_config.action_limit_rad,
         )
-    elif name in {"H1-min", "H1-min-raw"}:
-        actor = MinimalDirectQuadraticActor(
-            observation_dim=koopman.state_dim,
-            lifted_dim=koopman.lifted_dim,
-            action_dim=7,
-            hidden_dims=(actor_config.hidden_dim,),
+    elif name == "KLQR":
+        # KLQR: cost-map (lift + context) -> physical Q diag + p, mapped
+        # through C and solved with the differentiable DARE into a
+        # time-varying closed-loop gain u = -K z - d.
+        actor = KoopmanLQRActor(
+            A=koopman.A,
+            B=koopman.B,
+            C=koopman.C,
             context_dim=TASK_CONTEXT_DIM,
-            conditioning="lifted" if name == "H1-min" else "observation",
+            hidden_dims=(actor_config.hidden_dim,),
             max_action=actor_config.action_limit_rad,
         )
     elif name == "AB-PQ":
@@ -324,7 +308,7 @@ def _build_actor(
 
 
 def _build_value(name: str, koopman: Any, device: torch.device) -> nn.Module:
-    if name == "B0":
+    if name == "PPO":
         value: nn.Module = StandardPPOValue(
             koopman.state_dim, TASK_CONTEXT_DIM
         )
@@ -337,23 +321,24 @@ def _initialize_ppo_modules(
     name: str,
     actor: nn.Module,
     value: nn.Module,
-    *,
-    h1_min_final_gain: float = H1_MIN_FINAL_GAIN,
 ) -> None:
-    """Apply comparable PPO-style initialization to policy and value MLPs."""
+    """Apply PPO-style initialization to the value critic.
 
-    if name in {"H1-min", "H1-min-raw"}:
-        # Minimal-H feeds its output back through a state-dependent matrix
-        # solve. Matching B0 only at reset hid a positive closed-loop feedback
-        # mode: gain=1e-3 reached the bound on about 90% of a deterministic
-        # 220-step rollout. A gain of 2e-6 also remains stable after the
-        # standard 0.05-rad Gaussian exploration perturbs the state, while
-        # retaining a nonzero mean policy with B0-scale closed-loop actions.
-        _orthogonal_linear(actor.network[0], math.sqrt(2.0))
-        _orthogonal_linear(actor.network[2], h1_min_final_gain)
-        _orthogonal_linear(value.network[0], math.sqrt(2.0))
-        _orthogonal_linear(value.network[2], math.sqrt(2.0))
-        _orthogonal_linear(value.network[4], 1.0)
+    The actor final layers are intentionally left at their constructor
+    defaults (zero) instead of the former ``2e-6`` ``g_u`` gain: from-scratch
+    H1-min PPO with that gain never escaped its near-zero policy. The
+    recommended path is BC pretraining + fine-tuning via ``--bc-checkpoint``,
+    which loads real policy weights and must not be overwritten here.
+
+    All remaining routes (PPO, KLQR, AB-PQ, BC-KMPC) keep their constructor
+    initialization; only the shared value critic is orthogonally initialized.
+    """
+
+    if name == "PPO":
+        return
+    _orthogonal_linear(value.network[0], math.sqrt(2.0))
+    _orthogonal_linear(value.network[2], math.sqrt(2.0))
+    _orthogonal_linear(value.network[4], 1.0)
 
 
 def _value_estimate(
@@ -363,7 +348,7 @@ def _value_estimate(
     lifted: torch.Tensor,
     context: torch.Tensor,
 ) -> torch.Tensor:
-    if name == "B0":
+    if name == "PPO":
         return value(normalized_state, context)
     return value(lifted, context)
 
@@ -375,10 +360,10 @@ def _actor_mean(
     lifted: torch.Tensor,
     context: torch.Tensor,
 ) -> torch.Tensor:
-    if name == "B0":
+    if name == "PPO":
         return actor(normalized_state, context)
-    if name in {"H1-min", "H1-min-raw"}:
-        return actor(normalized_state, lifted, context).action
+    if name == "KLQR":
+        return actor(lifted, context).action
     if name == "AB-PQ":
         return actor(torch.cat((lifted, context), dim=-1), lifted).action
     return actor(lifted, context).action
@@ -407,6 +392,7 @@ def train(
     config: PPOConfig,
     device_name: str = "auto",
     resume: bool = True,
+    bc_checkpoint: Path | None = None,
 ) -> dict[str, Any]:
     config.validate()
     if actor_name not in ACTOR_NAMES:
@@ -423,9 +409,28 @@ def train(
     output_dir.mkdir(parents=True, exist_ok=True)
     actor_config = BCConfig(seed=config.seed)
     koopman, koopman_payload = load_koopman(koopman_path, device)
-    actor = _build_actor(actor_name, koopman, actor_config, device)
+    bc_payload: dict[str, Any] | None = None
+    if bc_checkpoint is not None:
+        bc_payload = torch.load(
+            bc_checkpoint, map_location=device, weights_only=False
+        )
+        bc_name = str(bc_payload.get("name"))
+        if bc_name != actor_name:
+            raise ValueError(
+                f"BC checkpoint actor {bc_name!r} does not match "
+                f"requested actor {actor_name!r}"
+            )
+        if bc_payload.get("kind") != "pandareach_threewaypoint_bc_actor":
+            raise ValueError(f"{bc_checkpoint} is not a PandaReach3 BC actor")
+        actor = _build_actor(actor_name, koopman, actor_config, device)
+        # The pretrained policy weights define the initialization; the
+        # PPO-style random init must not overwrite them.
+        actor.load_state_dict(bc_payload["actor_state"])
+    else:
+        actor = _build_actor(actor_name, koopman, actor_config, device)
     value = _build_value(actor_name, koopman, device)
-    _initialize_ppo_modules(actor_name, actor, value)
+    if bc_payload is None:
+        _initialize_ppo_modules(actor_name, actor, value)
     log_std = nn.Parameter(
         torch.full((7,), math.log(config.initial_std_rad), device=device)
     )
@@ -439,22 +444,50 @@ def train(
         ],
         eps=1e-5,
     )
-    state_center = torch.as_tensor(
-        koopman_payload["normalizer"]["center"], device=device, dtype=torch.float32
-    )
-    state_scale = torch.as_tensor(
-        koopman_payload["normalizer"]["scale"], device=device, dtype=torch.float32
-    )
+    if bc_payload is not None:
+        # BC trained with dataset-fitted state/context normalizers; reuse them
+        # exactly so the fine-tuned policy sees the same input distribution.
+        bc_normalizer = bc_payload["normalizer"]
+        state_center = torch.as_tensor(
+            bc_normalizer["state_center"], device=device, dtype=torch.float32
+        )
+        state_scale = torch.as_tensor(
+            bc_normalizer["state_scale"], device=device, dtype=torch.float32
+        )
+        context_center = torch.as_tensor(
+            bc_normalizer["context_center"], device=device, dtype=torch.float32
+        )
+        context_scale = torch.as_tensor(
+            bc_normalizer["context_scale"], device=device, dtype=torch.float32
+        )
+    else:
+        state_center = torch.as_tensor(
+            koopman_payload["normalizer"]["center"],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_scale = torch.as_tensor(
+            koopman_payload["normalizer"]["scale"],
+            device=device,
+            dtype=torch.float32,
+        )
     env = _make_env(config)
     observation, _ = env.reset(seed=config.seed)
-    context_center, context_scale = _initial_context_normalizer(observation, device)
+    if bc_payload is None:
+        context_center, context_scale = _initial_context_normalizer(
+            observation, device
+        )
     latest_path = output_dir / "latest.pt"
-    if actor_name == "B0":
+    if actor_name == "PPO":
+        # The PPO route uses the identical StandardPPOActor in BC and PPO, so
+        # the architecture version is the same for both initialization paths.
         architecture_version = "standard_raw_mlp_256x256_v1"
-    elif actor_name in {"H1-min", "H1-min-raw"}:
-        architecture_version = "minimal_h_orthogonal_stable_v3"
     else:
-        architecture_version = "structured_ppo_v1"
+        architecture_version = (
+            "structured_ppo_bc_v2"
+            if bc_payload is not None
+            else "structured_ppo_v1"
+        )
     start_update = 0
     global_step = 0
     if resume and latest_path.exists():
@@ -490,33 +523,50 @@ def train(
     started = time.perf_counter()
     wall_time_reached = False
     metadata = {
-        "kind": "pandareach_threewaypoint_ppo_from_scratch",
+        "kind": (
+            "pandareach_threewaypoint_ppo_from_scratch"
+            if bc_payload is None
+            else "pandareach_threewaypoint_ppo_bc_finetune"
+        ),
         "actor_name": actor_name,
         "architecture_version": architecture_version,
         "training_spec_version": TRAINING_SPEC_VERSION,
-        "h1_min_final_gain": (
-            H1_MIN_FINAL_GAIN
-            if actor_name in {"H1-min", "H1-min-raw"}
+        "bc_checkpoint": (
+            str(bc_checkpoint.resolve()) if bc_checkpoint is not None else None
+        ),
+        "bc_sha256": (
+            _sha256(bc_checkpoint) if bc_checkpoint is not None else None
+        ),
+        "bc_validation_mse": (
+            float(bc_payload["report"]["best_validation_mse"])
+            if bc_payload is not None
+            else None
+        ),
+        "bc_closed_loop_success": (
+            float(bc_payload["report"]["closed_loop"]["full_success_rate"])
+            if bc_payload is not None
             else None
         ),
         "initialization": (
-            "orthogonal random raw-state MLP actor and critic"
-            if actor_name == "B0"
+            (
+                "BC-pretrained actor weights loaded from checkpoint; random "
+                "value critic and log_std; frozen pretrained Koopman lift"
+            )
+            if bc_payload is not None
             else (
-                "orthogonal nonzero minimal-H actor and critic; frozen "
-                "pretrained Koopman lift"
-                if actor_name in {"H1-min", "H1-min-raw"}
+                "orthogonal random raw-state MLP actor and critic"
+                if actor_name == "PPO"
                 else "random actor; frozen pretrained Koopman lift"
             )
         ),
         "actor_input": (
             "normalize(x) + normalize(task_context)"
-            if actor_name == "B0"
+            if actor_name == "PPO"
             else "method-specific raw/lifted state + normalized task context"
         ),
         "critic_input": (
             "normalize(x) + normalize(task_context)"
-            if actor_name == "B0"
+            if actor_name == "PPO"
             else "frozen Koopman lift + normalized task context"
         ),
         "config": asdict(config),
@@ -871,6 +921,16 @@ def parse_args() -> argparse.Namespace:
         default=Path("runs/pandareach_threewaypoint/koopman/best.pt"),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--bc-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "BC-pretrained actor checkpoint to initialize from and "
+            "fine-tune (recommended path; skips random PPO init and uses "
+            "the BC dataset normalizers)."
+        ),
+    )
     parser.add_argument("--total-timesteps", type=int, default=3_000_000)
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--rollout-steps", type=int, default=256)
@@ -889,6 +949,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dense-waypoint-completion-reward", type=float, default=1.0
     )
+    parser.add_argument(
+        "--goal-threshold",
+        type=float,
+        default=0.01,
+        help="Waypoint-passing and default success radius in meters.",
+    )
+    parser.add_argument(
+        "--success-goal-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Final-success radius in meters; defaults to --goal-threshold. "
+            "Only affects the final success criterion, not waypoint passing."
+        ),
+    )
+    parser.add_argument(
+        "--no-require-robot-static",
+        action="store_true",
+        help=(
+            "Do not require the robot to be static for final success; "
+            "makes the success criterion more lenient."
+        ),
+    )
     parser.add_argument("--checkpoint-interval-updates", type=int, default=10)
     parser.add_argument("--max-wall-time-minutes", type=float, default=None)
     parser.add_argument("--seed", type=int, default=20_280_804)
@@ -899,13 +982,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    default_actor_learning_rates = {
-        "B0": 3e-4,
-        "H1-min": 5e-8,
-        "H1-min-raw": 5e-8,
-        "AB-PQ": 3e-5,
-        "BC-KMPC": 3e-6,
-    }
+    # The tiny per-method actor learning rates were calibrated for
+    # from-scratch initialization. When fine-tuning from a BC-pretrained
+    # policy, use a normal PPO actor LR instead (still overridable).
+    if args.bc_checkpoint is not None:
+        default_actor_learning_rates = {
+            name: 1e-4 for name in ACTOR_NAMES
+        }
+    else:
+        default_actor_learning_rates = {
+            "PPO": 3e-4,
+            "KLQR": 3e-5,
+            "AB-PQ": 3e-5,
+            "BC-KMPC": 3e-6,
+        }
     result = train(
         args.actor,
         args.koopman,
@@ -931,6 +1021,9 @@ def main() -> None:
             dense_waypoint_completion_reward=(
                 args.dense_waypoint_completion_reward
             ),
+            goal_threshold=args.goal_threshold,
+            success_goal_threshold=args.success_goal_threshold,
+            require_robot_static=not args.no_require_robot_static,
             checkpoint_interval_updates=args.checkpoint_interval_updates,
             max_wall_time_seconds=(
                 None
@@ -941,6 +1034,7 @@ def main() -> None:
         ),
         args.device,
         not args.no_resume,
+        args.bc_checkpoint,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

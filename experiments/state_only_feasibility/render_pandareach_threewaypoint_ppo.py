@@ -19,13 +19,11 @@ from experiments.state_only_feasibility.maniskill_pandareach import (
     PandaReachThreeWaypointEnv,
 )
 from experiments.state_only_feasibility.train_pandareach_threewaypoint_bc import (
-    B0Actor,
     BCConfig,
     TASK_CONTEXT_DIM,
     load_koopman,
 )
 from experiments.state_only_feasibility.train_pandareach_threewaypoint_ppo import (
-    H1_MIN_FINAL_GAIN,
     _actor_mean,
     _build_actor,
     _build_value,
@@ -198,37 +196,21 @@ def render_comparison(
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    legacy_b0 = (
-        actor_name == "B0"
-        and payload.get("architecture_version")
-        != "standard_raw_mlp_256x256_v1"
-    )
-    if legacy_b0:
-        initial_actor = B0Actor(
-            koopman.state_dim + TASK_CONTEXT_DIM,
-            actor_config.b0_hidden_dim,
-            actor_config.action_limit_rad,
-        ).to(device)
-        trained_actor = B0Actor(
-            koopman.state_dim + TASK_CONTEXT_DIM,
-            actor_config.b0_hidden_dim,
-            actor_config.action_limit_rad,
-        ).to(device)
-    else:
-        initial_actor = _build_actor(actor_name, koopman, actor_config, device)
-        initial_value = _build_value(actor_name, koopman, device)
-        h1_min_final_gain = H1_MIN_FINAL_GAIN
-        if payload.get("architecture_version") == (
-            "minimal_h_orthogonal_nonzero_v2"
-        ):
-            h1_min_final_gain = 0.001
-        _initialize_ppo_modules(
-            actor_name,
-            initial_actor,
-            initial_value,
-            h1_min_final_gain=h1_min_final_gain,
+    bc_pretrained = payload.get("bc_checkpoint") is not None
+    initial_actor = _build_actor(actor_name, koopman, actor_config, device)
+    initial_value = _build_value(actor_name, koopman, device)
+    if bc_pretrained:
+        # BC-pretrained PPO checkpoint: the "initial" policy is the BC
+        # actor the run was fine-tuned from.
+        bc_payload = torch.load(
+            payload["bc_checkpoint"],
+            map_location=device,
+            weights_only=False,
         )
-        trained_actor = _build_actor(actor_name, koopman, actor_config, device)
+        initial_actor.load_state_dict(bc_payload["actor_state"])
+    else:
+        _initialize_ppo_modules(actor_name, initial_actor, initial_value)
+    trained_actor = _build_actor(actor_name, koopman, actor_config, device)
     trained_actor.load_state_dict(payload["actor_state"])
     state_center = torch.as_tensor(
         koopman_payload["normalizer"]["center"], device=device
@@ -249,6 +231,12 @@ def render_comparison(
             render_mode="rgb_array",
             max_episode_steps=int(payload["config"]["max_episode_steps"]),
             goal_threshold=float(payload["config"]["goal_threshold"]),
+            success_goal_threshold=payload["config"].get(
+                "success_goal_threshold"
+            ),
+            require_robot_static=payload["config"].get(
+                "require_robot_static", True
+            ),
         )
     )
     output_dir.mkdir(parents=True, exist_ok=True)

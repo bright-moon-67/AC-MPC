@@ -1,22 +1,21 @@
-from .ac_koopman_policy import KoopmanLQRPolicy
-from .cost_actor import CostActor
-from .critic import Critic
+"""Structured Koopman RL actors used by the PandaReach3 pipeline.
+
+Only the modules consumed by the PandaReach experiments are exported here;
+the AntMaze TD3+BC / PPO stack was removed during cleanup.
+"""
+
 from .koopman_mpc_actor import KoopmanMPCActor
 from .quadratic_actors import (
     DirectQuadraticActor,
+    KoopmanLQRActor,
     LowRankValueActor,
     MinimalDirectQuadraticActor,
 )
-from .td3_bc import TD3BCTrainer, TwinActionValueCritic
 
 __all__ = [
-    "KoopmanLQRPolicy",
-    "CostActor",
-    "Critic",
     "LowRankValueActor",
     "DirectQuadraticActor",
     "MinimalDirectQuadraticActor",
+    "KoopmanLQRActor",
     "KoopmanMPCActor",
-    "TD3BCTrainer",
-    "TwinActionValueCritic",
 ]
