@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from .model import DeepKoopman
+
+# format_version 3 adds: atomic writes (temp + os.replace), a ``history``
+# field, and full resume state (optimizer + rng + epoch) so training can be
+# continued after an interruption. format_version 2 checkpoints still load.
+FORMAT_VERSION = 3
+
+
+def _atomic_save(payload: dict[str, Any], path: Path) -> None:
+    """Write a checkpoint atomically: temp file in the same dir, then rename.
+
+    Prevents a half-written/corrupt checkpoint if the process is killed
+    mid-save (a crash leaves only the .tmp file, never a broken final one).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
 
 
 def save_checkpoint(
@@ -20,24 +39,22 @@ def save_checkpoint(
     normalizers: dict[str, Any],
     elapsed_seconds: float,
     rng_state: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "format_version": 2,
-            "architecture": model.architecture(),
-            "model": model.state_dict(),
-            "optimizer": None if optimizer is None else optimizer.state_dict(),
-            "epoch": int(epoch),
-            "best_validation": float(best_validation),
-            "config": config,
-            "normalizers": normalizers,
-            "elapsed_seconds": float(elapsed_seconds),
-            "rng_state": rng_state,
-        },
-        path,
-    )
+    payload = {
+        "format_version": FORMAT_VERSION,
+        "architecture": model.architecture(),
+        "model": model.state_dict(),
+        "optimizer": None if optimizer is None else optimizer.state_dict(),
+        "epoch": int(epoch),
+        "best_validation": float(best_validation),
+        "config": config,
+        "normalizers": normalizers,
+        "elapsed_seconds": float(elapsed_seconds),
+        "rng_state": rng_state,
+        "history": history if history is not None else [],
+    }
+    _atomic_save(payload, path)
 
 
 def load_checkpoint(

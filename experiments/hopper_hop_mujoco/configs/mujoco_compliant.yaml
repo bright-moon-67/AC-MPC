@@ -1,0 +1,14 @@
+# MuJoCo Hopper — compliant contact (primary comparison vs PhysX-hard).
+# Soft: timeconst 0.08 s, d0=0.2 (soft onset), width=10 mm (gradual impedance),
+# margin=10 mm (force generation from a distance). Sliding friction 0.3 is
+# matched to the PhysX material (PhysxMaterial(0.3,0.3,0.0)).
+name: mujoco_compliant
+solref: [0.08, 1.0]
+solimp: [0.2, 0.9, 0.01, 0.5, 2.0]
+margin: 0.01
+sliding_friction: 0.3
+description: >-
+  Medium compliant contact for the PhysX-hard vs MuJoCo-compliant comparison.
+  Effective stiffness ~1.2 kN/m, resting penetration ~6.3 mm (analytical);
+  finite compression over several physics steps; still stiff enough for
+  sustained hopping.

@@ -1,0 +1,13 @@
+# MuJoCo Hopper — default contact (native MuJoCo / dm_control Hopper defaults).
+# This is the "simulator-native" reference: solref/solimp/margin are MuJoCo
+# defaults; sliding friction is the MuJoCo geom default (1.0), which differs
+# from the PhysX material (0.3) — use mujoco_compliant / mujoco_hard for the
+# controlled hard-vs-compliant comparison.
+name: mujoco_default
+solref: [0.02, 1.0]
+solimp: [0.9, 0.95, 0.001, 0.5, 2.0]
+margin: 0.0
+sliding_friction: 1.0
+description: >-
+  Native MuJoCo / dm_control Hopper contact defaults. Effective stiffness
+  ~18 kN/m, resting penetration ~0.2 mm (analytical).

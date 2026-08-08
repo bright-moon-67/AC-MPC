@@ -1,0 +1,13 @@
+# MuJoCo Hopper — hard contact (scientific control for simulator-vs-compliance).
+# Near-rigid: timeconst 5 ms, d0=d_width=0.999 (impedance ~1 at onset),
+# width 0.1 mm (abrupt ramp). Sliding friction 0.3 matched to PhysX.
+# Compared against mujoco_compliant this isolates "compliance difference";
+# compared against MS-HopperHop-v1 it isolates "simulator difference".
+name: mujoco_hard
+solref: [0.005, 1.0]
+solimp: [0.999, 0.999, 0.0001, 0.5, 2.0]
+margin: 0.0
+sliding_friction: 0.3
+description: >-
+  Much-harder-than-default MuJoCo contact (scientific control).
+  Effective stiffness ~280 kN/m, resting penetration ~0.25 um (analytical).
