@@ -11,8 +11,8 @@ lowered when running on a single GPU.
 
 The AC-MPC routes share the same NatureCNN rgb features but feed them through
 a context head into structured actors on the frozen robot Koopman:
-  * ``KLQR``   : KoopmanLQRActor (closed-form DARE gain).
-  * ``BC-KMPC``: KoopmanMPCActor (differentiable condensed box-QP).
+  * ``KLQR`` : KoopmanLQRActor (closed-form DARE gain).
+  * ``KMPC`` : KoopmanMPCActor (differentiable condensed box-QP).
   * ``AB-PQ``  : LowRankValueActor (low-rank quadratic value -> box-QP).
 ``extra/goal_pos`` is used only for a training-time pos_branch auxiliary loss
 on the context (privileged, never an input for the AC-MPC routes).
@@ -53,7 +53,7 @@ from experiments.maniskill_pick_visual.visual_pick_cube import (
     VisualPickCubeEnv,  # registers ACMPC-VisualPickCube-v1
 )
 
-ACTOR_NAMES = ("PPO", "KLQR", "BC-KMPC", "AB-PQ")
+ACTOR_NAMES = ("PPO", "KLQR", "KMPC", "AB-PQ")
 ROBOT_DIM = 21
 ACTION_DIM = 8
 # Official PPO "state" = qpos9 + qvel9 + is_grasped1 + tcp_pose7 + goal_pos3.
@@ -188,7 +188,7 @@ class ContextHead(nn.Module):
 
 
 class ValueNetwork(nn.Module):
-    """Value on the frozen Koopman lift + context (KLQR / BC-KMPC / AB-PQ)."""
+    """Value on the frozen Koopman lift + context (KLQR / KMPC / AB-PQ)."""
 
     def __init__(self, input_dim: int) -> None:
         super().__init__()
@@ -365,7 +365,7 @@ def _build_actor(
             hidden_dims=(config.context_hidden_dim,),
             max_action=1.0,
         ).to(device)
-    if actor_name == "BC-KMPC":
+    if actor_name == "KMPC":
         return KoopmanMPCActor(
             A=koopman.A,
             B=koopman.B,
@@ -410,7 +410,7 @@ def _structured_mean(
     lifted: torch.Tensor,
     context: torch.Tensor,
 ) -> torch.Tensor:
-    if actor_name in ("KLQR", "BC-KMPC"):
+    if actor_name in ("KLQR", "KMPC"):
         return actor(lifted, context).action
     return actor(torch.cat((lifted, context), dim=-1), lifted).action
 
@@ -902,6 +902,20 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--num-envs", type=int, default=None)
+    # Expose the official ManiSkill PPO RGB knobs so the PPO route can be run
+    # with the recommended parameters (gamma=0.8, gae=0.9, update_epochs=4,
+    # rollout_steps=50, minibatch=batch/32, target_kl=0.2, no lr anneal).
+    # Structured routes (KLQR/KMPC/AB-PQ) share the same base PPO hyperparams.
+    parser.add_argument("--rollout-steps", type=int, default=None)
+    parser.add_argument("--update-epochs", type=int, default=None)
+    parser.add_argument("--minibatch-size", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--discount", type=float, default=None)
+    parser.add_argument("--gae-lambda", type=float, default=None)
+    parser.add_argument("--target-kl", type=float, default=None)
+    parser.add_argument("--anneal-lr", type=lambda s: s.lower() in ("1", "true", "yes"), default=None)
+    parser.add_argument("--max-episode-steps", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--smoke",
@@ -910,13 +924,26 @@ def main() -> None:
     )
     args = parser.parse_args()
     base = PPOConfig()
+    overrides = {
+        "total_timesteps": args.total_timesteps,
+        "num_envs": args.num_envs,
+        "rollout_steps": args.rollout_steps,
+        "update_epochs": args.update_epochs,
+        "minibatch_size": args.minibatch_size,
+        "learning_rate": args.learning_rate,
+        "discount": args.discount,
+        "gae_lambda": args.gae_lambda,
+        "target_kl": args.target_kl,
+        "anneal_learning_rate": args.anneal_lr,
+        "max_episode_steps": args.max_episode_steps,
+        "seed": args.seed,
+    }
     config = PPOConfig(
-        total_timesteps=(
-            args.total_timesteps
-            if args.total_timesteps is not None
-            else base.total_timesteps
-        ),
-        num_envs=args.num_envs if args.num_envs is not None else base.num_envs,
+        **{
+            name: value
+            for name, value in overrides.items()
+            if value is not None
+        }
     )
     summary = train(
         args.actor,

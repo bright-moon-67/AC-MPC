@@ -3,7 +3,7 @@
 The PickCube causal dataset stores ``robot`` = [qpos9, qvel9, tcp_xyz3] (21)
 and normalized ``actions`` (8, [-1, 1]) per trajectory group.  This trainer
 fits a DeepKoopman on the robot dynamics only (no visual latent), producing
-the frozen lift that the AC-MPC visual PPO actors (BC-KMPC, AB-PQ) consume.
+the frozen lift that the AC-MPC visual PPO actors (KMPC, AB-PQ) consume.
 
 Mid-training artifacts (per project convention):
   * ``recovery_epoch_XXXX.pt`` every 25 epochs
