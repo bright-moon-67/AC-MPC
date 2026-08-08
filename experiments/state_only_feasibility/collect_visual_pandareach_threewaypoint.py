@@ -39,10 +39,14 @@ from experiments.state_only_feasibility.maniskill_pandareach import (
 from experiments.state_only_feasibility.visual_pandareach_env import (
     VisualPandaReachThreeWaypointEnv,
 )
+from experiments.state_only_feasibility.visual_pandareach_single_goal import (
+    VisualPandaReachSingleGoalEnv,
+)
 
 
 @dataclass(frozen=True)
 class CollectionConfig:
+    env_id: str = "ACMPC-VisualPandaReach3-v0"
     episodes: int = 100
     seed_start: int = 20_260_804
     split_seed: int = 31
@@ -56,8 +60,16 @@ class CollectionConfig:
     action_radians: float = 0.1
     # ManiSkill minimal-shader depth is in millimeters (uint16).
     depth_scale: float = 2500.0
+    # Workspace-space goal sampling box for the single-goal env; None keeps the
+    # FK-certified waypoint path used by the three-waypoint collector.
+    goal_region_radius: tuple[float, float, float] | None = None
 
     def validate(self) -> None:
+        if self.env_id not in {
+            "ACMPC-VisualPandaReach3-v0",
+            "ACMPC-VisualPandaReach1-v0",
+        }:
+            raise ValueError(f"Unsupported visual env id {self.env_id!r}")
         if self.episodes < 3:
             raise ValueError("At least three episodes are required")
         if self.steps_per_waypoint < 1:
@@ -74,6 +86,13 @@ class CollectionConfig:
             raise ValueError("action_radians must be positive")
         if self.depth_scale <= 0:
             raise ValueError("depth_scale must be positive")
+        if self.goal_region_radius is not None and (
+            len(self.goal_region_radius) != 3
+            or any(value <= 0 for value in self.goal_region_radius)
+        ):
+            raise ValueError(
+                "goal_region_radius must be three positive values or None"
+            )
 
 
 def _unbatch(value: Any, *, name: str) -> np.ndarray:
@@ -113,8 +132,7 @@ def collect(config: CollectionConfig, output_path: Path) -> dict[str, Any]:
     config.validate()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    base_env = gym.make(
-        "ACMPC-VisualPandaReach3-v0",
+    env_kwargs = dict(
         num_envs=1,
         obs_mode="rgb+depth",
         control_mode="pd_joint_delta_pos",
@@ -124,6 +142,12 @@ def collect(config: CollectionConfig, output_path: Path) -> dict[str, Any]:
         goal_threshold=config.goal_threshold,
         waypoint_joint_jitter=config.waypoint_joint_jitter,
     )
+    region = config.goal_region_radius
+    if config.env_id == "ACMPC-VisualPandaReach1-v0":
+        region = region if region is not None else (0.06, 0.06, 0.03)
+        env_kwargs["goal_region_radius"] = region
+        env_kwargs["goal_marker_scale"] = 5.0
+    base_env = gym.make(config.env_id, **env_kwargs)
     env = PandaArmOnlyActionWrapper(base_env)
     env.reset(seed=config.seed_start)
     unwrapped = env.unwrapped
@@ -176,17 +200,27 @@ def collect(config: CollectionConfig, output_path: Path) -> dict[str, Any]:
         for episode_id in range(config.episodes):
             seed = config.seed_start + episode_id
             observation, _ = env.reset(seed=seed)
-            waypoints = _numpy(unwrapped.waypoints).reshape(3, 3).copy()
-            oracle_qpos = _numpy(unwrapped.oracle_waypoint_qpos).reshape(3, 7).copy()
+            waypoint_count = int(unwrapped.waypoint_count)
+            waypoints = _numpy(unwrapped.waypoints).reshape(
+                waypoint_count, 3
+            ).copy()
+            oracle_qpos = _numpy(unwrapped.oracle_waypoint_qpos).reshape(
+                waypoint_count, 7
+            ).copy()
             full_qpos = _numpy(unwrapped.agent.robot.get_qpos()).reshape(9)
-            fk_residual = np.empty(3, dtype=np.float32)
-            for waypoint_index in range(3):
-                certificate = full_qpos.copy()
-                certificate[:7] = oracle_qpos[waypoint_index]
-                certified = expert.fk_tcp_world(certificate)
-                fk_residual[waypoint_index] = np.linalg.norm(
-                    certified - waypoints[waypoint_index]
-                )
+            if region is not None:
+                # Waypoints are deliberately offset in workspace space after
+                # FK, so the oracle-qpos certificate no longer matches them.
+                fk_residual = np.zeros(waypoint_count, dtype=np.float32)
+            else:
+                fk_residual = np.empty(waypoint_count, dtype=np.float32)
+                for waypoint_index in range(waypoint_count):
+                    certificate = full_qpos.copy()
+                    certificate[:7] = oracle_qpos[waypoint_index]
+                    certified = expert.fk_tcp_world(certificate)
+                    fk_residual[waypoint_index] = np.linalg.norm(
+                        certified - waypoints[waypoint_index]
+                    )
             if not np.isfinite(waypoints).all() or float(fk_residual.max()) > 2e-4:
                 raise RuntimeError(f"Episode {episode_id} failed FK certification")
 
@@ -362,7 +396,7 @@ def collect(config: CollectionConfig, output_path: Path) -> dict[str, Any]:
                 "minimum": arrays["episode_waypoints"][:, index].min(0).tolist(),
                 "maximum": arrays["episode_waypoints"][:, index].max(0).tolist(),
             }
-            for index in range(3)
+            for index in range(int(arrays["episode_waypoints"].shape[1]))
         },
         "config": asdict(config),
     }
@@ -374,13 +408,26 @@ def collect(config: CollectionConfig, output_path: Path) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--env-id",
+        default=CollectionConfig.env_id,
+        choices=["ACMPC-VisualPandaReach3-v0", "ACMPC-VisualPandaReach1-v0"],
+    )
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--seed-start", type=int, default=None)
     parser.add_argument("--steps-per-waypoint", type=int, default=None)
     parser.add_argument("--depth-scale", type=float, default=None)
+    parser.add_argument(
+        "--goal-region-radius",
+        type=str,
+        default=None,
+        help="comma-separated x,y,z workspace half-extents for the single-goal "
+        "env, e.g. 0.06,0.06,0.03 (skips FK certification)",
+    )
     args = parser.parse_args()
 
     config = CollectionConfig(
+        env_id=args.env_id,
         episodes=args.episodes if args.episodes is not None else CollectionConfig.episodes,
         seed_start=(
             args.seed_start if args.seed_start is not None else CollectionConfig.seed_start
@@ -392,6 +439,11 @@ def main() -> None:
         ),
         depth_scale=(
             args.depth_scale if args.depth_scale is not None else CollectionConfig.depth_scale
+        ),
+        goal_region_radius=(
+            tuple(float(v) for v in args.goal_region_radius.split(","))
+            if args.goal_region_radius is not None
+            else None
         ),
     )
     collect(config, args.output)

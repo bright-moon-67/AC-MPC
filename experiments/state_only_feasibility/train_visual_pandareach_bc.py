@@ -47,6 +47,9 @@ from experiments.state_only_feasibility.visual_encoder import VisualEncoder
 from experiments.state_only_feasibility.visual_pandareach_env import (
     VisualPandaReachThreeWaypointEnv,
 )
+from experiments.state_only_feasibility.visual_pandareach_single_goal import (
+    VisualPandaReachSingleGoalEnv,
+)
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,10 @@ class VisualBCConfig:
     # ManiSkill minimal-shader depth is in millimeters (uint16).
     depth_scale: float = 2500.0
     pos_weight: float = 0.5
+    # Fix A: use the pos_branch goal estimate as the costmap context (explicit
+    # visual target) instead of the raw latent v.
+    use_goal_context: bool = True
+    env_id: str = "ACMPC-VisualPandaReach3-v0"
     kmpc_horizon: int = 10
     kmpc_solver_iterations: int = 20
     kmpc_sequence_weight: float = 0.25
@@ -75,6 +82,11 @@ class VisualBCConfig:
     evaluation_seed_start: int = 20_270_804
     max_episode_steps: int = 220
     goal_threshold: float = 0.01
+    # Single-goal eval must match the collection env (enlarged workspace goal
+    # sampling region + larger visible marker) or the closed-loop metric is
+    # measured on a different task distribution than the data.
+    goal_region_radius: tuple[float, float, float] | None = (0.06, 0.06, 0.03)
+    goal_marker_scale: float = 5.0
 
     def validate(self) -> None:
         if self.epochs < 1 or self.batch_size < 1:
@@ -159,6 +171,7 @@ def _evaluate_mse(
     goal_scale: np.ndarray,
     loader: DataLoader,
     device: torch.device,
+    use_goal_context: bool,
 ) -> float:
     total = 0.0
     elements = 0
@@ -173,8 +186,9 @@ def _evaluate_mse(
                 action.to(device),
             )
             lifted = koopman.lift(state)
-            v, _ = encoder(rgb, depth)
-            prediction = actor(lifted, v).action
+            v, pos = encoder(rgb, depth)
+            context = pos if use_goal_context else v
+            prediction = actor(lifted, context).action
             total += float((prediction - action).square().sum())
             elements += action.numel()
     encoder.train()
@@ -209,7 +223,7 @@ def closed_loop_evaluation(
 ) -> dict[str, Any]:
     env = PandaArmOnlyActionWrapper(
         gym.make(
-            "ACMPC-VisualPandaReach3-v0",
+            config.env_id,
             num_envs=1,
             obs_mode="rgb+depth",
             control_mode="pd_joint_delta_pos",
@@ -217,6 +231,14 @@ def closed_loop_evaluation(
             render_mode=None,
             max_episode_steps=config.max_episode_steps,
             goal_threshold=config.goal_threshold,
+            **(
+                {
+                    "goal_region_radius": config.goal_region_radius,
+                    "goal_marker_scale": config.goal_marker_scale,
+                }
+                if config.env_id == "ACMPC-VisualPandaReach1-v0"
+                else {}
+            ),
         )
     )
     successes = 0
@@ -246,8 +268,9 @@ def closed_loop_evaluation(
                 ).unsqueeze(0)
                 with torch.no_grad():
                     lifted = koopman.lift(state_tensor)
-                    v, _ = encoder(rgb_tensor, depth_tensor)
-                    action = actor(lifted, v).action
+                    v, pos = encoder(rgb_tensor, depth_tensor)
+                    context = pos if config.use_goal_context else v
+                    action = actor(lifted, context).action
                 action_rad = action.squeeze(0).cpu().numpy()
                 bound_count += int(
                     np.count_nonzero(
@@ -300,6 +323,7 @@ def train(
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     device = _resolve_device(device_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     with np.load(dataset_path, allow_pickle=False) as archive:
         data = {name: archive[name] for name in archive.files}
@@ -346,7 +370,7 @@ def train(
         B=koopman.B,
         C=koopman.C,
         horizon=config.kmpc_horizon,
-        context_dim=config.v_dim,
+        context_dim=3 if config.use_goal_context else config.v_dim,
         hidden_dims=(config.costmap_hidden_dim,),
         action_low=-config.action_limit_rad,
         action_high=config.action_limit_rad,
@@ -390,7 +414,8 @@ def train(
             with torch.no_grad():
                 lifted = koopman.lift(state)
             v, pos = encoder(rgb, depth)
-            output = actor(lifted, v)
+            context = pos if config.use_goal_context else v
+            output = actor(lifted, context)
             loss = (output.action - action).square().mean()
             if output.action_sequence.shape[-2] > 1:
                 errors = (
@@ -430,6 +455,7 @@ def train(
                 goal_scale,
                 loaders["validation"],
                 device,
+                config.use_goal_context,
             )
             if validation < best_validation:
                 best_validation = validation
@@ -439,6 +465,33 @@ def train(
                     "encoder": copy.deepcopy(encoder.state_dict()),
                     "actor": copy.deepcopy(actor.state_dict()),
                 }
+            with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "epoch": epoch,
+                            "validation_mse": validation,
+                            "best_epoch": best_epoch,
+                            "best_validation_mse": best_validation,
+                        }
+                    )
+                    + "\n"
+                )
+                handle.flush()
+        if epoch % 50 == 0:
+            torch.save(
+                {
+                    "method": "visual_bc_kmpc",
+                    "config": asdict(config),
+                    "koopman_checkpoint": str(koopman_path.resolve()),
+                    "epoch": epoch,
+                    "best_epoch": best_epoch,
+                    "best_validation_mse": best_validation,
+                    "encoder": copy.deepcopy(encoder.state_dict()),
+                    "actor": copy.deepcopy(actor.state_dict()),
+                },
+                output_dir / f"recovery_epoch_{epoch:04d}.pt",
+            )
         if epoch == 1 or epoch % 50 == 0 or epoch == config.epochs:
             print(
                 f"epoch={epoch:04d} val_mse={validation:.6g}",
@@ -482,6 +535,7 @@ def train(
         goal_scale,
         loaders["test"],
         device,
+        config.use_goal_context,
     )
     evaluation = closed_loop_evaluation(
         encoder,
@@ -536,6 +590,10 @@ def main() -> None:
     parser.add_argument("--use-dct", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pos-weight", type=float, default=None)
     parser.add_argument("--kmpc-horizon", type=int, default=None)
+    parser.add_argument("--env-id", default=VisualBCConfig.env_id)
+    parser.add_argument(
+        "--use-goal-context", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--evaluation-episodes", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
@@ -550,6 +608,8 @@ def main() -> None:
         v_dim=args.v_dim if args.v_dim is not None else defaults.v_dim,
         use_dct=args.use_dct,
         pos_weight=args.pos_weight if args.pos_weight is not None else defaults.pos_weight,
+        use_goal_context=args.use_goal_context,
+        env_id=args.env_id,
         kmpc_horizon=(
             args.kmpc_horizon if args.kmpc_horizon is not None else defaults.kmpc_horizon
         ),
