@@ -1,4 +1,4 @@
-"""Train and evaluate the four HopperHop BC actors (PPO / KLQR / AB-PQ / BC-KMPC).
+"""Train and evaluate the four HopperHop BC actors (PPO / KLQR / AB-PQ / KMPC).
 
 Behavior-cloning pretraining on expert transitions rolled out from the trained
 50M-step PPO policies (``collect_hopperhop_expert.py``), followed by a
@@ -7,14 +7,16 @@ closed-loop evaluation in MS-HopperHop.
 Actors (all cost-map / controller heads reuse the frozen global Koopman model
 ``A,B,C`` from ``runs/hopper_hop/koopman_v2/best.pt``):
 
-    PPO      : standard Gaussian-mean MLP on the RAW 15-dim state (the same
-               convention as the PPO baseline trainer, so BC weights transfer
-               to PPO fine-tuning and the baseline comparison is apples-to-
-               apples). No Koopman lift.
-    KLQR     : cost-map (lift) -> Q_diag, p -> differentiable DARE ->
-               time-varying closed-loop gain (replaces the H1-min series).
-    AB-PQ    : low-rank quadratic value head greedified through A,B (AB-PQ).
-    BC-KMPC  : cost-map (lift) -> finite-horizon box-QP Koopman MPC.
+    PPO    : standard Gaussian-mean MLP on the RAW 15-dim state (the same
+             convention as the PPO baseline trainer, so BC weights transfer
+             to PPO fine-tuning and the baseline comparison is apples-to-
+             apples). No Koopman lift.
+    KLQR   : cost-map (lift) -> Q_diag, p -> differentiable DARE ->
+             time-varying closed-loop gain (replaces the H1-min series).
+    AB-PQ  : low-rank quadratic value head greedified through A,B (AB-PQ).
+    KMPC   : cost-map (lift) -> finite-horizon box-QP Koopman MPC
+             (previously called BC-KMPC; renamed to be peer-level with
+             AB-PQ / KLQR since no BC init is used).
 
 HopperHop has no task context (pure locomotion), so ``context_dim=0``
 everywhere.  Actions are the normalized ``pd_joint_delta_pos`` in [-1, 1]
@@ -109,7 +111,14 @@ class StandardPPOActor(nn.Module):
         return self.action_limit * self.network(state)
 
 
-BC_ACTOR_ORDER = ("PPO", "KLQR", "AB-PQ", "BC-KMPC")
+BC_ACTOR_ORDER = ("PPO", "KLQR", "AB-PQ", "KMPC")
+# Legacy name used before the BC-KMPC -> KMPC rename; keep old checkpoints
+# loadable (their ``name`` / ``actor_name`` fields still say "BC-KMPC").
+ACTOR_NAME_ALIASES = {"BC-KMPC": "KMPC"}
+
+
+def canonical_actor_name(name: str) -> str:
+    return ACTOR_NAME_ALIASES.get(name, name)
 
 
 def load_koopman(path: Path, device: torch.device) -> tuple[DeepKoopman, dict]:
@@ -413,7 +422,7 @@ def _make_builders(
             hidden_dims=(config.hidden_dim,),
             max_action=config.action_limit,
         ),
-        "BC-KMPC": lambda: KoopmanMPCActor(
+        "KMPC": lambda: KoopmanMPCActor(
             A=koopman.A,
             B=koopman.B,
             C=koopman.C,
@@ -704,7 +713,7 @@ def evaluate_checkpoint(
     )
     if payload.get("kind") != "hopperhop_bc_actor":
         raise ValueError(f"{actor_name}.pt is not a HopperHop BC actor")
-    if payload.get("name") != actor_name:
+    if canonical_actor_name(payload.get("name")) != canonical_actor_name(actor_name):
         raise ValueError(f"Checkpoint actor name mismatch")
     koopman, _ = load_koopman(koopman_path, device)
     actor = _make_builders(koopman, config, device)[actor_name]().to(device)

@@ -9,8 +9,8 @@ the comparison is robust to episode randomness.
 
 Example:
   python -m experiments.hopper_hop.eval_hopperhop_multiseed \
-      --actor BC-KMPC \
-      --checkpoint runs/hopper_hop/ppo_fair/BC-KMPC/latest.pt \
+      --actor KMPC \
+      --checkpoint runs/hopper_hop/ppo_fair/KMPC/latest.pt \
       --koopman runs/hopper_hop/koopman_v2/best.pt \
       --eval-seeds 10 --episodes 64
 """
@@ -27,6 +27,7 @@ import torch
 from experiments.hopper_hop.train_hopper_hop_bc import (
     BC_ACTOR_ORDER,
     BCConfig,
+    canonical_actor_name,
     closed_loop_evaluation,
     load_koopman,
     _make_builders,
@@ -45,7 +46,7 @@ def _load_actor(
     )
     # PPO-actors latest.pt: keys actor_state / actor_name / center / scale
     if "actor_state" in payload and "actor_name" in payload:
-        if payload["actor_name"] != actor_name:
+        if canonical_actor_name(payload["actor_name"]) != canonical_actor_name(actor_name):
             raise ValueError(
                 f"Checkpoint actor {payload['actor_name']!r} != requested {actor_name!r}"
             )
@@ -54,7 +55,7 @@ def _load_actor(
         source = "ppo"
     # BC {actor}.pt: keys actor_state / name / normalizer
     elif "actor_state" in payload and payload.get("kind") == "hopperhop_bc_actor":
-        if payload.get("name") != actor_name:
+        if canonical_actor_name(payload.get("name")) != canonical_actor_name(actor_name):
             raise ValueError(f"Checkpoint actor name mismatch")
         normalizer = payload["normalizer"]
         center = np.asarray(normalizer["state_center"], dtype=np.float32)
@@ -166,7 +167,7 @@ def evaluate_multiseed(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--actor", default="BC-KMPC", choices=BC_ACTOR_ORDER)
+    parser.add_argument("--actor", default="KMPC", choices=BC_ACTOR_ORDER)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
         "--koopman",

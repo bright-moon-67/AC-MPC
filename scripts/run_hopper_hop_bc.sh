@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Parallel Behavior-Cloning for the four HopperHop actors
-# (PPO / KLQR / AB-PQ / BC-KMPC), one process per actor.
+# (PPO / KLQR / AB-PQ / KMPC), one process per actor.
 #
 #   HOPPER_BC_EPOCHS       per-actor BC epochs (default 250)
 #   HOPPER_BC_BATCH        batch size (default 2048)
@@ -19,7 +19,7 @@ dataset="${HOPPER_BC_DATASET:-${project_root}/runs/hopper_hop/data/hopperhop_exp
 koopman="${HOPPER_BC_KOOPMAN:-${project_root}/runs/hopper_hop/koopman_v2/best.pt}"
 epochs="${HOPPER_BC_EPOCHS:-250}"
 batch="${HOPPER_BC_BATCH:-2048}"
-actors="${HOPPER_BC_ACTORS:-PPO KLQR AB-PQ BC-KMPC}"
+actors="${HOPPER_BC_ACTORS:-PPO KLQR AB-PQ KMPC}"
 
 if [[ ! -x "${python_bin}" ]]; then
     echo "Python executable not found: ${python_bin}" >&2

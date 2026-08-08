@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Parallel from-scratch PPO for the four HopperHop actors
-# (PPO / KLQR / AB-PQ / BC-KMPC), one process per actor.
+# (PPO / KLQR / AB-PQ / KMPC), one process per actor.
 #
 #   PPO4_NUM_ENVS        parallel envs per actor process (default 2048, the
 #                         official PPO baseline config)
@@ -26,7 +26,7 @@ total_timesteps="${PPO4_TOTAL_TIMESTEPS:-100000000}"
 initial_std="${PPO4_INITIAL_STD:-1.0}"
 seed="${PPO4_SEED:-20240801}"
 learning_rate="${PPO4_LR:-0.0003}"
-actors="${PPO4_ACTORS:-PPO KLQR AB-PQ BC-KMPC}"
+actors="${PPO4_ACTORS:-PPO KLQR AB-PQ KMPC}"
 # minibatch = num_envs * rollout / 32 minibatches (matches the PPO baseline)
 minibatch_size=$(( num_envs * rollout_steps / 32 ))
 

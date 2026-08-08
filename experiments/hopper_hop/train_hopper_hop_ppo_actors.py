@@ -1,4 +1,4 @@
-"""PPO training for the four HopperHop actors (PPO / KLQR / AB-PQ / BC-KMPC).
+"""PPO training for the four HopperHop actors (PPO / KLQR / AB-PQ / KMPC).
 
 Supports two initialization modes per actor:
 
@@ -11,11 +11,12 @@ Supports two initialization modes per actor:
 The policy is a Gaussian over each actor's deterministic mean:
 
   ``mean = actor_mean(obs)`` (raw 15-dim state for PPO; Koopman lift for
-  KLQR / AB-PQ / BC-KMPC),  ``a ~ Normal(mean, log_std.exp())``.
+  KLQR / AB-PQ / KMPC),  ``a ~ Normal(mean, log_std.exp())``.
 
 Hyperparameters match the PPO baseline trainer (num_envs=2048, rollout 100,
 minibatch 6400, 8 update epochs, GAE lambda 0.95, gamma 0.99, annealed lr).
-Resume is supported via ``latest.pt`` (atomic writes).
+Resume is supported via ``latest.pt`` (atomic writes) and the best policy is
+saved separately to ``best.pt``.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from torch.distributions import Normal
 from experiments.hopper_hop.train_hopper_hop_bc import (
     BC_ACTOR_ORDER,
     BCConfig,
+    canonical_actor_name,
     StandardPPOActor,
     closed_loop_evaluation,
     load_koopman,
@@ -172,7 +174,9 @@ def train(
         bc_payload = torch.load(
             bc_checkpoint, map_location=device, weights_only=False
         )
-        if bc_payload.get("name") != actor_name:
+        if canonical_actor_name(bc_payload.get("name")) != canonical_actor_name(
+            actor_name
+        ):
             raise ValueError(
                 f"BC checkpoint actor {bc_payload.get('name')!r} does not "
                 f"match requested actor {actor_name!r}"
@@ -245,7 +249,9 @@ def train(
         payload = torch.load(
             latest_path, map_location=device, weights_only=False
         )
-        if payload.get("actor_name") != actor_name:
+        if canonical_actor_name(payload.get("actor_name")) != canonical_actor_name(
+            actor_name
+        ):
             raise ValueError("Resume checkpoint actor does not match requested actor")
         if payload.get("training_spec_version") != TRAINING_SPEC_VERSION:
             raise ValueError(
