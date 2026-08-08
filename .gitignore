@@ -15,6 +15,7 @@ dist/
 .env.*
 data/raw/
 data/processed/
+.data/
 runs/
 .cleanup_trash/
 .venv/

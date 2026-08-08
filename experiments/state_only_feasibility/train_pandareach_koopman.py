@@ -491,38 +491,46 @@ def train(
             else float("nan"),
         }
         history.append(epoch_record)
-        if validation_mse < best_validation:
+        with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(epoch_record) + "\n")
+            handle.flush()
+        is_best = validation_mse < best_validation
+        if is_best:
             best_validation = validation_mse
             best_epoch = epoch
+        checkpoint_payload = {
+            "kind": "pandareach_k_step_koopman",
+            "model_state": model.state_dict(),
+            "architecture": model.architecture(),
+            "normalizer": {
+                "center": torch.from_numpy(center),
+                "scale": torch.from_numpy(scale),
+                "fit": (
+                    "train episodes only; q/tcp center=train mean for "
+                    "q_qdot_tcp, q center=train mean otherwise"
+                ),
+            },
+            "state_kind": state_kind,
+            "config": asdict(config),
+            "dataset_path": str(dataset_path.resolve()),
+            "dataset_sha256": _sha256(dataset_path),
+            "best_epoch": best_epoch,
+            "best_validation_rollout_normalized_mse": best_validation,
+            "k_step": config.k_step,
+            "history": config.history,
+            "split_episode_ids": {
+                split: torch.from_numpy(
+                    data[f"{split}_episode_ids"]
+                )
+                for split in ("train", "validation", "test")
+            },
+        }
+        if is_best:
+            torch.save(checkpoint_payload, checkpoint_path)
+        if epoch % 25 == 0:
             torch.save(
-                {
-                    "kind": "pandareach_k_step_koopman",
-                    "model_state": model.state_dict(),
-                    "architecture": model.architecture(),
-                    "normalizer": {
-                        "center": torch.from_numpy(center),
-                        "scale": torch.from_numpy(scale),
-                        "fit": (
-                            "train episodes only; q/tcp center=train mean for "
-                            "q_qdot_tcp, q center=train mean otherwise"
-                        ),
-                    },
-                    "state_kind": state_kind,
-                    "config": asdict(config),
-                    "dataset_path": str(dataset_path.resolve()),
-                    "dataset_sha256": _sha256(dataset_path),
-                    "best_epoch": best_epoch,
-                    "best_validation_rollout_normalized_mse": best_validation,
-                    "k_step": config.k_step,
-                    "history": config.history,
-                    "split_episode_ids": {
-                        split: torch.from_numpy(
-                            data[f"{split}_episode_ids"]
-                        )
-                        for split in ("train", "validation", "test")
-                    },
-                },
-                checkpoint_path,
+                {**checkpoint_payload, "epoch": epoch},
+                output_dir / f"recovery_epoch_{epoch:04d}.pt",
             )
         if epoch == 1 or epoch % 25 == 0 or epoch == config.epochs:
             elapsed = time.perf_counter() - start_time
