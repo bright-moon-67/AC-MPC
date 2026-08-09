@@ -637,6 +637,7 @@ class KoopmanLQRActor(nn.Module):
         max_action: float | None = None,
         check_stabilizable: bool = True,
         check_detectable: bool = True,
+        perception_only_network: bool = False,
     ) -> None:
         super().__init__()
         if A.ndim != 2 or A.shape[0] != A.shape[1]:
@@ -656,6 +657,11 @@ class KoopmanLQRActor(nn.Module):
             raise ValueError("Invalid DARE tolerance or iteration count")
         if max_action is not None and max_action <= 0:
             raise ValueError("max_action must be positive when provided")
+        if perception_only_network and context_dim < 1:
+            raise ValueError(
+                "perception_only_network requires a context_dim >= 1 "
+                "(the context IS the perception input)"
+            )
         if check_stabilizable:
             failures = stabilizability_diagnostic(A, B)
             if failures:
@@ -680,6 +686,7 @@ class KoopmanLQRActor(nn.Module):
         self.quadratic_log_scale = float(quadratic_log_scale)
         self.linear_scale = float(linear_scale)
         self.max_action = None if max_action is None else float(max_action)
+        self.perception_only_network = bool(perception_only_network)
 
         self.register_buffer("A", A.detach().clone())
         self.register_buffer("B", B.detach().clone())
@@ -697,8 +704,13 @@ class KoopmanLQRActor(nn.Module):
             "implicit_backward": True,
         }
         output_dim = 2 * self.cost_dim
+        network_input_dim = (
+            self.context_dim
+            if self.perception_only_network
+            else self.lifted_dim + self.context_dim
+        )
         self.network = _mlp(
-            self.lifted_dim + self.context_dim,
+            network_input_dim,
             hidden_dims,
             output_dim,
             activation,
@@ -721,7 +733,13 @@ class KoopmanLQRActor(nn.Module):
                 raise ValueError("Wrong or missing context dimension")
             if context.shape[:-1] != batch_shape:
                 raise ValueError("Context batch shape does not match lifted state")
-            network_input = torch.cat((lifted_state, context), dim=-1)
+            if self.perception_only_network:
+                # Perception-only mode: the cost-map network consumes the
+                # PPO-style perception feature directly; the Koopman lift is
+                # used only by the DARE solver (dynamics) below.
+                network_input = context
+            else:
+                network_input = torch.cat((lifted_state, context), dim=-1)
         elif context is not None:
             raise ValueError("This actor was constructed without context")
         raw = self.network(network_input)

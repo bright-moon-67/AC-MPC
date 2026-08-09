@@ -9,13 +9,17 @@ actor log-std initialized to ``-0.5``, ``normalized_dense`` reward,
 (``num_envs``, ``minibatch_size``, ``total_timesteps``) are expected to be
 lowered when running on a single GPU.
 
-The AC-MPC routes share the same NatureCNN rgb features but feed them through
-a context head into structured actors on the frozen robot Koopman:
+The AC-MPC routes give their cost-map / value networks the EXACT same input
+as the PPO actor: the 512-d NatureCNN feature over (rgb normalized by
+``/255``, state29).  The frozen robot Koopman lift is used only inside the
+bottom-level solver, never as an actor input:
   * ``KLQR`` : KoopmanLQRActor (closed-form DARE gain).
   * ``KMPC`` : KoopmanMPCActor (differentiable condensed box-QP).
   * ``AB-PQ``  : LowRankValueActor (low-rank quadratic value -> box-QP).
-``extra/goal_pos`` is used only for a training-time pos_branch auxiliary loss
-on the context (privileged, never an input for the AC-MPC routes).
+Each structured actor maps perception(512) -> cost-map parameters consumed
+by the underlying Koopman-based solver on z0 = lift(robot state).  There is
+no context head and no auxiliary loss; the goal signal reaches the actor
+through state29 -> state_mlp, exactly as in the PPO route.
 
 Mid-training artifacts (project convention): ``recovery_update_XXXXX.pt``
 every ``checkpoint_interval_updates`` updates and a ``metrics.jsonl`` appended
@@ -58,6 +62,12 @@ ROBOT_DIM = 21
 ACTION_DIM = 8
 # Official PPO "state" = qpos9 + qvel9 + is_grasped1 + tcp_pose7 + goal_pos3.
 STATE_DIM = 29
+# Structured routes feed their cost-map / value networks the EXACT same
+# 512-d perception feature as the PPO route: NatureCNN(rgb) -> 256 plus
+# state_mlp(state29) -> 256 (including the privileged goal).  The frozen
+# Koopman lift is used only by the bottom-level solver (KMPC QP / DARE /
+# AB-PQ greedy), never as an actor input.
+PERCEPTION_DIM = 512
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +123,19 @@ class NatureCNN(nn.Module):
         return torch.cat((rgb_feature, self.state_mlp(state)), dim=-1)
 
 
+def make_critic(input_dim: int) -> nn.Module:
+    """The shared critic head, identical across all four actor routes.
+
+    Mirrors the official ManiSkill PPO critic: ``Linear(512) -> ReLU ->
+    Linear(1)`` with orthogonal init (sqrt(2)) and a final std of 1.0.
+    """
+    return nn.Sequential(
+        layer_init(nn.Linear(input_dim, 512)),
+        nn.ReLU(inplace=True),
+        layer_init(nn.Linear(512, 1), std=1.0),
+    )
+
+
 class PPORoute(nn.Module):
     """Official PPO Agent: NatureCNN -> actor_mean/critic, log-std init -0.5."""
 
@@ -120,11 +143,7 @@ class PPORoute(nn.Module):
         super().__init__()
         self.feature_net = NatureCNN(rgb_channels=3, state_dim=state_dim)
         latent_size = self.feature_net.out_features
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(latent_size, 512)),
-            nn.ReLU(inplace=True),
-            layer_init(nn.Linear(512, 1), std=1.0),
-        )
+        self.critic = make_critic(latent_size)
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(latent_size, 512)),
             nn.ReLU(inplace=True),
@@ -160,50 +179,6 @@ class PPORoute(nn.Module):
         return self.critic(self.feature_net(rgb, state)).squeeze(-1)
 
 
-class ContextHead(nn.Module):
-    """NatureCNN rgb features -> task context (goal estimate) + pos_branch."""
-
-    def __init__(
-        self,
-        feature_dim: int = 256,
-        v_dim: int = 3,
-        pos_dim: int = 3,
-        hidden_dim: int = 128,
-    ) -> None:
-        super().__init__()
-        self.context = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, v_dim),
-        )
-        self.pos_branch = nn.Linear(v_dim, pos_dim)
-        nn.init.zeros_(self.pos_branch.weight)
-        nn.init.zeros_(self.pos_branch.bias)
-
-    def forward(
-        self, features: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        context = self.context(features)
-        return context, self.pos_branch(context)
-
-
-class ValueNetwork(nn.Module):
-    """Value on the frozen Koopman lift + context (KLQR / KMPC / AB-PQ)."""
-
-    def __init__(self, input_dim: int) -> None:
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1),
-        )
-
-    def forward(self, lifted: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        return self.network(torch.cat((lifted, context), dim=-1)).squeeze(-1)
-
-
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -219,7 +194,8 @@ class PPOConfig:
     discount: float = 0.99
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
-    clip_value_loss: bool = True
+    # official ManiSkill ppo_rgb.py sets clip_vloss=False
+    clip_value_loss: bool = False
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.0
     max_grad_norm: float = 0.5
@@ -228,13 +204,10 @@ class PPOConfig:
     max_wall_time_seconds: float | None = None
     max_episode_steps: int = 50
     reward_mode: str = "normalized_dense"
-    v_dim: int = 3
     context_hidden_dim: int = 128
     kmpc_horizon: int = 10
     kmpc_solver_iterations: int = 20
     ab_rank: int = 16
-    # Auxiliary pos_branch supervision on extra/goal_pos (privileged, train-only).
-    pos_weight: float = 0.5
     seed: int = 20_280_804
 
     @property
@@ -260,8 +233,6 @@ class PPOConfig:
             raise ValueError("learning_rate must be positive")
         if self.checkpoint_interval_updates <= 0:
             raise ValueError("checkpoint_interval_updates must be positive")
-        if self.pos_weight < 0:
-            raise ValueError("pos_weight must be non-negative")
         if self.reward_mode not in {"dense", "normalized_dense", "sparse"}:
             raise ValueError(f"Unsupported reward_mode {self.reward_mode!r}")
 
@@ -361,9 +332,10 @@ def _build_actor(
             A=koopman.A,
             B=koopman.B,
             C=koopman.C,
-            context_dim=config.v_dim,
+            context_dim=PERCEPTION_DIM,
             hidden_dims=(config.context_hidden_dim,),
             max_action=1.0,
+            perception_only_network=True,
         ).to(device)
     if actor_name == "KMPC":
         return KoopmanMPCActor(
@@ -371,15 +343,16 @@ def _build_actor(
             B=koopman.B,
             C=koopman.C,
             horizon=config.kmpc_horizon,
-            context_dim=config.v_dim,
+            context_dim=PERCEPTION_DIM,
             hidden_dims=(config.context_hidden_dim,),
             action_low=-1.0,
             action_high=1.0,
             solver_iterations=config.kmpc_solver_iterations,
+            perception_only_network=True,
         ).to(device)
     if actor_name == "AB-PQ":
         return LowRankValueActor(
-            observation_dim=koopman.lifted_dim + config.v_dim,
+            observation_dim=PERCEPTION_DIM,
             A=koopman.A,
             B=koopman.B,
             R=torch.eye(ACTION_DIM, device=device, dtype=koopman.A.dtype),
@@ -401,18 +374,23 @@ def _build_value(
 ) -> nn.Module | None:
     if actor_name == "PPO":
         return None  # value lives inside PPORoute
-    return ValueNetwork(koopman.lifted_dim + config.v_dim)
+    # Critic identical to the PPO route: make_critic over the 512-d
+    # perception feature (the exact same NatureCNN output the PPO critic sees).
+    return make_critic(PERCEPTION_DIM)
 
 
 def _structured_mean(
     actor_name: str,
     actor: nn.Module,
     lifted: torch.Tensor,
-    context: torch.Tensor,
+    perception: torch.Tensor,
 ) -> torch.Tensor:
+    # Actor input is IDENTICAL to the PPO route: the 512-d NatureCNN feature
+    # over (rgb, state29).  The Koopman lift feeds only the bottom-level
+    # solver (KMPC QP / DARE / AB-PQ greedy), never the cost-map network.
     if actor_name in ("KLQR", "KMPC"):
-        return actor(lifted, context).action
-    return actor(torch.cat((lifted, context), dim=-1), lifted).action
+        return actor(lifted, perception).action
+    return actor(perception, lifted).action
 
 
 # --------------------------------------------------------------------------- #
@@ -461,12 +439,10 @@ def train(
             seed=config.seed,
             max_episode_steps=config.max_episode_steps,
             reward_mode=config.reward_mode,
-            v_dim=config.v_dim,
             context_hidden_dim=config.context_hidden_dim,
             kmpc_horizon=config.kmpc_horizon,
             kmpc_solver_iterations=config.kmpc_solver_iterations,
             ab_rank=config.ab_rank,
-            pos_weight=config.pos_weight,
         )
     config_used.validate()
     if actor_name not in ACTOR_NAMES:
@@ -489,23 +465,22 @@ def train(
     if value is not None:
         value = value.to(device)
     if actor_name == "PPO":
-        context_head: ContextHead | None = None
         log_std: nn.Parameter | None = None
         encoder = actor.feature_net
         encoder_parameters: list[nn.Parameter] = []
         auxiliary_parameters: list[nn.Parameter] = []
     else:
-        context_head = ContextHead(
-            256, config_used.v_dim, hidden_dim=config_used.context_hidden_dim
-        ).to(device)
+        # The SAME NatureCNN as the PPO route, used in full: the structured
+        # cost-map / value networks consume the identical 512-d perception
+        # feature NatureCNN(rgb, state29) -> [rgb_branch 256; state_mlp 256].
         encoder = NatureCNN(rgb_channels=3, state_dim=STATE_DIM).to(device)
+        # official PPO route inits actor log_std at -0.5; match it exactly so
+        # the structured routes start at the same exploration scale.
         log_std = nn.Parameter(
-            torch.full((ACTION_DIM,), math.log(0.3), device=device)
+            torch.full((ACTION_DIM,), -0.5, device=device)
         )
         assert value is not None
-        encoder_parameters = list(encoder.parameters()) + list(
-            context_head.parameters()
-        )
+        encoder_parameters = list(encoder.parameters())
         auxiliary_parameters = [*value.parameters(), log_std]
     actor_parameters = list(actor.parameters())
     optimizer = torch.optim.Adam(
@@ -525,6 +500,50 @@ def train(
     minibatch_size = config_used.effective_minibatch_size()
     metrics_path = output_dir / "metrics.jsonl"
     latest_path = output_dir / "latest.pt"
+
+    # Auto-resume: if a previous run left latest.pt, continue from the saved
+    # update instead of restarting from scratch (crash / reboot protection).
+    start_update = 1
+    if latest_path.exists():
+        payload = torch.load(
+            latest_path, map_location=device, weights_only=False
+        )
+        if payload.get("kind") != "visual_pickcube_ppo":
+            raise ValueError(
+                f"Refusing to resume: latest.pt is not a visual PPO "
+                f"checkpoint (kind={payload.get('kind')!r})"
+            )
+        saved_actor = payload.get("actor_name")
+        if saved_actor != actor_name:
+            raise ValueError(
+                f"Refusing to resume: latest.pt belongs to actor "
+                f"{saved_actor!r}, not {actor_name!r}"
+            )
+        saved_config = payload.get("config")
+        if saved_config is not None and saved_config != asdict(config_used):
+            print(
+                f"[resume] WARNING: checkpoint config differs from the "
+                f"requested config; loading weights regardless.",
+                flush=True,
+            )
+        if actor_name == "PPO":
+            actor.load_state_dict(payload["actor_state"])
+        else:
+            assert value is not None
+            assert log_std is not None
+            encoder.load_state_dict(payload["encoder_state"])
+            actor.load_state_dict(payload["actor_state"])
+            value.load_state_dict(payload["value_state"])
+            log_std.data.copy_(payload["log_std"].to(device))
+        optimizer.load_state_dict(payload["optimizer_state"])
+        start_update = int(payload["update"]) + 1
+        print(
+            f"[resume] {actor_name} resumed from update "
+            f"{int(payload['update'])} step "
+            f"{int(payload['global_step'])} -> continues at update "
+            f"{start_update}",
+            flush=True,
+        )
     episode_returns: deque[float] = deque(maxlen=100)
     episode_lengths: deque[float] = deque(maxlen=100)
     episode_successes: deque[float] = deque(maxlen=100)
@@ -546,8 +565,9 @@ def train(
     }
     _atomic_json(output_dir / "run_config.json", metadata)
 
+    update = start_update - 1
     try:
-        for update in range(1, number_updates + 1):
+        for update in range(start_update, number_updates + 1):
             if config_used.anneal_learning_rate:
                 fraction = 1.0 - (update - 1.0) / number_updates
                 optimizer.param_groups[0]["lr"] = (
@@ -560,8 +580,6 @@ def train(
             lifted_states: list[torch.Tensor] = []
             states29: list[torch.Tensor] = []
             rgb_list: list[torch.Tensor] = []
-            contexts: list[torch.Tensor] = []
-            pos_targets: list[torch.Tensor] = []
             actions: list[torch.Tensor] = []
             log_probabilities: list[torch.Tensor] = []
             rewards: list[torch.Tensor] = []
@@ -580,16 +598,14 @@ def train(
                         action, log_probability, _, state_value = (
                             actor.get_action_and_value(rgb, state29)
                         )
-                        pos = torch.zeros(rgb.shape[0], 3, device=device)
-                        context = torch.zeros(
-                            rgb.shape[0], config_used.v_dim, device=device
-                        )
                     else:
-                        assert context_head is not None and log_std is not None
-                        features = encoder.forward_rgb(rgb)
-                        context, pos = context_head(features)
+                        assert log_std is not None
+                        # Actor input exactly like PPO: NatureCNN(rgb, state29)
+                        # -> 512-d perception.  The Koopman lift (normalized
+                        # robot state) feeds only the bottom-level solver.
+                        perception = encoder(rgb, state29)
                         mean = _structured_mean(
-                            actor_name, actor, lifted, context
+                            actor_name, actor, lifted, perception
                         )
                         distribution = Normal(
                             mean, log_std.exp().expand_as(mean)
@@ -597,7 +613,7 @@ def train(
                         action = distribution.sample()
                         log_probability = distribution.log_prob(action).sum(-1)
                         assert value is not None
-                        state_value = value(lifted, context)
+                        state_value = value(perception).squeeze(-1)
                 next_observation, reward, terminated, truncated, info = env.step(
                     action
                     if actor_name == "PPO"
@@ -632,16 +648,6 @@ def train(
                 lifted_states.append(lifted.detach())
                 states29.append(state29.detach())
                 rgb_list.append(rgb.detach())
-                contexts.append(context.detach())
-                if actor_name == "PPO":
-                    pos_targets.append(
-                        torch.zeros(config_used.num_envs, 3, device=device)
-                    )
-                else:
-                    goal = _as_tensor(
-                        observation["extra"]["goal_pos"], device
-                    ).float()[..., :3]
-                    pos_targets.append(goal)
                 actions.append(action.detach())
                 log_probabilities.append(log_probability.detach())
                 rewards.append(reward_tensor)
@@ -660,15 +666,13 @@ def train(
                 if actor_name == "PPO":
                     next_value = actor.get_value(next_rgb, next_state29)
                 else:
-                    assert context_head is not None and value is not None
-                    next_context = context_head(encoder.forward_rgb(next_rgb))[1]
-                    next_value = value(next_lifted, next_context)
+                    assert value is not None
+                    next_perception = encoder(next_rgb, next_state29)
+                    next_value = value(next_perception).squeeze(-1)
 
             rgb_batch = torch.stack(rgb_list)
             state29_batch = torch.stack(states29)
             lifted_batch = torch.stack(lifted_states)
-            context_batch = torch.stack(contexts)
-            pos_target_batch = torch.stack(pos_targets)
             action_batch = torch.stack(actions)
             old_log_prob = torch.stack(log_probabilities)
             reward_batch = torch.stack(rewards)
@@ -700,8 +704,6 @@ def train(
             flat_rgb = rgb_batch.flatten(0, 1)
             flat_state29 = state29_batch.flatten(0, 1)
             flat_lifted = lifted_batch.flatten(0, 1)
-            flat_context = context_batch.flatten(0, 1)
-            flat_pos_target = pos_target_batch.flatten(0, 1)
             flat_action = action_batch.flatten(0, 1)
             flat_old_log_prob = old_log_prob.flatten()
             flat_old_value = old_value.flatten()
@@ -711,7 +713,6 @@ def train(
             policy_losses: list[float] = []
             value_losses: list[float] = []
             entropies: list[float] = []
-            pos_losses: list[float] = []
             stopped_early = False
             stop_kl: float | None = None
             for _ in range(config_used.update_epochs):
@@ -730,13 +731,13 @@ def train(
                                 flat_action[index],
                             )
                         )
-                        pos = torch.zeros(len(index), 3, device=device)
                     else:
-                        assert context_head is not None and log_std is not None
-                        features = encoder.forward_rgb(flat_rgb[index])
-                        context, pos = context_head(features)
+                        assert log_std is not None
+                        perception = encoder(
+                            flat_rgb[index], flat_state29[index]
+                        )
                         mean = _structured_mean(
-                            actor_name, actor, flat_lifted[index], context
+                            actor_name, actor, flat_lifted[index], perception
                         )
                         distribution = Normal(
                             mean, log_std.exp().expand_as(mean)
@@ -746,7 +747,7 @@ def train(
                         ).sum(-1)
                         entropy = distribution.entropy().sum(-1)
                         assert value is not None
-                        current_value = value(flat_lifted[index], context)
+                        current_value = value(perception).squeeze(-1)
                     log_ratio = new_log_probability - flat_old_log_prob[index]
                     ratio = log_ratio.exp()
                     if config_used.target_kl is not None:
@@ -779,16 +780,10 @@ def train(
                         value_loss = (
                             (current_value - flat_returns[index]).square().mean()
                         )
-                    pos_loss = torch.zeros((), device=device)
-                    if actor_name != "PPO" and config_used.pos_weight > 0:
-                        pos_loss = config_used.pos_weight * (
-                            (pos - flat_pos_target[index]).square().mean()
-                        )
                     loss = (
                         policy_loss
                         - config_used.entropy_coefficient * entropy.mean()
                         + config_used.value_coefficient * value_loss
-                        + pos_loss
                     )
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
@@ -806,7 +801,6 @@ def train(
                     policy_losses.append(float(policy_loss))
                     value_losses.append(float(value_loss))
                     entropies.append(float(entropy.mean()))
-                    pos_losses.append(float(pos_loss))
                 if stopped_early:
                     break
 
@@ -816,7 +810,6 @@ def train(
                 "policy_loss": float(np.mean(policy_losses)) if policy_losses else float("nan"),
                 "value_loss": float(np.mean(value_losses)) if value_losses else float("nan"),
                 "entropy": float(np.mean(entropies)) if entropies else float("nan"),
-                "pos_loss": float(np.mean(pos_losses)) if pos_losses else float("nan"),
                 "episode_return": _optional_mean(episode_returns),
                 "episode_length": _optional_mean(episode_lengths),
                 "episode_success": _optional_mean(episode_successes),
@@ -847,9 +840,6 @@ def train(
                     "global_step": record["global_step"],
                     "encoder_state": (
                         encoder.state_dict() if actor_name != "PPO" else None
-                    ),
-                    "context_head_state": (
-                        context_head.state_dict() if context_head is not None else None
                     ),
                     "actor_state": actor.state_dict(),
                     "value_state": (
@@ -914,6 +904,7 @@ def main() -> None:
     parser.add_argument("--gae-lambda", type=float, default=None)
     parser.add_argument("--target-kl", type=float, default=None)
     parser.add_argument("--anneal-lr", type=lambda s: s.lower() in ("1", "true", "yes"), default=None)
+    parser.add_argument("--clip-vloss", type=lambda s: s.lower() in ("1", "true", "yes"), default=None)
     parser.add_argument("--max-episode-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="auto")
@@ -935,6 +926,7 @@ def main() -> None:
         "gae_lambda": args.gae_lambda,
         "target_kl": args.target_kl,
         "anneal_learning_rate": args.anneal_lr,
+        "clip_value_loss": args.clip_vloss,
         "max_episode_steps": args.max_episode_steps,
         "seed": args.seed,
     }

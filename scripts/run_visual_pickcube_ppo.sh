@@ -9,7 +9,8 @@
 # fairness principle.
 #
 # Hardware-bound knobs are configurable:
-#   VPICK_NUM_ENVS         parallel envs (official 512; single-GPU 128-256)
+#   VPICK_NUM_ENVS         parallel envs (official 512; this host's Vulkan
+#                          camera-group limit is ~128, so default 128)
 #   VPICK_TOTAL_TIMESTEPS  official 10M
 #   VPICK_ACTORS           space-separated, run sequentially (default PPO KMPC AB-PQ)
 #   VPICK_KOOPMAN          runs/pickcube_robot_koopman_coverage/best.pt
@@ -23,7 +24,7 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${AC_MPC_PYTHON:-/root/miniconda3/bin/python}"
 output_root="${VPICK_OUTPUT_ROOT:-${project_root}/runs/visual_pickcube_ppo}"
 koopman="${VPICK_KOOPMAN:-${project_root}/runs/pickcube_robot_koopman_coverage/best.pt}"
-num_envs="${VPICK_NUM_ENVS:-256}"
+num_envs="${VPICK_NUM_ENVS:-128}"
 total_timesteps="${VPICK_TOTAL_TIMESTEPS:-10000000}"
 seed="${VPICK_SEED:-20280804}"
 actors="${VPICK_ACTORS:-PPO KMPC AB-PQ}"
@@ -58,6 +59,7 @@ common=(
     --gae-lambda 0.9
     --target-kl 0.2
     --anneal-lr false
+    --clip-vloss false
 )
 
 # Replace the placeholder minibatch with the official batch/32 (computed here

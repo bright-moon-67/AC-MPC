@@ -103,6 +103,7 @@ class KoopmanMPCActor(nn.Module):
         solver_iterations: int = 20,
         step_fraction: float = 0.95,
         solver_epsilon: float = 1e-6,
+        perception_only_network: bool = False,
     ) -> None:
         super().__init__()
         if A.ndim != 2 or A.shape[0] != A.shape[1]:
@@ -124,6 +125,11 @@ class KoopmanMPCActor(nn.Module):
             raise ValueError("step_fraction must lie in (0, 1]")
         if solver_epsilon <= 0:
             raise ValueError("solver_epsilon must be positive")
+        if perception_only_network and context_dim < 1:
+            raise ValueError(
+                "perception_only_network requires a context_dim >= 1 "
+                "(the context IS the perception input)"
+            )
 
         self.lifted_dim = int(lifted_dim)
         self.physical_dim = int(physical_dim)
@@ -136,6 +142,7 @@ class KoopmanMPCActor(nn.Module):
         self.solver_iterations = int(solver_iterations)
         self.step_fraction = float(step_fraction)
         self.solver_epsilon = float(solver_epsilon)
+        self.perception_only_network = bool(perception_only_network)
 
         self.register_buffer("A", A.detach().clone())
         self.register_buffer("B", B.detach().clone())
@@ -155,8 +162,13 @@ class KoopmanMPCActor(nn.Module):
         self.register_buffer("action_map", action_map)
 
         output_dim = 2 * self.horizon * self.augmented_dim
+        network_input_dim = (
+            context_dim
+            if perception_only_network
+            else lifted_dim + context_dim
+        )
         self.network = _mlp(
-            lifted_dim + self.context_dim,
+            network_input_dim,
             hidden_dims,
             output_dim,
             activation,
@@ -211,7 +223,13 @@ class KoopmanMPCActor(nn.Module):
                 raise ValueError("Wrong or missing context dimension")
             if context.shape[:-1] != batch_shape:
                 raise ValueError("Context batch shape does not match lifted state")
-            network_input = torch.cat((lifted_state, context), dim=-1)
+            if self.perception_only_network:
+                # Perception-only mode: the cost-map network consumes the
+                # PPO-style perception feature directly; the Koopman lift is
+                # used only by the bottom-level solver (dynamics z0 below).
+                network_input = context
+            else:
+                network_input = torch.cat((lifted_state, context), dim=-1)
         elif context is not None:
             raise ValueError("This actor was constructed without context")
         raw = self.network(network_input).reshape(
