@@ -9,13 +9,18 @@ import numpy as np
 
 from manisoft.envs.vlm_env import VisionLanguageManipulationEnvironment
 from manisoft.muscle import SplineMuscle
-from manisoft.utils import Rotation, load_yaml
+from manisoft.utils import (
+    KOOPMAN_PHYSICAL_STATE_DIM,
+    KOOPMAN_TIP_POSITION_SLICE,
+    koopman_section_state,
+    load_yaml,
+)
 
 from .delta_action_wrapper import DeltaActionWrapper
 
 
 class ManiSoftTipTrackingEnv(gym.Env):
-    """固定目标的ManiSoft末端跟踪环境，输出41维物理状态。"""
+    """固定目标的ManiSoft末端跟踪环境，输出45维物理状态。"""
 
     def __init__(
         self,
@@ -44,7 +49,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(41,),
+            shape=(KOOPMAN_PHYSICAL_STATE_DIM,),
             dtype=np.float32,
         )
         self.action_space = gym.spaces.Box(
@@ -63,50 +68,9 @@ class ManiSoftTipTrackingEnv(gym.Env):
 
     def _physical_state(self) -> np.ndarray:
         soft = self.sim._backend.softrobot_state
+        state = koopman_section_state(soft)
 
-        positions = np.asarray(
-            soft.element_positions,
-            dtype=np.float64,
-        ).T
-
-        sample_step = int(soft.num_elements) // 10
-
-        compact_positions = np.concatenate(
-            (
-                positions[0, ::sample_step],
-                positions[1, ::sample_step],
-                positions[2, ::sample_step],
-            )
-        )
-
-        tip_velocity = np.asarray(
-            soft.element_velocities,
-            dtype=np.float64,
-        ).T[..., -1]
-
-        speed = np.asarray([np.linalg.norm(tip_velocity)])
-
-        if speed[0] > 0:
-            velocity_direction = tip_velocity / speed[0]
-        else:
-            velocity_direction = np.zeros(3)
-
-        tip_quaternion = np.asarray(
-            Rotation.from_directions(
-                soft.element_directors[-1]
-            ).to_wxyz()
-        )
-
-        state = np.concatenate(
-            (
-                compact_positions,
-                speed,
-                velocity_direction,
-                tip_quaternion,
-            )
-        ).astype(np.float32)
-
-        if state.shape != (41,):
+        if state.shape != (KOOPMAN_PHYSICAL_STATE_DIM,):
             raise RuntimeError(f"错误状态维度：{state.shape}")
         if not np.isfinite(state).all():
             raise FloatingPointError("ManiSoft状态出现NaN或Inf")
@@ -115,7 +79,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
 
     @staticmethod
     def _tip_position(state: np.ndarray) -> np.ndarray:
-        return state[[10, 21, 32]]
+        return state[KOOPMAN_TIP_POSITION_SLICE]
 
     def reset(
         self,
@@ -139,8 +103,21 @@ class ManiSoftTipTrackingEnv(gym.Env):
             robot_length=float(np.sum(soft.element_lengths)),
             robot_num_elements=int(soft.num_elements),
             number_of_control_points=6,
-            muscle_torque_scale=75,
+            muscle_torque_scale=30,
         )
+
+        # Settle with zero activation for 1 s at 50 Hz, matching the Koopman
+        # data collector (settle-seconds=1).  This relaxes the rod to the
+        # gravitational equilibrium the model was trained on; without it the
+        # closed-loop starts from the upright initial pose (out of
+        # distribution) and the MPC diverges.
+        self.muscle.set_activation(np.zeros((6, 3), dtype=np.float64))
+
+        def zero_torque(element_lengths: np.ndarray) -> np.ndarray:
+            return self.muscle.evaluate(element_lengths)
+
+        for _ in range(50):
+            self.sim.step_with_torque_callback(zero_torque)
 
         observation = self._physical_state()
         self.target_tip = (
@@ -177,13 +154,15 @@ class ManiSoftTipTrackingEnv(gym.Env):
             self.action_space.high,
         )
 
-        soft = self.sim._backend.softrobot_state
+        self.muscle.set_activation(action.reshape(6, 3))
 
-        torque = self.muscle.activate(
-            action.reshape(6, 3),
-            soft.element_lengths,
-        )
-        self.sim.step(list(map(tuple, torque)))
+        def current_torque(element_lengths: np.ndarray) -> np.ndarray:
+            return self.muscle.evaluate(element_lengths)
+
+        # Match the 50 Hz Koopman data collector: keep the activation fixed
+        # while refreshing the length-dependent distributed torque at every
+        # physics substep.
+        self.sim.step_with_torque_callback(current_torque)
 
         observation = self._physical_state()
         distance = float(
@@ -241,15 +220,15 @@ class ManiSoftTipTrackingEnv(gym.Env):
 
 
 class TipPositionErrorObservationWrapper(gym.ObservationWrapper):
-    """Append normalized 3-D tip-position error after the 59-D dynamics state."""
+    """Append normalized 3-D tip-position error after the 63-D dynamics state."""
 
     def __init__(self, env: gym.Env, target_scale: float):
         super().__init__(env)
         if not isinstance(env.observation_space, gym.spaces.Box):
             raise TypeError("末端误差包装器要求Box观测空间")
-        if env.observation_space.shape != (59,):
+        if env.observation_space.shape != (63,):
             raise ValueError(
-                f"末端误差包装器要求59维基础状态，实际为{env.observation_space.shape}"
+                f"末端误差包装器要求63维基础状态，实际为{env.observation_space.shape}"
             )
         if target_scale <= 0:
             raise ValueError("target_scale必须为正数")
@@ -267,13 +246,13 @@ class TipPositionErrorObservationWrapper(gym.ObservationWrapper):
 
     def observation(self, observation: np.ndarray) -> np.ndarray:
         state = np.asarray(observation, dtype=np.float32)
-        if state.shape != (59,):
+        if state.shape != (63,):
             raise ValueError(f"错误基础状态维度：{state.shape}")
 
         target_tip = self.env.unwrapped.target_tip
         if target_tip is None:
             raise RuntimeError("ManiSoft环境尚未设置目标末端位置")
-        tip_position = state[[10, 21, 32]]
+        tip_position = state[KOOPMAN_TIP_POSITION_SLICE]
         tip_error = (
             np.asarray(target_tip, dtype=np.float32) - tip_position
         ) / self.target_scale
@@ -281,7 +260,7 @@ class TipPositionErrorObservationWrapper(gym.ObservationWrapper):
             np.float32,
             copy=False,
         )
-        if policy_state.shape != (62,):
+        if policy_state.shape != (66,):
             raise RuntimeError(f"错误策略状态维度：{policy_state.shape}")
         if not np.isfinite(policy_state).all():
             raise FloatingPointError("策略状态出现NaN或Inf")
@@ -303,7 +282,7 @@ def make_manisoft_tracking_env(
     )
     delta_env = DeltaActionWrapper(
         base_env,
-        expected_observation_dim=41,
+        expected_observation_dim=KOOPMAN_PHYSICAL_STATE_DIM,
     )
     return TipPositionErrorObservationWrapper(
         delta_env,

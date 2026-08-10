@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from manisoft.envs.vlm_env import VLMEnvironmentForExecutorControl
-from manisoft.utils import load_yaml
+from manisoft.utils import koopman_section_state, load_yaml
 from antmaze_ac.koopman.checkpoint import load_checkpoint
 
 warnings.filterwarnings("ignore", message="Gimbal lock detected.*")
@@ -34,26 +34,22 @@ std = np.asarray(stats["std"], dtype=np.float32)
 
 def physical_state(env):
     _, softrobot_state = env.get_state(False)
-    state52 = env._patch_state(
-        np.zeros(3, dtype=np.float32),
-        np.zeros(3, dtype=np.float32),
-        softrobot_state,
-    )
-    return np.asarray(state52[:41], dtype=np.float32)
+    return koopman_section_state(softrobot_state)
 
 
 def label(index):
-    if index < 11:
-        return f"rod_x[{index}]"
-    if index < 22:
-        return f"rod_y[{index - 11}]"
-    if index < 33:
-        return f"rod_z[{index - 22}]"
-    if index == 33:
-        return "tip_speed"
-    if index < 37:
-        return f"tip_velocity_direction[{index - 34}]"
-    return f"tip_quaternion[{index - 37}]"
+    section = index // 15
+    component = index % 15
+    point = (4, 8, 11)[section]
+    if component < 3:
+        name = f"position[{component}]"
+    elif component < 9:
+        name = f"rotation_6d[{component - 3}]"
+    elif component < 12:
+        name = f"linear_velocity[{component - 9}]"
+    else:
+        name = f"angular_velocity[{component - 12}]"
+    return f"section_{point}.{name}"
 
 
 pairs = []
@@ -136,32 +132,32 @@ for episode, (scenario, trajectory_path) in enumerate(pairs[:EPISODES]):
     naive_states = np.repeat(
         initial_state[None, :], HORIZON, axis=0
     )
-    naive_states[:, 41:] = actions
+    naive_states[:, 45:] = actions
     naive_normalized = (naive_states - mean) / std
 
     koopman_h1 = np.mean(
-        (predicted[:1, :41] - real_normalized[:1, :41]) ** 2
+        (predicted[:1, :45] - real_normalized[:1, :45]) ** 2
     )
     baseline_h1 = np.mean(
-        (naive_normalized[:1, :41]
-         - real_normalized[:1, :41]) ** 2
+        (naive_normalized[:1, :45]
+         - real_normalized[:1, :45]) ** 2
     )
     koopman_h20 = np.mean(
-        (predicted[:, :41] - real_normalized[:, :41]) ** 2
+        (predicted[:, :45] - real_normalized[:, :45]) ** 2
     )
     baseline_h20 = np.mean(
-        (naive_normalized[:, :41]
-         - real_normalized[:, :41]) ** 2
+        (naive_normalized[:, :45]
+         - real_normalized[:, :45]) ** 2
     )
     action_h20 = np.mean(
         (
-            predicted[:, 41:] * std[41:] + mean[41:]
-            - real_states[:, 41:]
+            predicted[:, 45:] * std[45:] + mean[45:]
+            - real_states[:, 45:]
         ) ** 2
     )
 
     h1_dimension_errors.append(
-        (predicted[0, :41] - real_normalized[0, :41]) ** 2
+        (predicted[0, :45] - real_normalized[0, :45]) ** 2
     )
     results.append(
         [koopman_h1, baseline_h1, koopman_h20, baseline_h20, action_h20]

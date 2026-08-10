@@ -15,7 +15,7 @@ def _activation(name: str) -> type[nn.Module]:
 
 
 class DeepKoopman(nn.Module):
-    """Identity-skip lifting model ``z=[x, phi(x)]`` and ``z'=Az+Bv``."""
+    """Identity-skip model with ``z_{t+1}=A z_t+B delta_u_t``."""
 
     def __init__(
         self,
@@ -49,10 +49,56 @@ class DeepKoopman(nn.Module):
         )
         self.B = nn.Parameter(torch.empty(self.lifted_dim, self.action_dim))
         nn.init.normal_(self.B, std=0.01)
+        self.register_buffer(
+            "action_state_scale",
+            torch.ones(self.action_dim),
+            persistent=False,
+        )
 
         reading = torch.zeros(self.state_dim, self.lifted_dim)
         reading[:, : self.state_dim] = torch.eye(self.state_dim)
         self.register_buffer("C", reading)
+
+    def configure_action_integrator(
+        self,
+        action_state_std: torch.Tensor | Sequence[float],
+    ) -> None:
+        """Make the final state block obey ``u_t=u_{t-1}+delta_u_t``.
+
+        States are normalized while delta actions remain in physical units,
+        hence the exact B diagonal is ``1 / std(u)`` rather than one.
+        """
+
+        if self.state_dim < self.action_dim:
+            raise ValueError(
+                "state_dim must include the previous-action block"
+            )
+        scale = torch.as_tensor(
+            action_state_std,
+            dtype=self.A.dtype,
+            device=self.A.device,
+        )
+        if scale.shape != (self.action_dim,):
+            raise ValueError(
+                "action_state_std must have shape "
+                f"({self.action_dim},), got {tuple(scale.shape)}"
+            )
+        if not torch.isfinite(scale).all() or bool((scale <= 0).any()):
+            raise ValueError("action_state_std must be finite and positive")
+        self.action_state_scale.copy_(scale)
+        self.project_action_integrator()
+
+    @torch.no_grad()
+    def project_action_integrator(self) -> None:
+        """Project the known previous-action rows of A and B exactly."""
+
+        start = self.state_dim - self.action_dim
+        rows = slice(start, self.state_dim)
+        self.A[rows].zero_()
+        self.B[rows].zero_()
+        indices = torch.arange(self.action_dim, device=self.A.device)
+        self.A[start + indices, start + indices] = 1.0
+        self.B[start + indices, indices] = self.action_state_scale.reciprocal()
 
     def lift(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.state_dim:

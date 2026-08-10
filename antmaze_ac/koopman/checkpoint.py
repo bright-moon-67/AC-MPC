@@ -47,8 +47,13 @@ def load_checkpoint(
 ) -> tuple[DeepKoopman, dict[str, Any]]:
     payload = torch.load(path, map_location=map_location, weights_only=False)
     architecture = dict(payload["architecture"])
-    architecture.pop("architecture", None)
-    model = DeepKoopman(**architecture)
+    architecture_name = architecture.pop("architecture", None)
+    if architecture_name == "fullA_history_context_v1":
+        from .history_model import HistoryDeepKoopman
+
+        model = HistoryDeepKoopman(**architecture)
+    else:
+        model = DeepKoopman(**architecture)
     model.load_state_dict(payload["model"])
     return model, payload
 

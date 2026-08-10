@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ import torch
 from antmaze_ac.koopman.checkpoint import load_checkpoint, sha256
 
 
-TIP_INDICES = (10, 21, 32)
+TIP_INDICES = (30, 31, 32)
 
 
 def parse_vector(text: str, *, length: int, name: str) -> tuple[float, ...]:
@@ -22,6 +23,38 @@ def parse_vector(text: str, *, length: int, name: str) -> tuple[float, ...]:
     if len(values) != length:
         raise ValueError(f"{name} must contain {length} comma-separated values")
     return values
+
+
+def launch_live_viewer(env):
+    """Launch the ManiSoft MuJoCo viewer for the wrapped tracking env."""
+
+    from manisoft.backend import ManiSoftSimBackend
+    from manisoft.visualize.mujoco_viewer import SoftRobotMujocoViewer
+
+    simulator = env.unwrapped.sim
+    if simulator is None:
+        raise RuntimeError("ManiSoft simulator is unavailable before live-view launch")
+    backend = simulator.backend
+    if not isinstance(backend, ManiSoftSimBackend):
+        raise TypeError("--live requires backend.type=ManiSoftSimBackend")
+
+    viewer = SoftRobotMujocoViewer(
+        backend.mujoco_model,
+        backend.mujoco_data,
+        backend.softrobot_radius,
+    ).launch()
+    _, soft_state = simulator.get_state(has_image=False)
+    if not viewer.sync(soft_state.element_positions):
+        viewer.close()
+        raise RuntimeError("Live viewer closed during initialization")
+    return viewer, simulator
+
+
+def sync_live_viewer(viewer, simulator) -> bool:
+    """Refresh the live soft-robot geometry from the true simulator state."""
+
+    _, soft_state = simulator.get_state(has_image=False)
+    return viewer.sync(soft_state.element_positions)
 
 
 def clipped_action_sequence(
@@ -59,6 +92,7 @@ def optimize_mpc(
     horizon: int,
     position_weight: float,
     control_weight: float,
+    smoothness_weight: float = 0.0,
     max_delta: float,
     iterations: int,
     learning_rate: float,
@@ -102,7 +136,10 @@ def optimize_mpc(
         predicted_tips = predicted_states.index_select(-1, tip_indices)
         position_cost = position_weight * (predicted_tips - goal_tensor).square().sum()
         control_cost = control_weight * applied_deltas.square().sum()
-        loss = position_cost + control_cost
+        smoothness_cost = smoothness_weight * (
+            applied_deltas[1:] - applied_deltas[:-1]
+        ).square().sum()
+        loss = position_cost + control_cost + smoothness_cost
         if not torch.isfinite(loss):
             raise FloatingPointError("MPC objective became NaN or Inf")
         optimizer.zero_grad(set_to_none=True)
@@ -125,7 +162,10 @@ def optimize_mpc(
         predicted_tips = predicted_states.index_select(-1, tip_indices)
         position_cost = position_weight * (predicted_tips - goal_tensor).square().sum()
         control_cost = control_weight * applied_deltas.square().sum()
-        total_cost = float(position_cost + control_cost)
+        smoothness_cost = smoothness_weight * (
+            applied_deltas[1:] - applied_deltas[:-1]
+        ).square().sum()
+        total_cost = float(position_cost + control_cost + smoothness_cost)
 
     return {
         "decision": decision.detach(),
@@ -150,6 +190,49 @@ def write_tip_csv(
         )
         for step, (tip, distance) in enumerate(zip(tip_positions, distances)):
             writer.writerow([step, *map(float, tip), *map(float, goal), float(distance)])
+
+
+def write_h1_tip_error_csv(
+    path: Path,
+    predicted_tips: np.ndarray,
+    actual_tips: np.ndarray,
+) -> None:
+    """Save one-step Koopman tip predictions and physical errors in metres."""
+
+    if predicted_tips.shape != actual_tips.shape or predicted_tips.ndim != 2:
+        raise ValueError("H1 predicted and actual tip arrays must have matching [N,3] shapes")
+    error_vectors = predicted_tips - actual_tips
+    error_norms = np.linalg.norm(error_vectors, axis=1)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "step",
+                "predicted_x",
+                "predicted_y",
+                "predicted_z",
+                "actual_x",
+                "actual_y",
+                "actual_z",
+                "error_x",
+                "error_y",
+                "error_z",
+                "error_norm_m",
+            ]
+        )
+        for step, (predicted, actual, error, error_norm) in enumerate(
+            zip(predicted_tips, actual_tips, error_vectors, error_norms),
+            start=1,
+        ):
+            writer.writerow(
+                [
+                    step,
+                    *map(float, predicted),
+                    *map(float, actual),
+                    *map(float, error),
+                    float(error_norm),
+                ]
+            )
 
 
 def write_control_csv(
@@ -234,13 +317,33 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--position-weight", type=float, default=100.0)
-    parser.add_argument("--control-weight", type=float, default=0.1)
-    parser.add_argument("--max-delta", type=float, default=0.02)
+    parser.add_argument("--control-weight", type=float, default=5.0)
+    parser.add_argument(
+        "--smoothness-weight",
+        type=float,
+        default=10.0,
+        help=(
+            "Penalty on adjacent-delta changes to keep MPC actions smooth "
+            "(closer to the smooth training distribution)."
+        ),
+    )
+    parser.add_argument("--max-delta", type=float, default=0.002)
     parser.add_argument("--absolute-action-limit", type=float, default=0.30)
     parser.add_argument("--optimizer-iterations", type=int, default=100)
     parser.add_argument("--optimizer-learning-rate", type=float, default=0.05)
     parser.add_argument("--success-threshold", type=float, default=0.002)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Show the true ManiSoft motion in a live MuJoCo window.",
+    )
+    parser.add_argument(
+        "--viewer-fps",
+        type=float,
+        default=50.0,
+        help="Maximum live-view refresh rate; only used with --live.",
+    )
     args = parser.parse_args()
 
     if args.steps < 1 or args.horizon < 1 or args.optimizer_iterations < 1:
@@ -248,12 +351,17 @@ def main() -> None:
     if min(
         args.position_weight,
         args.control_weight,
+        args.smoothness_weight,
         args.max_delta,
         args.absolute_action_limit,
         args.optimizer_learning_rate,
         args.success_threshold,
+        args.viewer_fps,
     ) <= 0:
-        raise ValueError("All MPC weights, limits, learning rate and threshold must be positive")
+        raise ValueError(
+            "All MPC weights, limits, learning rate, threshold and viewer-fps "
+            "must be positive"
+        )
 
     target_offset = parse_vector(args.target_offset, length=3, name="--target-offset")
     checkpoint = Path(args.checkpoint).expanduser().resolve()
@@ -272,16 +380,16 @@ def main() -> None:
     )
     model, payload = load_checkpoint(checkpoint, map_location=device)
     model = model.to(device).freeze_dynamics()
-    if (model.state_dim, model.action_dim) != (59, 18):
+    if (model.state_dim, model.action_dim) != (63, 18):
         raise ValueError(
-            f"This ManiSoft check requires state/action dimensions (59,18), got "
+            f"This ManiSoft check requires state/action dimensions (63,18), got "
             f"({model.state_dim},{model.action_dim})"
         )
     stats = payload["normalizers"]["state"]
     state_mean = torch.as_tensor(stats["mean"], dtype=torch.float32, device=device)
     state_std = torch.as_tensor(stats["std"], dtype=torch.float32, device=device)
-    if state_mean.shape != (59,) or state_std.shape != (59,):
-        raise ValueError("Checkpoint state normalizer must have 59 dimensions")
+    if state_mean.shape != (63,) or state_std.shape != (63,):
+        raise ValueError("Checkpoint state normalizer must have 63 dimensions")
 
     # Keep the optimization core importable without a local ManiSoft install.
     from antmaze_ac.envs.manisoft_tracking_env import make_manisoft_tracking_env
@@ -292,14 +400,19 @@ def main() -> None:
         episode_steps=args.steps,
         absolute_action_limit=args.absolute_action_limit,
     )
+    viewer = None
+    simulator = None
     try:
         observation, reset_info = env.reset()
-        dynamics_state = np.asarray(observation[:59], dtype=np.float32)
+        dynamics_state = np.asarray(observation[:63], dtype=np.float32)
         initial_tip = dynamics_state[np.asarray(TIP_INDICES)]
         goal = initial_tip + np.asarray(target_offset, dtype=np.float32)
         environment_goal = np.asarray(reset_info["target_tip"], dtype=np.float32)
         if not np.allclose(goal, environment_goal, atol=1e-7):
             raise RuntimeError("Environment target does not match the requested tip offset")
+
+        if args.live:
+            viewer, simulator = launch_live_viewer(env)
 
         base_action_space = env.unwrapped.action_space
         action_low = torch.as_tensor(base_action_space.low, dtype=torch.float32, device=device)
@@ -318,6 +431,7 @@ def main() -> None:
         stop_reason = "max_steps"
 
         for step in range(args.steps):
+            frame_start = time.perf_counter()
             plan = optimize_mpc(
                 model=model,
                 state=dynamics_state,
@@ -329,6 +443,7 @@ def main() -> None:
                 horizon=args.horizon,
                 position_weight=args.position_weight,
                 control_weight=args.control_weight,
+                smoothness_weight=args.smoothness_weight,
                 max_delta=args.max_delta,
                 iterations=args.optimizer_iterations,
                 learning_rate=args.optimizer_learning_rate,
@@ -345,10 +460,11 @@ def main() -> None:
             if not np.allclose(actual_applied_delta, applied_plan[0], atol=1e-5):
                 raise RuntimeError("Planner clipping and environment clipping disagree")
 
-            dynamics_state = np.asarray(next_observation[:59], dtype=np.float32)
+            dynamics_state = np.asarray(next_observation[:63], dtype=np.float32)
             tip = dynamics_state[np.asarray(TIP_INDICES)]
             distance = float(np.linalg.norm(tip - goal))
             predicted_first_tip = predicted_tips[0]
+            h1_tip_error = float(np.linalg.norm(predicted_first_tip - tip))
 
             tip_positions.append(tip.copy())
             distances.append(distance)
@@ -358,15 +474,29 @@ def main() -> None:
             saturation_history.append(float(info["action_saturation_ratio"]))
             mpc_cost_history.append(float(plan["cost"]))
             predicted_first_tip_history.append(predicted_first_tip)
-            one_step_tip_error_history.append(float(np.linalg.norm(predicted_first_tip - tip)))
+            one_step_tip_error_history.append(h1_tip_error)
 
             decision = plan["decision"]
             warm_start = torch.cat((decision[1:], torch.zeros_like(decision[:1])), dim=0)
             print(
-                f"step={step + 1:03d} distance={distance:.6f} "
+                f"step={step + 1:03d} "
+                f"tip=({tip[0]:.6f},{tip[1]:.6f},{tip[2]:.6f}) "
+                f"h1_pred=({predicted_first_tip[0]:.6f},"
+                f"{predicted_first_tip[1]:.6f},{predicted_first_tip[2]:.6f}) "
+                f"h1_error={h1_tip_error:.6f}m "
+                f"distance={distance:.6f} "
                 f"mpc_cost={float(plan['cost']):.6f} "
                 f"max_action={float(np.max(np.abs(actual_applied_action))):.4f}"
             )
+            if viewer is not None:
+                if not sync_live_viewer(viewer, simulator):
+                    stop_reason = "viewer_closed"
+                    break
+                remaining = 1.0 / args.viewer_fps - (
+                    time.perf_counter() - frame_start
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
             if terminated:
                 stop_reason = "environment_success"
                 break
@@ -374,6 +504,8 @@ def main() -> None:
                 stop_reason = "environment_time_limit"
                 break
     finally:
+        if viewer is not None:
+            viewer.close()
         env.close()
 
     tip_array = np.asarray(tip_positions, dtype=np.float32)
@@ -385,6 +517,8 @@ def main() -> None:
     cost_array = np.asarray(mpc_cost_history, dtype=np.float32)
     predicted_tip_array = np.asarray(predicted_first_tip_history, dtype=np.float32)
     one_step_error_array = np.asarray(one_step_tip_error_history, dtype=np.float32)
+    actual_h1_tip_array = tip_array[1 : 1 + len(predicted_tip_array)]
+    h1_error_vector_array = predicted_tip_array - actual_h1_tip_array
     success = bool(distance_array[-1] <= args.success_threshold)
 
     np.savez_compressed(
@@ -398,9 +532,16 @@ def main() -> None:
         saturation_ratio=saturation_array,
         mpc_cost=cost_array,
         predicted_first_tip=predicted_tip_array,
+        actual_first_tip=actual_h1_tip_array,
+        one_step_tip_prediction_error_vector=h1_error_vector_array,
         one_step_tip_prediction_error=one_step_error_array,
     )
     write_tip_csv(output / "tip_trajectory.csv", tip_array, goal, distance_array)
+    write_h1_tip_error_csv(
+        output / "h1_tip_prediction_error.csv",
+        predicted_tip_array,
+        actual_h1_tip_array,
+    )
     write_control_csv(
         output / "controls.csv",
         requested_array,
@@ -422,6 +563,8 @@ def main() -> None:
         "checkpoint_sha256": sha256(checkpoint),
         "scenario": str(scenario),
         "device": str(device),
+        "live_view": args.live,
+        "viewer_fps": args.viewer_fps if args.live else None,
         "horizon": args.horizon,
         "position_weight": args.position_weight,
         "control_weight": args.control_weight,
@@ -436,6 +579,19 @@ def main() -> None:
         "minimum_distance": float(distance_array.min()),
         "mean_one_step_tip_prediction_error": (
             float(one_step_error_array.mean()) if len(one_step_error_array) else None
+        ),
+        "rmse_one_step_tip_prediction_error": (
+            float(np.sqrt(np.mean(np.sum(h1_error_vector_array ** 2, axis=1))))
+            if len(h1_error_vector_array)
+            else None
+        ),
+        "maximum_one_step_tip_prediction_error": (
+            float(one_step_error_array.max()) if len(one_step_error_array) else None
+        ),
+        "axis_rmse_one_step_tip_prediction_error": (
+            np.sqrt(np.mean(h1_error_vector_array ** 2, axis=0)).tolist()
+            if len(h1_error_vector_array)
+            else None
         ),
         "maximum_absolute_action": (
             float(np.max(np.abs(applied_action_array))) if len(applied_action_array) else 0.0

@@ -55,6 +55,21 @@ def test_full_a_reference_initialization_and_one_step_forward():
     torch.testing.assert_close(predicted, model.reconstruct(lifted))
 
 
+def test_exact_previous_action_integrator_in_normalized_coordinates():
+    model = DeepKoopman(7, 2, lift_dim=4, hidden_dims=(16, 16))
+    action_std = torch.tensor([0.2, 0.5])
+    model.configure_action_integrator(action_std)
+    state = torch.randn(5, 7)
+    delta_action = torch.randn(5, 2) * 0.01
+
+    predicted, _ = model(state, delta_action)
+
+    torch.testing.assert_close(
+        predicted[:, -2:],
+        state[:, -2:] + delta_action / action_std,
+    )
+
+
 def test_loss_rejects_nonfinite_inputs_and_preserves_identity_reconstruction():
     model = DeepKoopman(3, 1, lift_dim=2, hidden_dims=(8,))
     states = torch.randn(2, 3, 3)

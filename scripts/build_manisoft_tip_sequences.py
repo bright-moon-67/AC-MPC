@@ -1,5 +1,16 @@
 #!/usr/bin/env python
-"""Convert per-episode ManiSoft NPZ files to the canonical Koopman dataset."""
+"""Convert per-episode ManiSoft NPZ files to an 11-D tip-only Koopman dataset.
+
+The full 41-D physical soft-robot state is compressed to the 11-D end-tip
+state used for tracking:
+
+    11-D = [tip_position(3), tip_speed(1), tip_velocity_direction(3),
+            tip_quaternion_wxyz(4)]
+
+The action dimension stays at 18, so the augmented (Koopman) state is
+    29-D = [11-D tip state, 18-D previous_action]
+and the Koopman action is the 18-D delta_action.
+"""
 
 from __future__ import annotations
 
@@ -19,8 +30,22 @@ from antmaze_ac.data.build_sequences import (
     valid_window_starts,
 )
 
-
 SOURCE_FIELDS = ("state", "action", "next_state")
+
+SOURCE_OBSERVATION_DIM = 41
+TIP_STATE_DIM = 11
+ACTION_DIM = 18
+AUGMENTED_STATE_DIM = TIP_STATE_DIM + ACTION_DIM
+
+# Layout of the 41-D physical state produced by
+# ManiSoft/scripts/collect_koopman_data.py:_build_compact_observation:
+#   [0:33]  compact positions (nodes 0,2,...,20, coordinate-major: x,y,z)
+#   [33:34] tip_speed
+#   [34:37] tip_velocity_direction (unit vector, zero at rest)
+#   [37:41] tip_quaternion_wxyz
+# The tip is node 20 = the 11th sampled node, so within the coordinate-major
+# layout its (x, y, z) live at indices (10, 21, 32).
+TIP_POSITION_INDICES = (10, 21, 32)
 
 
 @dataclass(frozen=True)
@@ -28,43 +53,6 @@ class SourceGroup:
     root: Path
     paths: tuple[Path, ...]
     ignored_paths: tuple[Path, ...]
-    metadata: dict[str, object]
-
-
-def load_source_metadata(root: Path) -> dict[str, object]:
-    """Load and validate provenance for one raw 45-D collection root."""
-
-    path = root / "metadata.json"
-    if not path.is_file():
-        raise FileNotFoundError(f"Raw collection metadata is missing: {path}")
-    metadata = json.loads(path.read_text(encoding="utf-8"))
-    expected = {
-        "state_dim": 45,
-        "action_dim": 18,
-        "control_hz": 50.0,
-        "control_dt": 0.02,
-        "physics_dt": 0.0002,
-        "muscle_torque_scale": 30.0,
-        "absolute_action_limit": 0.30,
-    }
-    for key, value in expected.items():
-        if key not in metadata:
-            raise ValueError(f"{path}: required provenance field {key!r} is missing")
-        if not np.isclose(float(metadata[key]), value, rtol=0, atol=1e-9):
-            raise ValueError(
-                f"{path}: {key}={metadata[key]!r}, expected {value!r}"
-            )
-    if int(metadata.get("schema_version", -1)) < 3:
-        raise ValueError(f"{path}: raw schema_version must be at least 3")
-    if (
-        not metadata.get("scenario_path")
-        or not metadata.get("scenario_sha256")
-        or not metadata.get("backend_type")
-    ):
-        raise ValueError(
-            f"{path}: scenario_path, scenario_sha256 and backend_type are required"
-        )
-    return metadata
 
 
 def discover_source_groups(
@@ -79,7 +67,7 @@ def discover_source_groups(
         raise ValueError("--episode-counts must contain one value per --input-root")
 
     groups: list[SourceGroup] = []
-    for group_index, raw_root in enumerate(roots):
+    for raw_root in roots:
         root = Path(raw_root).expanduser().resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"Input root is not a directory: {root}")
@@ -88,7 +76,7 @@ def discover_source_groups(
             paths = tuple(sorted(discovered, key=_episode_number))
             ignored_paths: tuple[Path, ...] = ()
         else:
-            count = int(episode_counts[group_index])
+            count = int(episode_counts[len(groups)])
             if count < 1:
                 raise ValueError("Every --episode-counts value must be positive")
             paths = tuple(root / f"episode_{index:04d}.npz" for index in range(count))
@@ -101,12 +89,7 @@ def discover_source_groups(
             ignored_paths = tuple(sorted(discovered.difference(paths), key=_episode_number))
         if not paths:
             raise ValueError(f"No episode_*.npz files found in {root}")
-        groups.append(SourceGroup(
-            root=root,
-            paths=paths,
-            ignored_paths=ignored_paths,
-            metadata=load_source_metadata(root),
-        ))
+        groups.append(SourceGroup(root=root, paths=paths, ignored_paths=ignored_paths))
     return groups
 
 
@@ -117,14 +100,45 @@ def _episode_number(path: Path) -> int:
         raise ValueError(f"Invalid episode filename: {path.name}") from exc
 
 
+def extract_tip_state(physical: np.ndarray) -> np.ndarray:
+    """Map a [T,41] full physical state to the [T,11] end-tip state.
+
+    The 11-D layout mirrors the observation order used at collection time:
+    tip position, tip speed, tip velocity direction, tip quaternion.
+    """
+
+    if physical.ndim != 2 or physical.shape[1] != SOURCE_OBSERVATION_DIM:
+        raise ValueError(
+            f"tip extraction requires [T,{SOURCE_OBSERVATION_DIM}] states, "
+            f"got {physical.shape}"
+        )
+    tip_position = physical[:, TIP_POSITION_INDICES]
+    tip_speed = physical[:, 33:34]
+    tip_velocity_direction = physical[:, 34:37]
+    tip_quaternion = physical[:, 37:41]
+    tip_state = np.concatenate(
+        (tip_position, tip_speed, tip_velocity_direction, tip_quaternion),
+        axis=1,
+    ).astype(np.float32, copy=False)
+    if tip_state.shape[1] != TIP_STATE_DIM:
+        raise RuntimeError(
+            f"tip state must be {TIP_STATE_DIM}-D, got {tip_state.shape[1]}-D"
+        )
+    if not np.isfinite(tip_state).all():
+        raise ValueError("tip state contains NaN or Inf")
+    return tip_state
+
+
 def load_manisoft_episode(
     path: Path,
     episode_id: int,
-    observation_dim: int,
-    action_dim: int,
     continuity_atol: float = 1e-6,
 ) -> tuple[AugmentedDataset, float]:
-    """Load one ``(s_t, u_t, s_{t+1})`` episode and build schema-v2 rows."""
+    """Load one ``(s_t, u_t, s_{t+1})`` episode and build schema-v2 rows.
+
+    The stored 41-D physical state is compressed to the 11-D tip state before
+    the previous-action block is appended.
+    """
 
     with np.load(path, allow_pickle=False) as archive:
         missing = [field for field in SOURCE_FIELDS if field not in archive.files]
@@ -134,9 +148,10 @@ def load_manisoft_episode(
         current_action = np.asarray(archive["action"], dtype=np.float32)
         next_physical_state = np.asarray(archive["next_state"], dtype=np.float32)
 
-    if physical_state.ndim != 2 or physical_state.shape[1] != observation_dim:
+    if physical_state.ndim != 2 or physical_state.shape[1] != SOURCE_OBSERVATION_DIM:
         raise ValueError(
-            f"{path}: state must have shape [T,{observation_dim}], got {physical_state.shape}"
+            f"{path}: state must have shape [T,{SOURCE_OBSERVATION_DIM}], "
+            f"got {physical_state.shape}"
         )
     if next_physical_state.shape != physical_state.shape:
         raise ValueError(
@@ -145,10 +160,10 @@ def load_manisoft_episode(
         )
     if current_action.ndim != 2 or current_action.shape != (
         len(physical_state),
-        action_dim,
+        ACTION_DIM,
     ):
         raise ValueError(
-            f"{path}: action must have shape [{len(physical_state)},{action_dim}], "
+            f"{path}: action must have shape [{len(physical_state)},{ACTION_DIM}], "
             f"got {current_action.shape}"
         )
     if not len(physical_state):
@@ -161,27 +176,30 @@ def load_manisoft_episode(
         if not np.isfinite(values).all():
             raise ValueError(f"{path}: {name} contains NaN or infinity")
 
+    tip_state = extract_tip_state(physical_state)
+    next_tip_state = extract_tip_state(next_physical_state)
+
     continuity_error = 0.0
-    if len(physical_state) > 1:
+    if len(tip_state) > 1:
         continuity_error = float(
-            np.max(np.abs(next_physical_state[:-1] - physical_state[1:]))
+            np.max(np.abs(next_tip_state[:-1] - tip_state[1:]))
         )
         if continuity_error > continuity_atol:
             raise ValueError(
-                f"{path}: max |next_state[t]-state[t+1]|={continuity_error:.3e} "
-                f"exceeds {continuity_atol:.1e}"
+                f"{path}: max |next_tip_state[t]-tip_state[t+1]|="
+                f"{continuity_error:.3e} exceeds {continuity_atol:.1e}"
             )
 
     previous_action = np.zeros_like(current_action)
     previous_action[1:] = current_action[:-1]
     delta_action = current_action - previous_action
-    rows = len(physical_state)
+    rows = len(tip_state)
     timeout = np.zeros(rows, dtype=bool)
     timeout[-1] = True
     dataset = AugmentedDataset(
-        state=np.concatenate((physical_state, previous_action), axis=1),
+        state=np.concatenate((tip_state, previous_action), axis=1),
         action=delta_action,
-        next_state=np.concatenate((next_physical_state, current_action), axis=1),
+        next_state=np.concatenate((next_tip_state, current_action), axis=1),
         reward=np.zeros(rows, dtype=np.float32),
         done=timeout.copy(),
         terminal=np.zeros(rows, dtype=bool),
@@ -223,29 +241,8 @@ def save_array(path: Path, values: np.ndarray) -> None:
 
 def convert(args: argparse.Namespace) -> dict[str, object]:
     config = load_config(args.config)
-    observation_dim = int(config["experiment"]["expected_observation_dim"])
-    action_dim = int(config["experiment"]["expected_action_dim"])
-    if (observation_dim, action_dim) != (45, 18):
-        raise ValueError(
-            "ManiSoft Koopman conversion requires observation/action dimensions (45,18), "
-            f"got {(observation_dim, action_dim)}"
-        )
 
     groups = discover_source_groups(args.input_root, args.episode_counts)
-    provenance_signatures = {
-        (
-            str(group.metadata["scenario_sha256"]),
-            str(group.metadata["backend_type"]),
-            float(group.metadata["physics_dt"]),
-            float(group.metadata["control_dt"]),
-        )
-        for group in groups
-    }
-    if len(provenance_signatures) != 1:
-        raise ValueError(
-            "All input roots must use the same scenario, backend, physics_dt "
-            "and control_dt"
-        )
     total_files = sum(len(group.paths) for group in groups)
     if args.expected_episodes is not None and total_files != args.expected_episodes:
         raise ValueError(
@@ -263,8 +260,6 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
             episode, continuity_error = load_manisoft_episode(
                 path,
                 episode_id=global_episode_id,
-                observation_dim=observation_dim,
-                action_dim=action_dim,
                 continuity_atol=args.continuity_atol,
             )
             episodes.append(episode)
@@ -286,12 +281,6 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
                 "last_file": group.paths[-1].name,
                 "global_episode_ids": [first_global_id, global_episode_id - 1],
                 "ignored_extra_files": len(group.ignored_paths),
-                "raw_schema_version": group.metadata["schema_version"],
-                "scenario_path": group.metadata["scenario_path"],
-                "scenario_sha256": group.metadata["scenario_sha256"],
-                "backend_type": group.metadata["backend_type"],
-                "muscle_torque_scale": group.metadata["muscle_torque_scale"],
-                "control_hz": group.metadata["control_hz"],
             }
         )
 
@@ -317,26 +306,39 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
         np.max(
             np.abs(
                 dataset.current_action
-                - (dataset.state[:, -action_dim:] + dataset.action)
+                - (dataset.state[:, -ACTION_DIM:] + dataset.action)
             )
         )
     )
     metadata: dict[str, object] = {
         "dataset_schema_version": 2,
+        "state_layout": {
+            "tip_position": {"slice": [0, 3], "description": "end-tip node position (m)"},
+            "tip_speed": {"slice": [3, 4], "description": "end-tip velocity norm (m/s)"},
+            "tip_velocity_direction": {
+                "slice": [4, 7],
+                "description": "end-tip velocity unit vector, zero at rest",
+            },
+            "tip_quaternion_wxyz": {
+                "slice": [7, 11],
+                "description": "end-tip orientation quaternion (wxyz)",
+            },
+            "previous_action": {"slice": [11, 29], "description": "18-D u_{t-1}"},
+        },
         "transition_semantics": {
-            "source_state": "45D three-section physical state s_t",
-            "state": "[s_t, previous_action=u_{t-1}]",
+            "source_state": "41D physical state s_t (compressed to 11D tip state)",
+            "state": "[tip_state_t, previous_action=u_{t-1}]",
             "action": "delta_action=u_t-u_{t-1} (physical units, not normalized)",
-            "next_state": "[s_{t+1}, current_action=u_t]",
-            "koopman_dynamics": "z_{t+1}=A z_t+B delta_u_t",
+            "next_state": "[tip_state_{t+1}, current_action=u_t]",
             "current_action": "18D absolute ManiSoft command u_t",
             "episode_initial_previous_action": "u_-1=0",
             "done": "terminal OR timeout; final row of each source file is timeout",
         },
         "source_groups": source_metadata,
-        "observation_dim": observation_dim,
-        "action_dim": action_dim,
-        "augmented_state_dim": observation_dim + action_dim,
+        "observation_dim": TIP_STATE_DIM,
+        "source_observation_dim": SOURCE_OBSERVATION_DIM,
+        "action_dim": ACTION_DIM,
+        "augmented_state_dim": AUGMENTED_STATE_DIM,
         "transitions": len(dataset),
         "episodes": episode_count,
         "split_seed": split_seed,
@@ -376,8 +378,8 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Merge ManiSoft episode NPZ files and build canonical 63D-state/18D-delta "
-            "Koopman train, validation and test datasets."
+            "Merge ManiSoft episode NPZ files into an 11-D tip-only Koopman "
+            "dataset with 29-D augmented state / 18-D delta action."
         )
     )
     parser.add_argument("--config", default="configs/manisoft_coll.yaml")

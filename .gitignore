@@ -34,3 +34,6 @@ wandb/
 /docs/
 /private_notes/
 *.private.md
+
+# Local experiment outputs
+/work_dirs/

@@ -8,7 +8,7 @@ experiment:
   - 3
   - 4
   output_dir: runs/manisoft_coll
-  expected_observation_dim: 41
+  expected_observation_dim: 45
   expected_action_dim: 18
   references:
     deep_koopman_commit: fe8b5dabd7de1778f1919be2b88015f13e7a0460
@@ -24,6 +24,7 @@ data:
   normalization_epsilon: 1.0e-06
 koopman:
   architecture: fullA_history_v2_adapted
+  exact_action_integrator: true
   lift_dim: 32
   K_step: 20
   encoder_hidden_dims:

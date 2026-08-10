@@ -23,6 +23,7 @@ plots = ["matplotlib>=3.8"]
 d4rl-data = ["h5py>=3.10"]
 modern-env = ["gymnasium-robotics>=1.4", "mujoco>=3.2"]
 tracking = ["wandb>=0.24"]
+mpc = ["osqp>=1.0,<2", "scipy>=1.11"]
 
 [tool.setuptools.packages.find]
 include = ["antmaze_ac*"]

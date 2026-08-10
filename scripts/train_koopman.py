@@ -236,6 +236,11 @@ def main() -> None:
         koopman_config["encoder_hidden_dims"],
         koopman_config["encoder_activation"],
     ).to(device)
+    exact_action_integrator = bool(
+        koopman_config.get("exact_action_integrator", False)
+    )
+    if exact_action_integrator:
+        model.configure_action_integrator(normalizer.std[-action_dim:])
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=koopman_config["learning_rate"],
@@ -247,6 +252,12 @@ def main() -> None:
     history_best_epoch = None
     if args.resume:
         model, payload = load_checkpoint(args.resume, map_location=device)
+        if (model.state_dim, model.action_dim) != (state_dim, action_dim):
+            raise ValueError(
+                "Refusing incompatible resume: checkpoint state/action "
+                f"dimensions are ({model.state_dim},{model.action_dim}), "
+                f"dataset requires ({state_dim},{action_dim})"
+            )
         checkpoint_architecture = payload.get("config", {}).get("koopman", {}).get("architecture")
         if checkpoint_architecture != koopman_config["architecture"]:
             raise ValueError(
@@ -254,7 +265,20 @@ def main() -> None:
                 f"{checkpoint_architecture!r}, requested {koopman_config['architecture']!r}. "
                 "Start a fresh fullA_history_v2-adapted run."
             )
+        checkpoint_exact_integrator = bool(
+            payload.get("config", {})
+            .get("koopman", {})
+            .get("exact_action_integrator", False)
+        )
+        if checkpoint_exact_integrator != exact_action_integrator:
+            raise ValueError(
+                "Refusing incompatible resume: exact_action_integrator "
+                f"changed from {checkpoint_exact_integrator} to "
+                f"{exact_action_integrator}"
+            )
         model.to(device)
+        if exact_action_integrator:
+            model.configure_action_integrator(normalizer.std[-action_dim:])
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=koopman_config["learning_rate"],
@@ -342,6 +366,8 @@ def main() -> None:
             if not torch.isfinite(gradient_norm):
                 raise FloatingPointError("Non-finite Koopman gradient")
             optimizer.step()
+            if exact_action_integrator:
+                model.project_action_integrator()
             if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
                 raise FloatingPointError("Koopman parameter became NaN or Inf after optimizer step")
             batch = len(states)
