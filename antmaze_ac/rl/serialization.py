@@ -70,7 +70,7 @@ def make_policy(
     state_mean = torch.tensor(state_stats["mean"], dtype=torch.float32)
     state_std = torch.tensor(state_stats["std"], dtype=torch.float32)
     if extra_observation_dim:
-        # ManiSoft appends already normalized goal-error features.
+        # Optional extra observation features are expected to be normalized.
         state_mean = torch.cat((state_mean, torch.zeros(extra_observation_dim)))
         state_std = torch.cat((state_std, torch.ones(extra_observation_dim)))
     policy = KoopmanLQRPolicy(

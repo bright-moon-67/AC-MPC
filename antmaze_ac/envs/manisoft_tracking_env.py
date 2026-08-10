@@ -219,54 +219,6 @@ class ManiSoftTipTrackingEnv(gym.Env):
         gc.collect()
 
 
-class TipPositionErrorObservationWrapper(gym.ObservationWrapper):
-    """Append normalized 3-D tip-position error after the 63-D dynamics state."""
-
-    def __init__(self, env: gym.Env, target_scale: float):
-        super().__init__(env)
-        if not isinstance(env.observation_space, gym.spaces.Box):
-            raise TypeError("末端误差包装器要求Box观测空间")
-        if env.observation_space.shape != (63,):
-            raise ValueError(
-                f"末端误差包装器要求63维基础状态，实际为{env.observation_space.shape}"
-            )
-        if target_scale <= 0:
-            raise ValueError("target_scale必须为正数")
-
-        self.target_scale = float(target_scale)
-        self.observation_space = gym.spaces.Box(
-            low=np.concatenate(
-                (env.observation_space.low, np.full(3, -np.inf, dtype=np.float32))
-            ),
-            high=np.concatenate(
-                (env.observation_space.high, np.full(3, np.inf, dtype=np.float32))
-            ),
-            dtype=np.float32,
-        )
-
-    def observation(self, observation: np.ndarray) -> np.ndarray:
-        state = np.asarray(observation, dtype=np.float32)
-        if state.shape != (63,):
-            raise ValueError(f"错误基础状态维度：{state.shape}")
-
-        target_tip = self.env.unwrapped.target_tip
-        if target_tip is None:
-            raise RuntimeError("ManiSoft环境尚未设置目标末端位置")
-        tip_position = state[KOOPMAN_TIP_POSITION_SLICE]
-        tip_error = (
-            np.asarray(target_tip, dtype=np.float32) - tip_position
-        ) / self.target_scale
-        policy_state = np.concatenate((state, tip_error)).astype(
-            np.float32,
-            copy=False,
-        )
-        if policy_state.shape != (66,):
-            raise RuntimeError(f"错误策略状态维度：{policy_state.shape}")
-        if not np.isfinite(policy_state).all():
-            raise FloatingPointError("策略状态出现NaN或Inf")
-        return policy_state
-
-
 def make_manisoft_tracking_env(
     scenario_path: str | Path,
     *,
@@ -280,11 +232,7 @@ def make_manisoft_tracking_env(
         episode_steps=episode_steps,
         absolute_action_limit=absolute_action_limit,
     )
-    delta_env = DeltaActionWrapper(
+    return DeltaActionWrapper(
         base_env,
         expected_observation_dim=KOOPMAN_PHYSICAL_STATE_DIM,
-    )
-    return TipPositionErrorObservationWrapper(
-        delta_env,
-        target_scale=float(np.linalg.norm(base_env.target_offset)),
     )

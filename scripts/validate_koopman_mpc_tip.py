@@ -404,7 +404,11 @@ def main() -> None:
     simulator = None
     try:
         observation, reset_info = env.reset()
-        dynamics_state = np.asarray(observation[:63], dtype=np.float32)
+        dynamics_state = np.asarray(observation, dtype=np.float32)
+        if dynamics_state.shape != (63,):
+            raise RuntimeError(
+                f"Expected 63-D environment observation, got {dynamics_state.shape}"
+            )
         initial_tip = dynamics_state[np.asarray(TIP_INDICES)]
         goal = initial_tip + np.asarray(target_offset, dtype=np.float32)
         environment_goal = np.asarray(reset_info["target_tip"], dtype=np.float32)
@@ -460,7 +464,12 @@ def main() -> None:
             if not np.allclose(actual_applied_delta, applied_plan[0], atol=1e-5):
                 raise RuntimeError("Planner clipping and environment clipping disagree")
 
-            dynamics_state = np.asarray(next_observation[:63], dtype=np.float32)
+            dynamics_state = np.asarray(next_observation, dtype=np.float32)
+            if dynamics_state.shape != (63,):
+                raise RuntimeError(
+                    "Expected 63-D environment observation, "
+                    f"got {dynamics_state.shape}"
+                )
             tip = dynamics_state[np.asarray(TIP_INDICES)]
             distance = float(np.linalg.norm(tip - goal))
             predicted_first_tip = predicted_tips[0]

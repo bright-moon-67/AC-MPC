@@ -1,5 +1,12 @@
 #!/usr/bin/env python
-"""Validate fixed-reference tracking with condensed-QP Koopman-MPC."""
+"""Validate fixed-reference tracking with condensed-QP Koopman-MPC
+using the ABSOLUTE-ACTION Koopman model ``z_{t+1}=A z_t + B u_t``.
+
+The model state is the raw 45-D physical state ``s_t`` (no previous-action
+block) and the action is the absolute 18-D muscle activation ``u_t``.
+The environment is the plain ManiSoftTipTrackingEnv (45-D observation,
+absolute actions), so no DeltaActionWrapper / tip-error appendage is used.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +25,7 @@ from antmaze_ac.koopman.checkpoint import load_checkpoint, sha256
 TIP_INDICES = (30, 31, 32)
 PHYSICAL_DIM = 45
 ACTION_DIM = 18
-DYNAMICS_STATE_DIM = PHYSICAL_DIM + ACTION_DIM
+DYNAMICS_STATE_DIM = PHYSICAL_DIM
 
 
 def compress_physical_to_model(
@@ -38,18 +45,20 @@ def compress_physical_to_model(
 
 
 def build_model_state(observation: np.ndarray, model_state_dim: int) -> np.ndarray:
+    """The abs-action model state is the raw 45-D env observation."""
+
     observation = np.asarray(observation, dtype=np.float32)
     if model_state_dim != DYNAMICS_STATE_DIM:
         raise ValueError(f"Unsupported model state dimension {model_state_dim}")
     if observation.shape != (DYNAMICS_STATE_DIM,):
         raise ValueError(
-            f"Expected 63-D environment observation, got {observation.shape}"
+            f"Expected 45-D environment observation, got {observation.shape}"
         )
     return observation
 
 
 class KoopmanMPCQP:
-    """Condensed OSQP controller for ``z+ = A z + B delta_u``."""
+    """Condensed OSQP controller for ``z+ = A z + B u`` (absolute action)."""
 
     def __init__(
         self,
@@ -84,7 +93,7 @@ class KoopmanMPCQP:
         self.action_high = np.asarray(action_high, dtype=np.float64)
         self.horizon = int(horizon)
         self.action_dim = int(model.action_dim)
-        self.physical_dim = int(model.state_dim - model.action_dim)
+        self.physical_dim = int(model.state_dim)
         self.state_weight = float(state_weight)
         self.action_weight = float(action_weight)
         self.control_weight = float(control_weight)
@@ -111,7 +120,7 @@ class KoopmanMPCQP:
         free_prediction = np.vstack(
             [C_physical @ powers[step + 1] for step in range(self.horizon)]
         )
-        delta_prediction = np.zeros(
+        action_prediction = np.zeros(
             (self.horizon * self.physical_dim, self.variable_dim),
             dtype=np.float64,
         )
@@ -122,19 +131,15 @@ class KoopmanMPCQP:
                     control_step * self.action_dim,
                     (control_step + 1) * self.action_dim,
                 )
-                delta_prediction[rows, columns] = (
+                action_prediction[rows, columns] = (
                     C_physical @ powers[step - control_step] @ B
                 )
 
         physical_std = np.tile(self.state_std[: self.physical_dim], self.horizon)
         self.free_prediction = physical_std[:, None] * free_prediction
-        self.delta_prediction = physical_std[:, None] * delta_prediction
+        self.action_prediction = physical_std[:, None] * action_prediction
         self.physical_mean = np.tile(
             self.state_mean[: self.physical_dim], self.horizon
-        )
-        self.cumulative = np.kron(
-            np.tril(np.ones((self.horizon, self.horizon), dtype=np.float64)),
-            np.eye(self.action_dim, dtype=np.float64),
         )
 
         if self.horizon > 1:
@@ -157,31 +162,50 @@ class KoopmanMPCQP:
         state_diagonal = np.tile(
             self.state_weight * np.square(self.state_scales), self.horizon
         )
-        hessian = self.delta_prediction.T @ (
-            state_diagonal[:, None] * self.delta_prediction
+        hessian = self.action_prediction.T @ (
+            state_diagonal[:, None] * self.action_prediction
         )
-        hessian += self.action_weight * (self.cumulative.T @ self.cumulative)
+        # Action tracking ||u - u_ref||^2 -> identity in absolute coordinates.
+        hessian += self.action_weight * np.eye(self.variable_dim)
+        # Action-magnitude regularizer ||u||^2 (control effort on u itself).
         hessian += self.control_weight * np.eye(self.variable_dim)
+        # Smoothness ||u_k - u_{k-1}||^2.
         hessian += self.smoothness_weight * (difference.T @ difference)
         hessian = 2.0 * ((hessian + hessian.T) * 0.5)
+
+        # First-step selector: u_0 - u_prev must stay within +/- max_delta.
+        first_step_selector = np.zeros(
+            (self.action_dim, self.variable_dim), dtype=np.float64
+        )
+        first_step_selector[:, : self.action_dim] = np.eye(
+            self.action_dim, dtype=np.float64
+        )
+        self.first_step_selector = first_step_selector
 
         constraint_matrix = sparse.vstack(
             (
                 sparse.eye(self.variable_dim, format="csc"),
-                sparse.csc_matrix(self.cumulative),
+                sparse.csc_matrix(difference),
+                sparse.csc_matrix(first_step_selector),
             ),
             format="csc",
         )
         initial_lower = np.concatenate(
             (
-                np.full(self.variable_dim, -self.max_delta),
                 np.tile(self.action_low, self.horizon),
+                np.full(
+                    (self.horizon - 1) * self.action_dim, -self.max_delta
+                ),
+                np.full(self.action_dim, -self.max_delta),
             )
         )
         initial_upper = np.concatenate(
             (
-                np.full(self.variable_dim, self.max_delta),
                 np.tile(self.action_high, self.horizon),
+                np.full(
+                    (self.horizon - 1) * self.action_dim, self.max_delta
+                ),
+                np.full(self.action_dim, self.max_delta),
             )
         )
         self.solver = osqp.OSQP()
@@ -213,13 +237,14 @@ class KoopmanMPCQP:
         state: np.ndarray,
         ref_state: np.ndarray,
         ref_action: np.ndarray,
-        initial_deltas: np.ndarray | None,
+        previous_action: np.ndarray,
+        initial_actions: np.ndarray | None,
     ) -> dict[str, np.ndarray | float | int | str]:
         started = time.perf_counter()
         state = np.asarray(state, dtype=np.float64)
         ref_state = np.asarray(ref_state, dtype=np.float64)
         ref_action = np.asarray(ref_action, dtype=np.float64)
-        previous_action = state[-self.action_dim :]
+        previous_action = np.asarray(previous_action, dtype=np.float64).reshape(-1)
 
         free_physical = self.free_prediction @ self._lift(state) + self.physical_mean
         state_error = free_physical - np.tile(
@@ -228,31 +253,39 @@ class KoopmanMPCQP:
         state_diagonal = np.tile(
             self.state_weight * np.square(self.state_scales), self.horizon
         )
-        linear = 2.0 * self.delta_prediction.T @ (state_diagonal * state_error)
+        linear = 2.0 * self.action_prediction.T @ (state_diagonal * state_error)
         action_target = (
             ref_action if self.action_tracking else np.zeros_like(ref_action)
         )
-        action_error = np.tile(previous_action - action_target, self.horizon)
-        linear += 2.0 * self.action_weight * self.cumulative.T @ action_error
+        # From 0.5*||u - u_target||^2 expanded: -u_target' u.
+        linear -= 2.0 * self.action_weight * np.tile(action_target, self.horizon)
 
+        first_lower = previous_action - self.max_delta
+        first_upper = previous_action + self.max_delta
         lower = np.concatenate(
             (
-                np.full(self.variable_dim, -self.max_delta),
-                np.tile(self.action_low - previous_action, self.horizon),
+                np.tile(self.action_low, self.horizon),
+                np.full(
+                    (self.horizon - 1) * self.action_dim, -self.max_delta
+                ),
+                first_lower,
             )
         )
         upper = np.concatenate(
             (
-                np.full(self.variable_dim, self.max_delta),
-                np.tile(self.action_high - previous_action, self.horizon),
+                np.tile(self.action_high, self.horizon),
+                np.full(
+                    (self.horizon - 1) * self.action_dim, self.max_delta
+                ),
+                first_upper,
             )
         )
         self.solver.update(q=linear, l=lower, u=upper)
-        if initial_deltas is not None:
-            initial_deltas = np.asarray(initial_deltas, dtype=np.float64)
-            if initial_deltas.shape != (self.horizon, self.action_dim):
+        if initial_actions is not None:
+            initial_actions = np.asarray(initial_actions, dtype=np.float64)
+            if initial_actions.shape != (self.horizon, self.action_dim):
                 raise ValueError("QP warm start has the wrong shape")
-            self.solver.warm_start(x=initial_deltas.reshape(-1))
+            self.solver.warm_start(x=initial_actions.reshape(-1))
         result = self.solver.solve(raise_error=False)
         if result.info.status_val not in {1, 2} or result.x is None:
             raise RuntimeError(
@@ -260,26 +293,19 @@ class KoopmanMPCQP:
                 f"status={result.info.status!r}, iterations={result.info.iter}"
             )
 
-        requested_deltas = np.asarray(result.x, dtype=np.float64).reshape(
+        requested_actions = np.asarray(result.x, dtype=np.float64).reshape(
             self.horizon, self.action_dim
         )
-        requested_deltas = np.clip(requested_deltas, -self.max_delta, self.max_delta)
-        applied_deltas = []
-        applied_actions = []
-        absolute_action = previous_action.copy()
-        for requested_delta in requested_deltas:
-            next_action = np.clip(
-                absolute_action + requested_delta, self.action_low, self.action_high
-            )
-            applied_deltas.append(next_action - absolute_action)
-            applied_actions.append(next_action)
-            absolute_action = next_action
-        applied_deltas = np.asarray(applied_deltas)
-        applied_actions = np.asarray(applied_actions)
+        applied_actions = np.clip(
+            requested_actions, self.action_low, self.action_high
+        )
+        applied_deltas = np.diff(
+            np.vstack((applied_actions[:1], applied_actions)), axis=0
+        )
 
-        flat_deltas = applied_deltas.reshape(-1)
+        flat_actions = applied_actions.reshape(-1)
         predicted_physical = (
-            free_physical + self.delta_prediction @ flat_deltas
+            free_physical + self.action_prediction @ flat_actions
         ).reshape(self.horizon, self.physical_dim)
         weighted_state_error = (
             predicted_physical - ref_state[: self.physical_dim]
@@ -288,15 +314,15 @@ class KoopmanMPCQP:
         action_cost = self.action_weight * np.square(
             applied_actions - action_target
         ).sum()
-        control_cost = self.control_weight * np.square(applied_deltas).sum()
+        control_cost = self.control_weight * np.square(applied_actions).sum()
         smoothness_cost = self.smoothness_weight * np.square(
-            np.diff(applied_deltas, axis=0)
+            np.diff(applied_actions, axis=0)
         ).sum()
 
         return {
-            "requested_deltas": requested_deltas.astype(np.float32),
-            "applied_deltas": applied_deltas.astype(np.float32),
+            "requested_actions": requested_actions.astype(np.float32),
             "applied_actions": applied_actions.astype(np.float32),
+            "applied_deltas": applied_deltas.astype(np.float32),
             "cost": float(
                 state_cost + action_cost + control_cost + smoothness_cost
             ),
@@ -309,12 +335,13 @@ class KoopmanMPCQP:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Koopman-MPC tracking of a fixed-action reference equilibrium"
+        description="Absolute-action Koopman-MPC tracking of a fixed-action "
+        "reference equilibrium"
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--reference", required=True, help="reference.npz")
-    parser.add_argument("--output", default="runs/koopman_mpc_reference")
+    parser.add_argument("--output", default="runs/koopman_mpc_reference_abs")
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--state-weight", type=float, default=100.0)
@@ -322,7 +349,7 @@ def main() -> None:
     parser.add_argument("--action-weight", type=float, default=30.0)
     parser.add_argument("--no-action-tracking", action="store_true")
     parser.add_argument("--track-tip-only", action="store_true")
-    parser.add_argument("--control-weight", type=float, default=5.0)
+    parser.add_argument("--control-weight", type=float, default=1.0)
     parser.add_argument("--smoothness-weight", type=float, default=10.0)
     parser.add_argument("--max-delta", type=float, default=0.002)
     parser.add_argument("--absolute-action-limit", type=float, default=0.30)
@@ -375,27 +402,26 @@ def main() -> None:
     model = model.to(device).freeze_dynamics()
     if (model.state_dim, model.action_dim) != (DYNAMICS_STATE_DIM, ACTION_DIM):
         raise ValueError(
-            "Requires state/action dimensions (63,18), "
+            "Requires state/action dimensions (45,18), "
             f"got ({model.state_dim},{model.action_dim})"
         )
-    model_physical_dim = model.state_dim - model.action_dim
     stats = payload["normalizers"]["state"]
     state_mean = torch.as_tensor(stats["mean"], dtype=torch.float32, device=device)
     state_std = torch.as_tensor(stats["std"], dtype=torch.float32, device=device)
     if state_mean.shape != (DYNAMICS_STATE_DIM,) or state_std.shape != (
         DYNAMICS_STATE_DIM,
     ):
-        raise ValueError("Checkpoint state normalizer must have 63 dimensions")
+        raise ValueError("Checkpoint state normalizer must have 45 dimensions")
 
     ref_model_state = compress_physical_to_model(
-        ref_state[None, :], model_physical_dim
+        ref_state[None, :], model.state_dim
     )[0]
     tip_idx = np.asarray(TIP_INDICES)
     ref_tip = ref_model_state[tip_idx].astype(np.float32, copy=False)
 
-    from antmaze_ac.envs.manisoft_tracking_env import make_manisoft_tracking_env
+    from antmaze_ac.envs.manisoft_tracking_env import ManiSoftTipTrackingEnv
 
-    env = make_manisoft_tracking_env(
+    env = ManiSoftTipTrackingEnv(
         scenario,
         target_offset=(0.01, 0.0, 0.0),
         episode_steps=args.steps,
@@ -407,12 +433,9 @@ def main() -> None:
         dynamics_state = build_model_state(observation, model.state_dim)
         initial_tip = dynamics_state[tip_idx]
         initial_state_dist = float(np.linalg.norm(initial_tip - ref_tip))
-        initial_action_dist = float(
-            np.linalg.norm(dynamics_state[-ACTION_DIM:] - ref_action)
-        )
-        base_action_space = env.unwrapped.action_space
-        action_low = np.asarray(base_action_space.low, dtype=np.float64)
-        action_high = np.asarray(base_action_space.high, dtype=np.float64)
+        initial_action_dist = float(np.linalg.norm(ref_action))
+        action_low = np.asarray(env.action_space.low, dtype=np.float64)
+        action_high = np.asarray(env.action_space.high, dtype=np.float64)
         planner = KoopmanMPCQP(
             model=model,
             state_mean=state_mean,
@@ -435,8 +458,8 @@ def main() -> None:
 
         state_distances = [initial_state_dist]
         action_distances = [initial_action_dist]
-        applied_delta_history = []
         applied_action_history = []
+        applied_delta_history = []
         mpc_cost_history = []
         qp_solve_time_history = []
         qp_internal_time_history = []
@@ -444,6 +467,7 @@ def main() -> None:
         simulation_time_history = []
         frame_time_history = []
         warm_start = None
+        previous_action = np.zeros(ACTION_DIM, dtype=np.float64)
 
         for step in range(args.steps):
             frame_start = time.perf_counter()
@@ -451,25 +475,24 @@ def main() -> None:
                 state=dynamics_state,
                 ref_state=ref_model_state,
                 ref_action=ref_action,
-                initial_deltas=warm_start,
+                previous_action=previous_action,
+                initial_actions=warm_start,
             )
-            requested_delta = plan["requested_deltas"][0]
-            applied_delta = plan["applied_deltas"][0]
             applied_action = plan["applied_actions"][0]
+            applied_delta = plan["applied_deltas"][0]
 
             simulation_start = time.perf_counter()
-            observation, _, _, _, _ = env.step(requested_delta)
+            observation, _, _, _, _ = env.step(applied_action)
             simulation_seconds = time.perf_counter() - simulation_start
+            previous_action = applied_action.copy()
             dynamics_state = build_model_state(observation, model.state_dim)
             tip = dynamics_state[tip_idx]
             state_dist = float(np.linalg.norm(tip - ref_tip))
-            action_dist = float(
-                np.linalg.norm(dynamics_state[-ACTION_DIM:] - ref_action)
-            )
+            action_dist = float(np.linalg.norm(applied_action - ref_action))
             state_distances.append(state_dist)
             action_distances.append(action_dist)
-            applied_delta_history.append(applied_delta)
             applied_action_history.append(applied_action)
+            applied_delta_history.append(applied_delta)
             mpc_cost_history.append(float(plan["cost"]))
             qp_solve_time_history.append(float(plan["qp_solve_seconds"]))
             qp_internal_time_history.append(float(plan["qp_internal_run_seconds"]))
@@ -478,8 +501,8 @@ def main() -> None:
             frame_time_history.append(time.perf_counter() - frame_start)
             warm_start = np.concatenate(
                 (
-                    plan["applied_deltas"][1:],
-                    np.zeros_like(plan["applied_deltas"][:1]),
+                    plan["applied_actions"][1:],
+                    plan["applied_actions"][-1:],
                 ),
                 axis=0,
             )
@@ -509,6 +532,7 @@ def main() -> None:
             "scenario": str(scenario),
             "reference": str(reference_path),
             "device": str(device),
+            "action_form": "absolute",
             "horizon": args.horizon,
             "state_weight": args.state_weight,
             "tip_state_scale": args.tip_state_scale,
@@ -554,8 +578,8 @@ def main() -> None:
             output / "trajectory.npz",
             state_distance=state_array,
             action_distance=action_array,
-            applied_delta=np.asarray(applied_delta_history, dtype=np.float32),
             applied_action=np.asarray(applied_action_history, dtype=np.float32),
+            applied_delta=np.asarray(applied_delta_history, dtype=np.float32),
             mpc_cost=np.asarray(mpc_cost_history, dtype=np.float32),
             qp_solve_seconds=qp_solve_times,
             qp_internal_seconds=qp_internal_times,
