@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 6 || $# -gt 7 ]]; then
+    echo "Usage: $0 KOOPMAN_CHECKPOINT SCENARIO REFERENCE EXPERT_DATA BC_OUTPUT PPO_OUTPUT [cuda|cpu]" >&2
+    exit 2
+fi
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python_bin="${AC_MPC_PYTHON:-python}"
+koopman_checkpoint="$1"
+scenario="$2"
+reference="$3"
+expert_data="$4"
+bc_output="$5"
+ppo_output="$6"
+device="${7:-cuda}"
+horizon="${BC_KMPC_HORIZON:-10}"
+solver_iterations="${BC_KMPC_SOLVER_ITERATIONS:-20}"
+max_delta="${BC_KMPC_MAX_DELTA:-0.001}"
+
+for path in "${koopman_checkpoint}" "${scenario}" "${reference}"; do
+    if [[ ! -f "${path}" ]]; then
+        echo "Missing required file: ${path}" >&2
+        exit 1
+    fi
+done
+
+cd "${project_root}"
+if [[ ! -f "${expert_data}" ]]; then
+    "${python_bin}" scripts/collect_manisoft_bc_kmpc_expert.py \
+        --koopman-checkpoint "${koopman_checkpoint}" \
+        --scenario "${scenario}" \
+        --reference "${reference}" \
+        --output "${expert_data}" \
+        --episodes "${BC_KMPC_EXPERT_EPISODES:-10}" \
+        --episode-steps "${BC_KMPC_EPISODE_STEPS:-300}" \
+        --horizon "${horizon}" \
+        --max-delta "${max_delta}" \
+        --device "${device}"
+fi
+
+bc_checkpoint="${bc_output}/best_validation.pt"
+bc_complete=false
+if [[ -f "${bc_output}/training_status.json" ]] \
+    && grep -q '"state": "complete"' "${bc_output}/training_status.json"; then
+    bc_complete=true
+fi
+if [[ "${bc_complete}" != true ]]; then
+    resume_bc=()
+    if [[ -f "${bc_output}/last.pt" ]]; then
+        resume_bc=(--resume "${bc_output}/last.pt")
+    fi
+    "${python_bin}" scripts/train_manisoft_bc_kmpc_bc.py \
+        --koopman-checkpoint "${koopman_checkpoint}" \
+        --dataset "${expert_data}" \
+        --output "${bc_output}" \
+        --epochs "${BC_KMPC_BC_EPOCHS:-150}" \
+        --batch-size "${BC_KMPC_BC_BATCH_SIZE:-256}" \
+        --horizon "${horizon}" \
+        --solver-iterations "${solver_iterations}" \
+        --max-delta "${max_delta}" \
+        --device "${device}" \
+        "${resume_bc[@]}"
+fi
+if [[ ! -f "${bc_checkpoint}" ]]; then
+    echo "BC training did not produce ${bc_checkpoint}" >&2
+    exit 1
+fi
+
+ppo_initialization=(--bc-checkpoint "${bc_checkpoint}")
+if [[ -f "${ppo_output}/last.pt" ]]; then
+    ppo_initialization=(--resume "${ppo_output}/last.pt")
+fi
+"${python_bin}" scripts/train_manisoft_bc_kmpc_ppo.py \
+    --koopman-checkpoint "${koopman_checkpoint}" \
+    --scenario "${scenario}" \
+    --reference "${reference}" \
+    --output "${ppo_output}" \
+    --episode-steps "${BC_KMPC_EPISODE_STEPS:-300}" \
+    --horizon "${horizon}" \
+    --solver-iterations "${solver_iterations}" \
+    --max-delta "${max_delta}" \
+    --num-envs "${BC_KMPC_NUM_ENVS:-1}" \
+    --actor-learning-rate "${BC_KMPC_ACTOR_LEARNING_RATE:-0.0000003}" \
+    --target-kl "${BC_KMPC_TARGET_KL:-0.02}" \
+    --device "${device}" \
+    "${ppo_initialization[@]}"

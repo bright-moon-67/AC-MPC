@@ -14,7 +14,12 @@ class Critic(nn.Module):
         activation: str = "gelu",
     ) -> None:
         super().__init__()
-        activation_types = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}
+        activation_types = {
+            "gelu": nn.GELU,
+            "relu": nn.ReLU,
+            "silu": nn.SiLU,
+            "tanh": nn.Tanh,
+        }
         if activation.lower() not in activation_types:
             raise ValueError(f"Unsupported critic activation {activation!r}")
         activation_type = activation_types[activation.lower()]

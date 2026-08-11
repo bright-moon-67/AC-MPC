@@ -26,6 +26,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
         self,
         scenario_path: str | Path,
         target_offset: Sequence[float] = (0.0, 0.005, 0.0),
+        target_tip: Sequence[float] | None = None,
         episode_steps: int = 300,
         success_threshold: float = 0.0015,
         success_streak: int = 5,
@@ -35,10 +36,17 @@ class ManiSoftTipTrackingEnv(gym.Env):
 
         self.scenario_path = Path(scenario_path).resolve()
         self.target_offset = np.asarray(target_offset, dtype=np.float32)
+        self.fixed_target_tip = (
+            None
+            if target_tip is None
+            else np.asarray(target_tip, dtype=np.float32)
+        )
 
         if self.target_offset.shape != (3,):
             raise ValueError("target_offset必须是3维")
-        if np.linalg.norm(self.target_offset) <= 0:
+        if self.fixed_target_tip is not None and self.fixed_target_tip.shape != (3,):
+            raise ValueError("target_tip必须是3维")
+        if self.fixed_target_tip is None and np.linalg.norm(self.target_offset) <= 0:
             raise ValueError("target_offset不能为零")
 
         self.episode_steps = int(episode_steps)
@@ -63,6 +71,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
         self.muscle = None
         self.target_tip = None
         self.previous_distance = None
+        self.target_scale = None
         self.step_count = 0
         self.success_count = 0
 
@@ -122,12 +131,24 @@ class ManiSoftTipTrackingEnv(gym.Env):
         observation = self._physical_state()
         self.target_tip = (
             self._tip_position(observation) + self.target_offset
+            if self.fixed_target_tip is None
+            else self.fixed_target_tip
         ).astype(np.float32)
 
         self.previous_distance = float(
             np.linalg.norm(
                 self._tip_position(observation) - self.target_tip
             )
+        )
+        # Offset tasks retain their original normalization.  An explicit
+        # reference tip may be much farther away, so normalize progress and
+        # distance reward by its actual reset distance instead of the default
+        # 5 mm offset.
+        self.target_scale = max(
+            float(np.linalg.norm(self.target_offset))
+            if self.fixed_target_tip is None
+            else self.previous_distance,
+            np.finfo(np.float32).eps,
         )
         self.step_count = 0
         self.success_count = 0
@@ -171,7 +192,9 @@ class ManiSoftTipTrackingEnv(gym.Env):
             )
         )
 
-        target_scale = float(np.linalg.norm(self.target_offset))
+        if self.target_scale is None:
+            raise RuntimeError("Environment must be reset before step")
+        target_scale = self.target_scale
         progress = (self.previous_distance - distance) / target_scale
 
         # 有界奖励，避免距离增大时产生过大的负回报。
@@ -223,12 +246,14 @@ def make_manisoft_tracking_env(
     scenario_path: str | Path,
     *,
     target_offset=(0.0, 0.005, 0.0),
+    target_tip=None,
     episode_steps: int = 300,
     absolute_action_limit: float = 0.30,
 ):
     base_env = ManiSoftTipTrackingEnv(
         scenario_path,
         target_offset=target_offset,
+        target_tip=target_tip,
         episode_steps=episode_steps,
         absolute_action_limit=absolute_action_limit,
     )

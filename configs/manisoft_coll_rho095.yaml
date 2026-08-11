@@ -42,7 +42,7 @@ koopman:
   checkpoint_interval: 25
   rollout_discount: 0.99
   target_latent_std: 1.0
-  spectral_radius_limit: 1.0
+  spectral_radius_limit: 0.95
   loss_weights:
     linear: 10.0
     rollout: 1.0

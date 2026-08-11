@@ -36,6 +36,13 @@ u_t=\operatorname{clip}(u_{t-1}+v_t,-1,1).
   action-value critics、target networks 和 BC 约束；可以初始化但不替换正式 PPO。
 - 同接口的 Delta-PPO、固定成本 Koopman-LQR、100-episode legacy 评估和分组件
   latency benchmark。
+- ManiSoft history BC-KMPC：45-D 软体状态、18-D 绝对动作和 H=10 显式历史
+  上下文；cost-map actor 逐预测步输出代价，经可微有限时域约束 QP/FISTA 得到
+  动作，并支持 fixed-cost OSQP 专家采集、BC 预训练、独立 critic 的 PPO 精调
+  及确定性评估。完整命令见 [`docs/manisoft_bc_kmpc.md`](docs/manisoft_bc_kmpc.md)。
+- 同观测、同专家数据和同动作约束的 ManiSoft H=10 History-MLP 基线；支持
+  MLP behavior cloning、from-scratch/BC-initialized PPO 和确定性闭环评估，见
+  [`docs/manisoft_history_mlp_baseline.md`](docs/manisoft_history_mlp_baseline.md)。
 
 ## 环境
 

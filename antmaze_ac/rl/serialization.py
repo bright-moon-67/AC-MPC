@@ -4,12 +4,15 @@ from pathlib import Path
 
 import torch
 
-from antmaze_ac.koopman.checkpoint import load_checkpoint
+from antmaze_ac.koopman.checkpoint import load_checkpoint, sha256
 
 from .ac_koopman_policy import KoopmanLQRPolicy
 from .cost_actor import CostActor
 from .critic import Critic
 from .delta_policy import DeltaPolicy
+from .history_mlp_policy import HistoryMLPActor, HistoryMLPPolicy
+from .history_koopman_mpc_policy import HistoryKoopmanMPCPolicy
+from .koopman_mpc_actor import KoopmanMPCActor
 
 
 def make_policy(
@@ -159,3 +162,214 @@ def load_td3_bc_checkpoint(path: str | Path, device: torch.device):
     )
     policy.load_state_dict(td3_payload["policy"])
     return policy, td3_payload, koopman_payload
+
+
+def make_history_mpc_policy(
+    koopman_checkpoint: str | Path,
+    device: torch.device,
+    *,
+    horizon: int | None = None,
+    absolute_action_limit: float | None = None,
+    max_delta: float | None = None,
+    solver_iterations: int | None = None,
+) -> tuple[HistoryKoopmanMPCPolicy, dict]:
+    """Build the soft-robot BC-KMPC policy from a history checkpoint."""
+
+    koopman, payload = load_checkpoint(koopman_checkpoint, map_location=device)
+    from antmaze_ac.koopman.history_model import HistoryDeepKoopman
+
+    if not isinstance(koopman, HistoryDeepKoopman):
+        raise ValueError(
+            "BC-KMPC requires a fullA_history_context_v1 Koopman checkpoint"
+        )
+    config = payload["config"]
+    settings = {
+        "horizon": 10,
+        "hidden_dims": [256, 256],
+        "activation": "gelu",
+        "quadratic_log_scale": 1.5,
+        "linear_scale": 10.0,
+        "smoothness_weight": 10.0,
+        "solver_iterations": 20,
+        "step_fraction": 0.95,
+        "solver_epsilon": 1e-6,
+        "absolute_action_limit": 0.30,
+        "max_delta": 0.001,
+        # Latent standard deviation for the rate-limited tanh distribution.
+        # exp(-0.5) explores a useful fraction of the +/- max_delta interval.
+        "log_std_init": -0.5,
+        "critic_hidden_dims": [256, 256],
+        "critic_activation": "gelu",
+    }
+    settings.update(config.get("bc_kmpc", {}))
+    if horizon is not None:
+        settings["horizon"] = int(horizon)
+    if absolute_action_limit is not None:
+        settings["absolute_action_limit"] = float(absolute_action_limit)
+    if max_delta is not None:
+        settings["max_delta"] = float(max_delta)
+    if solver_iterations is not None:
+        settings["solver_iterations"] = int(solver_iterations)
+
+    limit = float(settings["absolute_action_limit"])
+    actor = KoopmanMPCActor(
+        koopman.A,
+        koopman.B,
+        koopman.C[: koopman.state_dim],
+        horizon=int(settings["horizon"]),
+        context_dim=HistoryKoopmanMPCPolicy.TASK_CONTEXT_DIM,
+        hidden_dims=settings["hidden_dims"],
+        activation=str(settings["activation"]),
+        action_low=-limit,
+        action_high=limit,
+        max_delta=float(settings["max_delta"]),
+        quadratic_log_scale=float(settings["quadratic_log_scale"]),
+        linear_scale=float(settings["linear_scale"]),
+        smoothness_weight=float(settings["smoothness_weight"]),
+        solver_iterations=int(settings["solver_iterations"]),
+        step_fraction=float(settings["step_fraction"]),
+        solver_epsilon=float(settings["solver_epsilon"]),
+    )
+    critic = Critic(
+        koopman.lifted_dim + HistoryKoopmanMPCPolicy.TASK_CONTEXT_DIM,
+        settings["critic_hidden_dims"],
+        str(settings["critic_activation"]),
+    )
+    state_stats = payload["normalizers"]["state"]
+    policy = HistoryKoopmanMPCPolicy(
+        koopman,
+        actor,
+        critic,
+        torch.as_tensor(state_stats["mean"], dtype=torch.float32),
+        torch.as_tensor(state_stats["std"], dtype=torch.float32),
+        log_std_init=float(settings["log_std_init"]),
+    ).to(device)
+    return policy, payload
+
+
+def load_history_mpc_checkpoint(
+    path: str | Path,
+    device: torch.device,
+) -> tuple[HistoryKoopmanMPCPolicy, dict, dict]:
+    """Load either a BC initialization or PPO-fine-tuned BC-KMPC policy."""
+
+    policy_payload = torch.load(path, map_location=device, weights_only=False)
+    method = policy_payload.get("method")
+    if method not in {"bc_kmpc_bc", "actor_critic_bc_kmpc"}:
+        raise ValueError(f"{path} is not a BC-KMPC checkpoint")
+    koopman_checkpoint = Path(policy_payload["koopman_checkpoint"])
+    if not koopman_checkpoint.is_file():
+        raise FileNotFoundError(
+            f"BC-KMPC Koopman checkpoint is missing: {koopman_checkpoint}"
+        )
+    expected_sha = policy_payload.get("koopman_checkpoint_sha256")
+    if expected_sha is not None and sha256(koopman_checkpoint) != expected_sha:
+        raise ValueError("BC-KMPC Koopman checkpoint SHA256 does not match")
+    runtime = policy_payload.get("runtime", {})
+    policy, koopman_payload = make_history_mpc_policy(
+        koopman_checkpoint,
+        device,
+        horizon=runtime.get("horizon"),
+        absolute_action_limit=runtime.get("absolute_action_limit"),
+        max_delta=runtime.get("max_delta"),
+        solver_iterations=runtime.get("solver_iterations"),
+    )
+    if method == "bc_kmpc_bc":
+        policy.actor.load_state_dict(policy_payload["actor"])
+    else:
+        policy.load_state_dict(policy_payload["policy"])
+    return policy, policy_payload, koopman_payload
+
+
+def make_history_mlp_policy(
+    koopman_checkpoint: str | Path,
+    device: torch.device,
+    *,
+    absolute_action_limit: float | None = None,
+    max_delta: float | None = None,
+) -> tuple[HistoryMLPPolicy, dict]:
+    """Build the Koopman-free history MLP baseline from shared metadata."""
+
+    koopman, payload = load_checkpoint(koopman_checkpoint, map_location=device)
+    from antmaze_ac.koopman.history_model import HistoryDeepKoopman
+
+    if not isinstance(koopman, HistoryDeepKoopman):
+        raise ValueError(
+            "History-MLP requires a fullA_history_context_v1 checkpoint "
+            "for dimensions and train-split normalization"
+        )
+    settings = {
+        "hidden_dims": [256, 256],
+        "activation": "tanh",
+        "absolute_action_limit": 0.30,
+        "max_delta": 0.001,
+        "log_std_init": -0.5,
+        "critic_hidden_dims": [256, 256],
+        "critic_activation": "tanh",
+    }
+    settings.update(payload["config"].get("history_mlp_baseline", {}))
+    if absolute_action_limit is not None:
+        settings["absolute_action_limit"] = float(absolute_action_limit)
+    if max_delta is not None:
+        settings["max_delta"] = float(max_delta)
+
+    feature_dim = koopman.context_dim + HistoryMLPPolicy.TASK_CONTEXT_DIM
+    limit = float(settings["absolute_action_limit"])
+    actor = HistoryMLPActor(
+        feature_dim,
+        koopman.action_dim,
+        settings["hidden_dims"],
+        str(settings["activation"]),
+        action_low=-limit,
+        action_high=limit,
+        max_delta=float(settings["max_delta"]),
+    )
+    critic = Critic(
+        feature_dim,
+        settings["critic_hidden_dims"],
+        str(settings["critic_activation"]),
+    )
+    state_stats = payload["normalizers"]["state"]
+    policy = HistoryMLPPolicy(
+        actor,
+        critic,
+        torch.as_tensor(state_stats["mean"], dtype=torch.float32),
+        torch.as_tensor(state_stats["std"], dtype=torch.float32),
+        state_dim=koopman.state_dim,
+        action_dim=koopman.action_dim,
+        history_steps=koopman.history_steps,
+        log_std_init=float(settings["log_std_init"]),
+    ).to(device)
+    return policy, payload
+
+
+def load_history_mlp_checkpoint(
+    path: str | Path,
+    device: torch.device,
+) -> tuple[HistoryMLPPolicy, dict, dict]:
+    """Load a BC-pretrained or PPO-fine-tuned history MLP baseline."""
+
+    policy_payload = torch.load(path, map_location=device, weights_only=False)
+    method = policy_payload.get("method")
+    if method not in {"history_mlp_bc", "actor_critic_history_mlp"}:
+        raise ValueError(f"{path} is not a History-MLP checkpoint")
+    koopman_checkpoint = Path(policy_payload["koopman_checkpoint"])
+    if not koopman_checkpoint.is_file():
+        raise FileNotFoundError(
+            f"History-MLP metadata checkpoint is missing: {koopman_checkpoint}"
+        )
+    expected_sha = policy_payload.get("koopman_checkpoint_sha256")
+    if expected_sha is not None and sha256(koopman_checkpoint) != expected_sha:
+        raise ValueError("History-MLP metadata checkpoint SHA256 does not match")
+    runtime = policy_payload.get("runtime", {})
+    policy, koopman_payload = make_history_mlp_policy(
+        koopman_checkpoint,
+        device,
+        absolute_action_limit=runtime.get("absolute_action_limit"),
+        max_delta=runtime.get("max_delta"),
+    )
+    if method == "history_mlp_bc":
+        policy.actor.load_state_dict(policy_payload["actor"])
+    else:
+        policy.load_state_dict(policy_payload["policy"])
+    return policy, policy_payload, koopman_payload

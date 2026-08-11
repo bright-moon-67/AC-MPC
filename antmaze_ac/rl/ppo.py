@@ -22,6 +22,8 @@ class Rollout:
     dare_fallback: np.ndarray
     episode_returns: np.ndarray
     episode_lengths: np.ndarray
+    distances: np.ndarray
+    episode_successes: np.ndarray
 
 
 @torch.no_grad()
@@ -32,7 +34,8 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
         observation = env._ppo_observation
     observations, actions, log_probs, values = [], [], [], []
     rewards, dones, saturation, dare_retry, dare_fallback = [], [], [], [], []
-    completed_returns, completed_lengths = [], []
+    completed_returns, completed_lengths, completed_successes = [], [], []
+    distances = []
     episode_return = float(getattr(env, "_ppo_episode_return", 0.0))
     episode_length = int(getattr(env, "_ppo_episode_length", 0))
     for _ in range(steps):
@@ -55,6 +58,7 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
         log_probs.append(log_prob)
         values.append(value)
         rewards.append(float(reward))
+        distances.append(float(info.get("distance", np.nan)))
         episode_return += float(reward)
         episode_length += 1
         dones.append(float(done))
@@ -64,6 +68,7 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
         if done:
             completed_returns.append(episode_return)
             completed_lengths.append(episode_length)
+            completed_successes.append(bool(info.get("is_success", terminated)))
             episode_return = 0.0
             episode_length = 0
             next_observation, _ = env.reset()
@@ -94,6 +99,8 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
         dare_fallback=np.asarray(dare_fallback),
         episode_returns=np.asarray(completed_returns),
         episode_lengths=np.asarray(completed_lengths),
+        distances=np.asarray(distances, dtype=np.float32),
+        episode_successes=np.asarray(completed_successes, dtype=np.bool_),
     )
 
 
@@ -135,7 +142,8 @@ def collect_vector_rollout(
 
     observations, actions, log_probs, values = [], [], [], []
     rewards, dones, saturation, dare_retry, dare_fallback = [], [], [], [], []
-    completed_returns, completed_lengths = [], []
+    completed_returns, completed_lengths, completed_successes = [], [], []
+    distances = []
     for _ in range(time_steps):
         observation_tensor = torch.as_tensor(
             np.stack(current_observations),
@@ -159,7 +167,7 @@ def collect_vector_rollout(
             solver_fallback = np.zeros(environment_count, dtype=np.float32)
         action_array = action.detach().cpu().numpy()
         next_observations = []
-        step_rewards, step_dones, step_saturation = [], [], []
+        step_rewards, step_dones, step_saturation, step_distances = [], [], [], []
         for index, env in enumerate(envs):
             next_observation, reward, terminated, truncated, info = env.step(
                 action_array[index]
@@ -170,6 +178,9 @@ def collect_vector_rollout(
             if done:
                 completed_returns.append(episode_returns[index])
                 completed_lengths.append(episode_lengths[index])
+                completed_successes.append(
+                    bool(info.get("is_success", terminated))
+                )
                 episode_returns[index] = 0.0
                 episode_lengths[index] = 0
                 next_observation, _ = env.reset()
@@ -181,6 +192,7 @@ def collect_vector_rollout(
             step_saturation.append(
                 float(info.get("action_saturation_ratio", 0.0))
             )
+            step_distances.append(float(info.get("distance", np.nan)))
         observations.append(observation_tensor)
         actions.append(action)
         log_probs.append(log_prob)
@@ -188,6 +200,7 @@ def collect_vector_rollout(
         rewards.append(step_rewards)
         dones.append(step_dones)
         saturation.append(step_saturation)
+        distances.append(step_distances)
         dare_retry.append(solver_retry)
         dare_fallback.append(solver_fallback)
         current_observations = next_observations
@@ -249,6 +262,8 @@ def collect_vector_rollout(
         dare_fallback=np.asarray(dare_fallback).reshape(steps),
         episode_returns=np.asarray(completed_returns),
         episode_lengths=np.asarray(completed_lengths),
+        distances=np.asarray(distances, dtype=np.float32).reshape(steps),
+        episode_successes=np.asarray(completed_successes, dtype=np.bool_),
     )
 
 
@@ -263,6 +278,7 @@ def ppo_update(
     value_coefficient: float,
     entropy_coefficient: float,
     max_grad_norm: float,
+    target_kl: float | None = None,
 ) -> dict[str, float]:
     metrics: dict[str, list[torch.Tensor]] = {
         "policy": [],
@@ -275,6 +291,9 @@ def ppo_update(
         "update_dare_fallback_fraction": [],
     }
     count = len(rollout.observations)
+    optimizer_steps = 0
+    early_stopped = False
+    early_stop_kl = torch.zeros((), device=rollout.observations.device)
     for _ in range(update_epochs):
         permutation = torch.randperm(count, device=rollout.observations.device)
         for start in range(0, count, minibatch_size):
@@ -299,12 +318,17 @@ def ppo_update(
                 log_ratio = log_prob - rollout.old_log_probs[indices]
                 approx_kl = ((torch.exp(log_ratio) - 1.0) - log_ratio).mean()
                 clip_fraction = (torch.abs(ratio - 1.0) > clip_range).float().mean()
+            if target_kl is not None and float(approx_kl) > target_kl:
+                early_stopped = True
+                early_stop_kl = approx_kl.detach()
+                break
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             if not torch.isfinite(grad_norm):
                 raise FloatingPointError("PPO gradient is NaN or Inf")
             optimizer.step()
+            optimizer_steps += 1
             for key, value in {
                 "policy": policy_loss,
                 "value": value_loss,
@@ -327,7 +351,17 @@ def ppo_update(
                 # float() for every metric/minibatch forces repeated GPU/CPU
                 # synchronization and materially slows small-matrix DARE PPO.
                 metrics[key].append(value.detach())
-    return {
+        if early_stopped:
+            break
+    result = {
         key: float(torch.stack(values).mean().cpu())
         for key, values in metrics.items()
     }
+    result["ppo_optimizer_steps"] = float(optimizer_steps)
+    result["ppo_early_stopped"] = float(early_stopped)
+    result["ppo_early_stop_kl"] = float(early_stop_kl.cpu())
+    if early_stopped:
+        # Report the KL that actually activated the guard; the minibatches that
+        # preceded it can all have near-zero pre-update KL.
+        result["approx_kl"] = result["ppo_early_stop_kl"]
+    return result

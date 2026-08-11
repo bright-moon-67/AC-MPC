@@ -1,0 +1,109 @@
+import gymnasium as gym
+import numpy as np
+import torch
+
+from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
+from antmaze_ac.koopman.history_model import HistoryDeepKoopman
+from antmaze_ac.rl.critic import Critic
+from antmaze_ac.rl.history_koopman_mpc_policy import HistoryKoopmanMPCPolicy
+from antmaze_ac.rl.koopman_mpc_actor import KoopmanMPCActor
+
+
+class _HistoryEnv(gym.Env):
+    observation_space = gym.spaces.Box(-10, 10, shape=(5,), dtype=np.float32)
+    action_space = gym.spaces.Box(-0.3, 0.3, shape=(2,), dtype=np.float32)
+
+    def __init__(self):
+        self.target_tip = np.asarray([0.2, 0.3, 0.4], dtype=np.float32)
+        self.state = np.zeros(5, dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.state.fill(0.0)
+        return self.state.copy(), {"target_tip": self.target_tip.copy()}
+
+    def step(self, action):
+        self.state[:2] += np.asarray(action, dtype=np.float32)
+        return self.state.copy(), 0.0, False, False, {}
+
+
+def test_history_wrapper_alignment_and_action_constraints():
+    wrapped = HistoryContextTrackingWrapper(
+        _HistoryEnv(),
+        history_steps=3,
+        state_mean=np.zeros(5),
+        state_std=np.ones(5),
+        max_delta=0.02,
+        tip_indices=(0, 1, 2),
+    )
+    observation, _ = wrapped.reset(seed=3)
+    assert observation.shape == (5 + 3 * (5 + 2) + 3,)
+    context = observation[5:-3]
+    np.testing.assert_allclose(context, 0.0)
+
+    following, _, _, _, info = wrapped.step(np.asarray([0.2, -0.2]))
+    np.testing.assert_allclose(info["applied_action"], [0.02, -0.02])
+    following_context = following[5:-3]
+    action_context = following_context[3 * 5 :].reshape(3, 2)
+    np.testing.assert_allclose(action_context[-1], [0.02, -0.02])
+    np.testing.assert_allclose(following[-3:], wrapped.target_tip)
+
+
+def test_history_mpc_policy_reconstructs_actor_and_critic_gradients():
+    torch.manual_seed(17)
+    koopman = HistoryDeepKoopman(
+        state_dim=5,
+        action_dim=2,
+        lift_dim=2,
+        hidden_dims=(8,),
+        history_steps=3,
+    )
+    with torch.no_grad():
+        koopman.A.copy_(torch.eye(7) * 0.85)
+        koopman.B.fill_(0.05)
+    actor = KoopmanMPCActor(
+        koopman.A,
+        koopman.B,
+        koopman.C,
+        horizon=3,
+        context_dim=6,
+        hidden_dims=(12,),
+        action_low=-0.3,
+        action_high=0.3,
+        max_delta=0.02,
+        solver_iterations=5,
+    )
+    critic = Critic(koopman.lifted_dim + 6, hidden_dims=(12,))
+    policy = HistoryKoopmanMPCPolicy(
+        koopman,
+        actor,
+        critic,
+        torch.zeros(5),
+        torch.ones(5),
+        tip_indices=(0, 1, 2),
+    )
+    observation_dim = 5 + koopman.context_dim + 3
+    observations = torch.randn(4, observation_dim)
+    # The action part of the history must be within the configured support.
+    action_context_start = 5 + koopman.history_steps * koopman.state_dim
+    observations[:, action_context_start : 5 + koopman.context_dim] *= 0.05
+    output = policy(observations)
+    assert output.mean.shape == (4, 2)
+    assert output.value.shape == (4,)
+    assert output.mpc.action_sequence.shape == (4, 3, 2)
+    actions = output.distribution.sample().detach()
+    previous_action = policy.split_observation(observations).previous_action
+    lower = torch.maximum(actor.action_low, previous_action - actor.max_delta)
+    upper = torch.minimum(actor.action_high, previous_action + actor.max_delta)
+    assert torch.all(actions >= lower)
+    assert torch.all(actions <= upper)
+    log_prob, entropy, values, _ = policy.evaluate_actions(observations, actions)
+    assert torch.isfinite(log_prob).all()
+    assert torch.isfinite(entropy).all()
+    loss = -log_prob.mean() - 0.01 * entropy.mean() + values.square().mean()
+    loss.backward()
+    assert any(
+        parameter.grad is not None and float(parameter.grad.abs().sum()) > 0
+        for parameter in actor.parameters()
+    )
+    assert all(parameter.grad is None for parameter in koopman.parameters())

@@ -30,8 +30,11 @@ wandb/
 *.npy
 *.jsonl
 
-# Local research notes and generated reports are never published.
-/docs/
+# Local research notes and generated reports are never published. Keep the
+# maintained ManiSoft runbooks as the opt-in documents in this directory.
+/docs/*
+!/docs/manisoft_bc_kmpc.md
+!/docs/manisoft_history_mlp_baseline.md
 /private_notes/
 *.private.md
 

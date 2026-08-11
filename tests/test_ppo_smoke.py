@@ -71,6 +71,9 @@ def test_collect_and_sb3_aligned_ppo_update_smoke():
         "clip_fraction",
         "update_dare_retry_fraction",
         "update_dare_fallback_fraction",
+        "ppo_optimizer_steps",
+        "ppo_early_stopped",
+        "ppo_early_stop_kl",
     }
     assert all(np.isfinite(value) for value in metrics.values())
     assert any(not torch.equal(old, new) for old, new in zip(before, policy.parameters()))

@@ -1,0 +1,355 @@
+#!/usr/bin/env python
+"""Behavior-clone the learned history BC-KMPC actor from MPC demonstrations."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import random
+import time
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from antmaze_ac.koopman.checkpoint import sha256
+from antmaze_ac.rl.serialization import make_history_mpc_policy
+
+
+def _device(specification: str) -> torch.device:
+    return torch.device(
+        "cuda"
+        if specification == "auto" and torch.cuda.is_available()
+        else ("cpu" if specification == "auto" else specification)
+    )
+
+
+def _save(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--koopman-checkpoint", required=True)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--checkpoint-interval", type=int, default=10)
+    parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--solver-iterations", type=int, default=20)
+    parser.add_argument("--max-delta", type=float, default=0.001)
+    parser.add_argument("--absolute-action-limit", type=float, default=0.30)
+    parser.add_argument("--max-train-samples", type=int, default=None)
+    parser.add_argument("--max-validation-samples", type=int, default=None)
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    if min(
+        args.epochs,
+        args.batch_size,
+        args.checkpoint_interval,
+        args.horizon,
+        args.solver_iterations,
+    ) < 1:
+        parser.error("Epoch, batch, horizon and solver counts must be positive")
+    if not 0 < args.validation_fraction < 1:
+        parser.error("validation-fraction must lie in (0,1)")
+    return args
+
+
+def _split_indices(
+    episode_ids: np.ndarray,
+    validation_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    episodes = np.unique(episode_ids)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(episodes)
+    if len(episodes) > 1:
+        validation_count = max(1, int(round(len(episodes) * validation_fraction)))
+        validation_count = min(validation_count, len(episodes) - 1)
+        validation_episodes = episodes[:validation_count]
+        validation_mask = np.isin(episode_ids, validation_episodes)
+        return np.flatnonzero(~validation_mask), np.flatnonzero(validation_mask)
+    order = rng.permutation(len(episode_ids))
+    validation_count = max(1, int(round(len(order) * validation_fraction)))
+    if validation_count >= len(order):
+        raise ValueError("Dataset needs at least two samples")
+    return order[validation_count:], order[:validation_count]
+
+
+@torch.no_grad()
+def _evaluate(policy, loader, max_delta: float, device: torch.device) -> dict:
+    policy.eval()
+    squared_error_sum = 0.0
+    normalized_loss_sum = 0.0
+    residual_sum = 0.0
+    elements = 0
+    samples = 0
+    for observations, targets in loader:
+        observations = observations.to(device)
+        targets = targets.to(device)
+        output = policy.actor_mean(observations)
+        squared_error = (output.action - targets).square()
+        squared_error_sum += float(squared_error.sum())
+        normalized_loss_sum += float((squared_error / (max_delta**2)).sum())
+        residual_sum += float(output.projected_gradient_residual.sum())
+        elements += squared_error.numel()
+        samples += len(observations)
+    return {
+        "mse": squared_error_sum / elements,
+        "rmse": (squared_error_sum / elements) ** 0.5,
+        "normalized_mse": normalized_loss_sum / elements,
+        "projected_gradient_residual_mean": residual_sum / samples,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    device = _device(args.device)
+    checkpoint = Path(args.koopman_checkpoint).expanduser().resolve()
+    dataset_path = Path(args.dataset).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    if not checkpoint.is_file() or not dataset_path.is_file():
+        raise FileNotFoundError("Koopman checkpoint and expert dataset must exist")
+    output.mkdir(parents=True, exist_ok=True)
+    history_path = output / "history.jsonl"
+    if args.resume is None and history_path.exists():
+        raise FileExistsError(
+            f"{history_path} already exists; use a new output or --resume"
+        )
+
+    policy, _ = make_history_mpc_policy(
+        checkpoint,
+        device,
+        horizon=args.horizon,
+        absolute_action_limit=args.absolute_action_limit,
+        max_delta=args.max_delta,
+        solver_iterations=args.solver_iterations,
+    )
+    policy.koopman.eval()
+    policy.critic.requires_grad_(False)
+    policy.log_std.requires_grad_(False)
+    optimizer = torch.optim.Adam(
+        policy.actor.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+
+    with np.load(dataset_path, allow_pickle=False) as archive:
+        observations = np.asarray(archive["observation"], dtype=np.float32)
+        targets = np.asarray(archive["expert_action"], dtype=np.float32)
+        episode_ids = np.asarray(archive["episode_id"], dtype=np.int64)
+    if observations.ndim != 2 or observations.shape[1] != policy.observation_dim:
+        raise ValueError(
+            f"Dataset observation must be [N,{policy.observation_dim}], "
+            f"got {observations.shape}"
+        )
+    if targets.shape != (len(observations), policy.action_dim):
+        raise ValueError("Dataset expert_action shape is incompatible")
+    if episode_ids.shape != (len(observations),):
+        raise ValueError("Dataset episode_id shape is incompatible")
+    if not np.isfinite(observations).all() or not np.isfinite(targets).all():
+        raise ValueError("Dataset contains NaN or Inf")
+    train_indices, validation_indices = _split_indices(
+        episode_ids,
+        args.validation_fraction,
+        args.seed,
+    )
+    if args.max_train_samples is not None:
+        train_indices = train_indices[: args.max_train_samples]
+    if args.max_validation_samples is not None:
+        validation_indices = validation_indices[: args.max_validation_samples]
+    train_data = TensorDataset(
+        torch.from_numpy(observations[train_indices]),
+        torch.from_numpy(targets[train_indices]),
+    )
+    validation_data = TensorDataset(
+        torch.from_numpy(observations[validation_indices]),
+        torch.from_numpy(targets[validation_indices]),
+    )
+    train_loader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=device.type == "cuda",
+    )
+    validation_loader = DataLoader(
+        validation_data,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=device.type == "cuda",
+    )
+
+    expected_koopman_sha = sha256(checkpoint)
+    start_epoch = 0
+    best_validation_mse = float("inf")
+    elapsed_before = 0.0
+    if args.resume is not None:
+        resume_path = Path(args.resume).expanduser().resolve()
+        resume_payload = torch.load(
+            resume_path,
+            map_location=device,
+            weights_only=False,
+        )
+        if resume_payload.get("method") != "bc_kmpc_bc":
+            raise ValueError("Resume checkpoint is not BC-KMPC behavior cloning")
+        if resume_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
+            raise ValueError("Resume checkpoint references another Koopman model")
+        expected_runtime = {
+            "horizon": policy.actor.horizon,
+            "solver_iterations": policy.actor.solver_iterations,
+            "absolute_action_limit": args.absolute_action_limit,
+            "max_delta": args.max_delta,
+        }
+        for key, expected in expected_runtime.items():
+            actual = resume_payload["runtime"].get(key)
+            if actual != expected:
+                raise ValueError(
+                    f"Resume runtime {key}={actual!r}, expected {expected!r}"
+                )
+        policy.actor.load_state_dict(resume_payload["actor"])
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        start_epoch = int(resume_payload["epoch"]) + 1
+        best_validation_mse = float(resume_payload["best_validation_mse"])
+        elapsed_before = float(resume_payload.get("elapsed_seconds", 0.0))
+
+    runtime = {
+        "horizon": policy.actor.horizon,
+        "solver_iterations": policy.actor.solver_iterations,
+        "absolute_action_limit": args.absolute_action_limit,
+        "max_delta": args.max_delta,
+        "observation_dim": policy.observation_dim,
+        "history_steps": policy.history_steps,
+        "train_samples": len(train_data),
+        "validation_samples": len(validation_data),
+    }
+    metadata = {
+        "method": "bc_kmpc_bc",
+        "format_version": 1,
+        "koopman_checkpoint": str(checkpoint),
+        "koopman_checkpoint_sha256": expected_koopman_sha,
+        "dataset": str(dataset_path),
+        "dataset_sha256": sha256(dataset_path),
+        "seed": args.seed,
+        "runtime": runtime,
+    }
+    _write_json(output / "run_config.json", {**metadata, "arguments": vars(args)})
+
+    started = time.monotonic()
+    last_epoch = start_epoch - 1
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            policy.actor.train()
+            train_squared_error = 0.0
+            train_elements = 0
+            train_normalized_loss = 0.0
+            gradient_norm_sum = 0.0
+            batches = 0
+            for batch_observations, batch_targets in train_loader:
+                batch_observations = batch_observations.to(device)
+                batch_targets = batch_targets.to(device)
+                output_actor = policy.actor_mean(batch_observations)
+                squared_error = (output_actor.action - batch_targets).square()
+                loss = (squared_error / (args.max_delta**2)).mean()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.actor.parameters(),
+                    args.gradient_clip_norm,
+                )
+                if not torch.isfinite(gradient_norm):
+                    raise FloatingPointError("BC-KMPC BC gradient is NaN or Inf")
+                optimizer.step()
+                train_squared_error += float(squared_error.detach().sum())
+                train_elements += squared_error.numel()
+                train_normalized_loss += float(loss.detach())
+                gradient_norm_sum += float(gradient_norm.detach())
+                batches += 1
+            validation = _evaluate(
+                policy,
+                validation_loader,
+                args.max_delta,
+                device,
+            )
+            elapsed = elapsed_before + time.monotonic() - started
+            row = {
+                "epoch": epoch,
+                "elapsed_seconds": elapsed,
+                "train_mse": train_squared_error / train_elements,
+                "train_rmse": (train_squared_error / train_elements) ** 0.5,
+                "train_normalized_mse": train_normalized_loss / batches,
+                "gradient_norm": gradient_norm_sum / batches,
+                **{f"validation_{key}": value for key, value in validation.items()},
+            }
+            with history_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, sort_keys=True) + "\n")
+            payload = {
+                **metadata,
+                "actor": policy.actor.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "best_validation_mse": min(
+                    best_validation_mse,
+                    validation["mse"],
+                ),
+                "elapsed_seconds": elapsed,
+                "last_report": row,
+            }
+            _save(output / "last.pt", payload)
+            if validation["mse"] < best_validation_mse:
+                best_validation_mse = validation["mse"]
+                _save(output / "best_validation.pt", payload)
+            if (epoch + 1) % args.checkpoint_interval == 0:
+                _save(output / f"recovery_epoch_{epoch:04d}.pt", payload)
+            last_epoch = epoch
+            print(json.dumps(row, sort_keys=True), flush=True)
+        status = {
+            "state": "complete",
+            "method": "bc_kmpc_bc",
+            "last_epoch": last_epoch,
+            "best_validation_mse": best_validation_mse,
+            "best_validation_checkpoint": str(
+                (output / "best_validation.pt").resolve()
+            ),
+        }
+        _write_json(output / "training_status.json", status)
+    except BaseException as error:
+        _write_json(
+            output / "training_status.json",
+            {
+                "state": "failed",
+                "method": "bc_kmpc_bc",
+                "last_epoch": last_epoch,
+                "error": f"{type(error).__name__}: {error}",
+            },
+        )
+        raise
+
+
+if __name__ == "__main__":
+    main()
