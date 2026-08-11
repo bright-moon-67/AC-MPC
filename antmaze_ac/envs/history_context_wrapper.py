@@ -12,12 +12,14 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
 
     The flattened observation is
 
-    ``[s_t, context_t, target_tip]``
+    ``[s_t, context_t, task_context]``
 
     where ``context_t=[normalized s[t-H+1:t+1], u[t-H:t]]``.  The current
     absolute action is deliberately absent.  The last action in the context
     is ``u[t-1]`` and is therefore sufficient to reproduce the action-rate
-    constraints when PPO later evaluates shuffled minibatches.
+    constraints when PPO later evaluates shuffled minibatches.  For a single
+    goal ``task_context=target_tip``.  For an ordered waypoint task it is
+    ``[G1,G2,G3,one_hot(active_index)]``.
     """
 
     def __init__(
@@ -46,6 +48,14 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         self.context_dim = self.history_steps * (
             self.state_dim + self.action_dim
         )
+        self.waypoint_count = int(getattr(env, "waypoint_count", 1))
+        if self.waypoint_count < 1:
+            raise ValueError("waypoint_count must be positive")
+        self.task_context_dim = (
+            3
+            if self.waypoint_count == 1
+            else 4 * self.waypoint_count
+        )
         self.tip_indices = np.asarray(tuple(tip_indices), dtype=np.int64)
         if self.tip_indices.shape != (3,):
             raise ValueError("tip_indices must contain exactly three indices")
@@ -73,7 +83,9 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         self.action_history: deque[np.ndarray] = deque(maxlen=self.history_steps)
         self.previous_action = np.zeros(self.action_dim, dtype=np.float32)
 
-        observation_dim = self.state_dim + self.context_dim + 3
+        observation_dim = (
+            self.state_dim + self.context_dim + self.task_context_dim
+        )
         self.observation_space = gym.spaces.Box(
             low=np.full(observation_dim, -np.inf, dtype=np.float32),
             high=np.full(observation_dim, np.inf, dtype=np.float32),
@@ -97,6 +109,23 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
             raise RuntimeError(f"Wrapped target_tip has wrong shape {target.shape}")
         return target
 
+    @property
+    def task_context(self) -> np.ndarray:
+        if self.waypoint_count == 1:
+            return self.target_tip
+        waypoints = np.asarray(
+            getattr(self.env, "waypoints", None), dtype=np.float32
+        )
+        if waypoints.shape != (self.waypoint_count, 3):
+            raise RuntimeError(
+                f"Wrapped waypoints have wrong shape {waypoints.shape}"
+            )
+        active_index = int(getattr(self.env, "active_waypoint_index", -1))
+        if not 0 <= active_index < self.waypoint_count:
+            raise RuntimeError("Wrapped active_waypoint_index is invalid")
+        stage = np.eye(self.waypoint_count, dtype=np.float32)[active_index]
+        return np.concatenate((waypoints.reshape(-1), stage))
+
     def _context(self) -> np.ndarray:
         if len(self.state_history) != self.history_steps or len(
             self.action_history
@@ -113,7 +142,7 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         state = np.asarray(state, dtype=np.float32).reshape(-1)
         if state.shape != (self.state_dim,):
             raise ValueError(f"Physical observation has wrong shape {state.shape}")
-        observation = np.concatenate((state, self._context(), self.target_tip))
+        observation = np.concatenate((state, self._context(), self.task_context))
         if observation.shape != self.observation_space.shape:
             raise RuntimeError("History observation layout is inconsistent")
         if not np.isfinite(observation).all():

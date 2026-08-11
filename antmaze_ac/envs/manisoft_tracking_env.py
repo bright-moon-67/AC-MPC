@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -17,6 +18,65 @@ from manisoft.utils import (
 )
 
 from .delta_action_wrapper import DeltaActionWrapper
+
+
+MANISOFT_WAYPOINT_REFERENCE_FILES = (
+    "ref_4cm/reference.npz",
+    "ref_8cm/reference.npz",
+    "ref_12cm/reference.npz",
+)
+MANISOFT_WAYPOINT_ACTION_FILES = (
+    "actions/u_scale_0p25.json",
+    "actions/u_scale_0p50.json",
+    "actions/u_scale_0p75.json",
+)
+
+
+def load_manisoft_waypoint_references(
+    root: str | Path,
+) -> tuple[np.ndarray, np.ndarray, tuple[Path, ...], tuple[Path, ...]]:
+    """Load and cross-check the fixed 4/8/12 cm waypoint references."""
+
+    root = Path(root).expanduser().resolve()
+    reference_paths = tuple(root / name for name in MANISOFT_WAYPOINT_REFERENCE_FILES)
+    action_paths = tuple(root / name for name in MANISOFT_WAYPOINT_ACTION_FILES)
+    missing = [path for path in (*reference_paths, *action_paths) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing ManiSoft waypoint reference files: "
+            + ", ".join(map(str, missing))
+        )
+
+    states: list[np.ndarray] = []
+    actions: list[np.ndarray] = []
+    for reference_path, action_path in zip(reference_paths, action_paths):
+        with np.load(reference_path, allow_pickle=False) as archive:
+            state = np.asarray(archive["reference_state"], dtype=np.float32).reshape(-1)
+            action = np.asarray(archive["reference_action"], dtype=np.float32).reshape(-1)
+        if state.shape != (KOOPMAN_PHYSICAL_STATE_DIM,) or action.shape != (18,):
+            raise ValueError(
+                f"{reference_path} must contain a 45-D state and 18-D action"
+            )
+        action_payload = json.loads(action_path.read_text(encoding="utf-8"))
+        reproducible_action = np.asarray(
+            action_payload.get("u"), dtype=np.float32
+        ).reshape(-1)
+        if reproducible_action.shape != (18,):
+            raise ValueError(f"{action_path} must contain an 18-D 'u' action")
+        if not np.allclose(action, reproducible_action, rtol=1e-6, atol=1e-7):
+            raise ValueError(
+                f"Reference action in {reference_path} does not match {action_path}"
+            )
+        if not np.isfinite(state).all() or not np.isfinite(action).all():
+            raise ValueError(f"{reference_path} contains NaN or Inf")
+        states.append(state)
+        actions.append(action)
+    return (
+        np.stack(states),
+        np.stack(actions),
+        reference_paths,
+        action_paths,
+    )
 
 
 class ManiSoftTipTrackingEnv(gym.Env):
@@ -240,6 +300,118 @@ class ManiSoftTipTrackingEnv(gym.Env):
         self.sim = None
         self.muscle = None
         gc.collect()
+
+
+class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
+    """按 4 cm -> 8 cm -> 12 cm 顺序连续跟踪三个固定末端目标。"""
+
+    waypoint_count = 3
+
+    def __init__(
+        self,
+        scenario_path: str | Path,
+        waypoint_tips: Sequence[Sequence[float]] | np.ndarray,
+        episode_steps: int = 300,
+        success_threshold: float = 0.0015,
+        success_streak: int = 5,
+        waypoint_event_reward: float = 1.0,
+        absolute_action_limit: float = 0.30,
+    ) -> None:
+        waypoints = np.asarray(waypoint_tips, dtype=np.float32)
+        if waypoints.shape != (self.waypoint_count, 3):
+            raise ValueError("waypoint_tips必须是[3,3]")
+        if not np.isfinite(waypoints).all():
+            raise ValueError("waypoint_tips出现NaN或Inf")
+        if waypoint_event_reward < 0:
+            raise ValueError("waypoint_event_reward必须非负")
+        super().__init__(
+            scenario_path,
+            target_tip=waypoints[0],
+            episode_steps=episode_steps,
+            success_threshold=success_threshold,
+            success_streak=success_streak,
+            absolute_action_limit=absolute_action_limit,
+        )
+        self.fixed_waypoints = waypoints.copy()
+        self.waypoint_event_reward = float(waypoint_event_reward)
+        self.active_waypoint_index = 0
+        self.waypoints_completed = 0
+
+    @property
+    def waypoints(self) -> np.ndarray:
+        return self.fixed_waypoints
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        observation, info = super().reset(seed=seed, options=options)
+        self.active_waypoint_index = 0
+        self.waypoints_completed = 0
+        self.target_tip = self.fixed_waypoints[0].copy()
+        tip = self._tip_position(observation)
+        distances = np.linalg.norm(self.fixed_waypoints - tip[None, :], axis=1)
+        self.previous_distance = float(distances[0])
+        self.target_scale = max(self.previous_distance, np.finfo(np.float32).eps)
+        info.update(
+            {
+                "target_tip": self.target_tip.copy(),
+                "waypoints": self.fixed_waypoints.copy(),
+                "active_waypoint_index": self.active_waypoint_index,
+                "waypoints_completed": self.waypoints_completed,
+                "waypoint_passed": False,
+                "all_waypoint_distances": distances.astype(np.float32),
+            }
+        )
+        return observation, info
+
+    def step(self, absolute_action: np.ndarray):
+        observation, reward, terminated, truncated, info = super().step(
+            absolute_action
+        )
+        reached_distance = float(info["distance"])
+        waypoint_passed = False
+
+        # Intermediate goals use the same consecutive-hit condition as the
+        # original single-goal task, but reaching them advances the stage
+        # instead of terminating the episode.
+        if terminated and self.active_waypoint_index < self.waypoint_count - 1:
+            terminated = False
+            waypoint_passed = True
+            self.waypoints_completed += 1
+            self.active_waypoint_index += 1
+            self.success_count = 0
+            self.target_tip = self.fixed_waypoints[
+                self.active_waypoint_index
+            ].copy()
+            next_distance = float(
+                np.linalg.norm(self._tip_position(observation) - self.target_tip)
+            )
+            self.previous_distance = next_distance
+            self.target_scale = max(next_distance, np.finfo(np.float32).eps)
+            # Replace the single-task terminal bonus with an intermediate
+            # waypoint event reward.
+            reward = reward - 5.0 + self.waypoint_event_reward
+            truncated = self.step_count >= self.episode_steps
+
+        if terminated:
+            self.waypoints_completed = self.waypoint_count
+
+        tip = self._tip_position(observation)
+        distances = np.linalg.norm(self.fixed_waypoints - tip[None, :], axis=1)
+        active_distance = float(distances[self.active_waypoint_index])
+        info.update(
+            {
+                "distance": active_distance,
+                "target_tip": self.target_tip.copy(),
+                "waypoints": self.fixed_waypoints.copy(),
+                "active_waypoint_index": self.active_waypoint_index,
+                "waypoints_completed": self.waypoints_completed,
+                "waypoint_passed": waypoint_passed,
+                "success_streak": self.success_count,
+                "reached_waypoint_distance": reached_distance,
+                "all_waypoint_distances": distances.astype(np.float32),
+                "is_success": bool(terminated),
+            }
+        )
+        return observation, float(reward), terminated, truncated, info
 
 
 def make_manisoft_tracking_env(

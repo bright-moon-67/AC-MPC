@@ -27,6 +27,24 @@ class _HistoryEnv(gym.Env):
         return self.state.copy(), 0.0, False, False, {}
 
 
+class _ThreeWaypointHistoryEnv(_HistoryEnv):
+    waypoint_count = 3
+
+    def __init__(self):
+        super().__init__()
+        self.waypoints = np.asarray(
+            [[0.1, 0.0, 0.0], [0.2, 0.1, 0.0], [0.3, 0.2, 0.1]],
+            dtype=np.float32,
+        )
+        self.active_waypoint_index = 0
+        self.target_tip = self.waypoints[0].copy()
+
+    def step(self, action):
+        self.active_waypoint_index = min(self.active_waypoint_index + 1, 2)
+        self.target_tip = self.waypoints[self.active_waypoint_index].copy()
+        return super().step(action)
+
+
 def test_history_wrapper_alignment_and_action_constraints():
     wrapped = HistoryContextTrackingWrapper(
         _HistoryEnv(),
@@ -47,6 +65,26 @@ def test_history_wrapper_alignment_and_action_constraints():
     action_context = following_context[3 * 5 :].reshape(3, 2)
     np.testing.assert_allclose(action_context[-1], [0.02, -0.02])
     np.testing.assert_allclose(following[-3:], wrapped.target_tip)
+
+
+def test_history_wrapper_exposes_all_waypoints_and_active_stage():
+    wrapped = HistoryContextTrackingWrapper(
+        _ThreeWaypointHistoryEnv(),
+        history_steps=2,
+        state_mean=np.zeros(5),
+        state_std=np.ones(5),
+        max_delta=0.02,
+        tip_indices=(0, 1, 2),
+    )
+    observation, _ = wrapped.reset(seed=3)
+    assert observation.shape == (5 + 2 * (5 + 2) + 12,)
+    np.testing.assert_allclose(
+        observation[-12:-3], wrapped.env.waypoints.reshape(-1)
+    )
+    np.testing.assert_allclose(observation[-3:], [1.0, 0.0, 0.0])
+
+    following, _, _, _, _ = wrapped.step(np.zeros(2, dtype=np.float32))
+    np.testing.assert_allclose(following[-3:], [0.0, 1.0, 0.0])
 
 
 def test_history_mpc_policy_reconstructs_actor_and_critic_gradients():
@@ -107,3 +145,45 @@ def test_history_mpc_policy_reconstructs_actor_and_critic_gradients():
         for parameter in actor.parameters()
     )
     assert all(parameter.grad is None for parameter in koopman.parameters())
+
+
+def test_history_mpc_policy_three_waypoint_context():
+    torch.manual_seed(23)
+    koopman = HistoryDeepKoopman(
+        state_dim=5,
+        action_dim=2,
+        lift_dim=2,
+        hidden_dims=(8,),
+        history_steps=2,
+    )
+    actor = KoopmanMPCActor(
+        koopman.A,
+        koopman.B,
+        koopman.C,
+        horizon=2,
+        context_dim=12,
+        hidden_dims=(12,),
+        action_low=-0.3,
+        action_high=0.3,
+        max_delta=0.02,
+        solver_iterations=3,
+    )
+    critic = Critic(koopman.lifted_dim + 12, hidden_dims=(12,))
+    policy = HistoryKoopmanMPCPolicy(
+        koopman,
+        actor,
+        critic,
+        torch.zeros(5),
+        torch.ones(5),
+        waypoint_count=3,
+        tip_indices=(0, 1, 2),
+    )
+    observations = torch.zeros(2, policy.observation_dim)
+    observations[:, -12:-3] = torch.arange(9, dtype=torch.float32)
+    observations[:, -3:] = torch.tensor([0.0, 1.0, 0.0])
+    split, _, actor_context = policy.features(observations)
+    assert split.task_context.shape == (2, 12)
+    assert actor_context.shape == (2, 12)
+    torch.testing.assert_close(actor_context[:, -3:], observations[:, -3:])
+    output = policy(observations)
+    assert output.mean.shape == (2, 2)

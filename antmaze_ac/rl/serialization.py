@@ -172,6 +172,7 @@ def make_history_mpc_policy(
     absolute_action_limit: float | None = None,
     max_delta: float | None = None,
     solver_iterations: int | None = None,
+    waypoint_count: int = 1,
 ) -> tuple[HistoryKoopmanMPCPolicy, dict]:
     """Build the soft-robot BC-KMPC policy from a history checkpoint."""
 
@@ -211,13 +212,20 @@ def make_history_mpc_policy(
     if solver_iterations is not None:
         settings["solver_iterations"] = int(solver_iterations)
 
+    if waypoint_count < 1:
+        raise ValueError("waypoint_count must be positive")
+    task_context_dim = (
+        HistoryKoopmanMPCPolicy.TASK_CONTEXT_DIM
+        if waypoint_count == 1
+        else 4 * int(waypoint_count)
+    )
     limit = float(settings["absolute_action_limit"])
     actor = KoopmanMPCActor(
         koopman.A,
         koopman.B,
         koopman.C[: koopman.state_dim],
         horizon=int(settings["horizon"]),
-        context_dim=HistoryKoopmanMPCPolicy.TASK_CONTEXT_DIM,
+        context_dim=task_context_dim,
         hidden_dims=settings["hidden_dims"],
         activation=str(settings["activation"]),
         action_low=-limit,
@@ -231,7 +239,7 @@ def make_history_mpc_policy(
         solver_epsilon=float(settings["solver_epsilon"]),
     )
     critic = Critic(
-        koopman.lifted_dim + HistoryKoopmanMPCPolicy.TASK_CONTEXT_DIM,
+        koopman.lifted_dim + task_context_dim,
         settings["critic_hidden_dims"],
         str(settings["critic_activation"]),
     )
@@ -242,6 +250,7 @@ def make_history_mpc_policy(
         critic,
         torch.as_tensor(state_stats["mean"], dtype=torch.float32),
         torch.as_tensor(state_stats["std"], dtype=torch.float32),
+        waypoint_count=int(waypoint_count),
         log_std_init=float(settings["log_std_init"]),
     ).to(device)
     return policy, payload
@@ -273,6 +282,7 @@ def load_history_mpc_checkpoint(
         absolute_action_limit=runtime.get("absolute_action_limit"),
         max_delta=runtime.get("max_delta"),
         solver_iterations=runtime.get("solver_iterations"),
+        waypoint_count=int(runtime.get("waypoint_count", 1)),
     )
     if method == "bc_kmpc_bc":
         policy.actor.load_state_dict(policy_payload["actor"])

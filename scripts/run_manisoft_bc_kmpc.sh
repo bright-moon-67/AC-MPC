@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 6 || $# -gt 7 ]]; then
-    echo "Usage: $0 KOOPMAN_CHECKPOINT SCENARIO REFERENCE EXPERT_DATA BC_OUTPUT PPO_OUTPUT [cuda|cpu]" >&2
+    echo "Usage: $0 KOOPMAN_CHECKPOINT SCENARIO WAYPOINT_ROOT EXPERT_DATA BC_OUTPUT PPO_OUTPUT [cuda|cpu]" >&2
     exit 2
 fi
 
@@ -10,7 +10,7 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${AC_MPC_PYTHON:-python}"
 koopman_checkpoint="$1"
 scenario="$2"
-reference="$3"
+waypoint_root="$3"
 expert_data="$4"
 bc_output="$5"
 ppo_output="$6"
@@ -19,25 +19,35 @@ horizon="${BC_KMPC_HORIZON:-10}"
 solver_iterations="${BC_KMPC_SOLVER_ITERATIONS:-20}"
 max_delta="${BC_KMPC_MAX_DELTA:-0.001}"
 
-for path in "${koopman_checkpoint}" "${scenario}" "${reference}"; do
+for path in "${koopman_checkpoint}" "${scenario}"; do
     if [[ ! -f "${path}" ]]; then
         echo "Missing required file: ${path}" >&2
         exit 1
     fi
 done
+if [[ ! -d "${waypoint_root}" ]]; then
+    echo "Missing waypoint root: ${waypoint_root}" >&2
+    exit 1
+fi
 
 cd "${project_root}"
 if [[ ! -f "${expert_data}" ]]; then
     "${python_bin}" scripts/collect_manisoft_bc_kmpc_expert.py \
         --koopman-checkpoint "${koopman_checkpoint}" \
         --scenario "${scenario}" \
-        --reference "${reference}" \
+        --waypoint-root "${waypoint_root}" \
         --output "${expert_data}" \
         --episodes "${BC_KMPC_EXPERT_EPISODES:-10}" \
         --episode-steps "${BC_KMPC_EPISODE_STEPS:-300}" \
         --horizon "${horizon}" \
         --max-delta "${max_delta}" \
         --device "${device}"
+elif [[ ! -f "${expert_data%.npz}.json" ]] \
+    || ! grep -q 'manisoft_history_bc_kmpc_three_waypoint_expert' \
+        "${expert_data%.npz}.json"; then
+    echo "Existing expert dataset is not the three-waypoint schema: ${expert_data}" >&2
+    echo "Use a new EXPERT_DATA path." >&2
+    exit 1
 fi
 
 bc_checkpoint="${bc_output}/best_validation.pt"
@@ -75,7 +85,7 @@ fi
 "${python_bin}" scripts/train_manisoft_bc_kmpc_ppo.py \
     --koopman-checkpoint "${koopman_checkpoint}" \
     --scenario "${scenario}" \
-    --reference "${reference}" \
+    --waypoint-root "${waypoint_root}" \
     --output "${ppo_output}" \
     --episode-steps "${BC_KMPC_EPISODE_STEPS:-300}" \
     --horizon "${horizon}" \

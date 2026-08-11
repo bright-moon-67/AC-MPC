@@ -12,7 +12,10 @@ import numpy as np
 import torch
 
 from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
-from antmaze_ac.envs.manisoft_tracking_env import ManiSoftTipTrackingEnv
+from antmaze_ac.envs.manisoft_tracking_env import (
+    ManiSoftThreeWaypointTrackingEnv,
+    load_manisoft_waypoint_references,
+)
 from antmaze_ac.koopman.checkpoint import sha256
 from antmaze_ac.rl.serialization import load_history_mpc_checkpoint
 
@@ -24,7 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--scenario", required=True)
-    parser.add_argument("--reference", default=None)
+    parser.add_argument(
+        "--waypoint-root",
+        default=None,
+        help="Directory containing ref_4cm/ref_8cm/ref_12cm and actions/.",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--episode-steps", type=int, default=300)
@@ -51,22 +58,25 @@ def main() -> None:
         device,
     )
     policy.eval()
-    reference_value = args.reference or policy_payload.get("reference")
-    if reference_value is None:
+    waypoint_root_value = args.waypoint_root or policy_payload.get("waypoint_root")
+    if waypoint_root_value is None:
         raise ValueError(
-            "--reference is required for a BC checkpoint without reference metadata"
+            "--waypoint-root is required for a checkpoint without waypoint metadata"
         )
-    reference = Path(reference_value).expanduser().resolve()
-    if not reference.is_file():
-        raise FileNotFoundError(f"Missing reference: {reference}")
-    with np.load(reference, allow_pickle=False) as archive:
-        reference_state = np.asarray(
-            archive["reference_state"],
-            dtype=np.float32,
-        ).reshape(-1)
-    if reference_state.shape != (45,):
-        raise ValueError("Reference state must be 45-D")
-    target_tip = reference_state[np.asarray(TIP_INDICES)]
+    waypoint_root = Path(waypoint_root_value).expanduser().resolve()
+    reference_states, _, reference_paths, action_paths = (
+        load_manisoft_waypoint_references(waypoint_root)
+    )
+    waypoint_tips = reference_states[:, np.asarray(TIP_INDICES)]
+    reference_hashes = [sha256(path) for path in reference_paths]
+    action_hashes = [sha256(path) for path in action_paths]
+    if policy.waypoint_count != 3:
+        raise ValueError("Checkpoint is not a three-waypoint BC-KMPC policy")
+    if (
+        policy_payload.get("reference_sha256") != reference_hashes
+        or policy_payload.get("action_sha256") != action_hashes
+    ):
+        raise ValueError("Checkpoint references another waypoint set")
     runtime = policy_payload["runtime"]
     absolute_action_limit = float(runtime["absolute_action_limit"])
     max_delta = float(runtime["max_delta"])
@@ -79,9 +89,9 @@ def main() -> None:
     inference_times: list[float] = []
     started = time.perf_counter()
     for episode in range(args.episodes):
-        base = ManiSoftTipTrackingEnv(
+        base = ManiSoftThreeWaypointTrackingEnv(
             scenario,
-            target_tip=target_tip,
+            waypoint_tips=waypoint_tips,
             episode_steps=args.episode_steps,
             absolute_action_limit=absolute_action_limit,
         )
@@ -99,9 +109,16 @@ def main() -> None:
         distances: list[float] = []
         rewards: list[float] = []
         residuals: list[float] = []
+        active_waypoint_indices: list[int] = []
+        completed_waypoints: list[int] = []
+        waypoint_events: list[bool] = []
+        all_waypoint_distances: list[np.ndarray] = []
         try:
             observation, info = env.reset(seed=args.seed + episode)
             distances.append(float(info["distance"]))
+            all_waypoint_distances.append(
+                np.asarray(info["all_waypoint_distances"], dtype=np.float32)
+            )
             terminated = truncated = False
             while not (terminated or truncated):
                 observation_tensor = torch.as_tensor(
@@ -133,10 +150,22 @@ def main() -> None:
                 residuals.append(
                     float(policy_output.mpc.projected_gradient_residual.mean())
                 )
+                active_waypoint_indices.append(int(info["active_waypoint_index"]))
+                completed_waypoints.append(int(info["waypoints_completed"]))
+                waypoint_events.append(bool(info["waypoint_passed"]))
+                all_waypoint_distances.append(
+                    np.asarray(
+                        info["all_waypoint_distances"], dtype=np.float32
+                    )
+                )
                 observation = next_observation
         finally:
             env.close()
         distance_array = np.asarray(distances, dtype=np.float32)
+        all_distance_array = np.asarray(
+            all_waypoint_distances, dtype=np.float32
+        )
+        final_completed = max(completed_waypoints, default=0)
         summary = {
             "episode": episode,
             "steps": len(rewards),
@@ -145,6 +174,9 @@ def main() -> None:
             "final_distance": float(distance_array[-1]),
             "minimum_distance": float(distance_array.min()),
             "success": bool(terminated),
+            "waypoints_completed": final_completed,
+            "waypoint_minimum_distances": all_distance_array.min(axis=0).tolist(),
+            "waypoint_pass_events": int(np.sum(waypoint_events)),
             "projected_gradient_residual_mean": float(np.mean(residuals)),
         }
         episode_summaries.append(summary)
@@ -155,6 +187,14 @@ def main() -> None:
                 "applied_action": np.asarray(applied_actions, dtype=np.float32),
                 "distance": distance_array,
                 "reward": np.asarray(rewards, dtype=np.float32),
+                "active_waypoint_index": np.asarray(
+                    active_waypoint_indices, dtype=np.int64
+                ),
+                "waypoints_completed": np.asarray(
+                    completed_waypoints, dtype=np.int64
+                ),
+                "waypoint_passed": np.asarray(waypoint_events, dtype=np.bool_),
+                "all_waypoint_distances": all_distance_array,
             }
         )
         print(json.dumps(summary, sort_keys=True), flush=True)
@@ -170,10 +210,16 @@ def main() -> None:
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": sha256(checkpoint),
         "scenario": str(scenario),
-        "reference": str(reference),
-        "reference_sha256": sha256(reference),
+        "waypoint_root": str(waypoint_root),
+        "references": [str(path) for path in reference_paths],
+        "reference_sha256": reference_hashes,
+        "actions": [str(path) for path in action_paths],
+        "action_sha256": action_hashes,
         "episodes": args.episodes,
         "success_rate": float(np.mean([row["success"] for row in episode_summaries])),
+        "waypoints_completed_mean": float(
+            np.mean([row["waypoints_completed"] for row in episode_summaries])
+        ),
         "return_mean": float(np.mean([row["return"] for row in episode_summaries])),
         "final_distance_mean": float(
             np.mean([row["final_distance"] for row in episode_summaries])

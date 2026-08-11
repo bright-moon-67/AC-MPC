@@ -14,7 +14,10 @@ import numpy as np
 import torch
 
 from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
-from antmaze_ac.envs.manisoft_tracking_env import ManiSoftTipTrackingEnv
+from antmaze_ac.envs.manisoft_tracking_env import (
+    ManiSoftThreeWaypointTrackingEnv,
+    load_manisoft_waypoint_references,
+)
 from antmaze_ac.koopman.checkpoint import sha256
 from antmaze_ac.rl.ppo import collect_rollout, collect_vector_rollout, ppo_update
 from antmaze_ac.rl.serialization import make_history_mpc_policy
@@ -49,7 +52,7 @@ def _write_json(path: Path, payload: dict) -> None:
 def _make_env(
     *,
     scenario: Path,
-    target_tip: np.ndarray,
+    waypoint_tips: np.ndarray,
     episode_steps: int,
     absolute_action_limit: float,
     max_delta: float,
@@ -57,9 +60,9 @@ def _make_env(
     state_mean: np.ndarray,
     state_std: np.ndarray,
 ) -> HistoryContextTrackingWrapper:
-    base = ManiSoftTipTrackingEnv(
+    base = ManiSoftThreeWaypointTrackingEnv(
         scenario,
-        target_tip=target_tip,
+        waypoint_tips=waypoint_tips,
         episode_steps=episode_steps,
         absolute_action_limit=absolute_action_limit,
     )
@@ -78,7 +81,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--koopman-checkpoint", required=True)
     parser.add_argument("--bc-checkpoint", default=None)
     parser.add_argument("--scenario", required=True)
-    parser.add_argument("--reference", required=True)
+    parser.add_argument(
+        "--waypoint-root",
+        required=True,
+        help="Directory containing ref_4cm/ref_8cm/ref_12cm and actions/.",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--episode-steps", type=int, default=300)
     parser.add_argument("--horizon", type=int, default=10)
@@ -114,24 +121,24 @@ def main() -> None:
     device = _device(args.device)
     koopman_path = Path(args.koopman_checkpoint).expanduser().resolve()
     scenario = Path(args.scenario).expanduser().resolve()
-    reference_path = Path(args.reference).expanduser().resolve()
+    waypoint_root = Path(args.waypoint_root).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     for name, path in (
         ("Koopman checkpoint", koopman_path),
         ("scenario", scenario),
-        ("reference", reference_path),
     ):
         if not path.is_file():
             raise FileNotFoundError(f"Missing {name}: {path}")
 
-    with np.load(reference_path, allow_pickle=False) as archive:
-        reference_state = np.asarray(
-            archive["reference_state"],
-            dtype=np.float32,
-        ).reshape(-1)
-    if reference_state.shape != (45,):
-        raise ValueError("Reference state must be 45-D")
-    target_tip = reference_state[np.asarray(TIP_INDICES)]
+    (
+        reference_states,
+        _,
+        reference_paths,
+        action_paths,
+    ) = load_manisoft_waypoint_references(waypoint_root)
+    waypoint_tips = reference_states[:, np.asarray(TIP_INDICES)]
+    reference_hashes = [sha256(path) for path in reference_paths]
+    action_hashes = [sha256(path) for path in action_paths]
 
     policy, koopman_payload = make_history_mpc_policy(
         koopman_path,
@@ -140,6 +147,7 @@ def main() -> None:
         absolute_action_limit=args.absolute_action_limit,
         max_delta=args.max_delta,
         solver_iterations=args.solver_iterations,
+        waypoint_count=3,
     )
     config = koopman_payload["config"]
     ppo = config["ppo"]
@@ -175,6 +183,7 @@ def main() -> None:
             ("solver_iterations", policy.actor.solver_iterations),
             ("max_delta", args.max_delta),
             ("absolute_action_limit", args.absolute_action_limit),
+            ("waypoint_count", 3),
         ):
             actual = bc_payload["runtime"].get(key)
             if actual != expected:
@@ -182,6 +191,11 @@ def main() -> None:
                     f"BC checkpoint runtime {key}={actual!r}, expected {expected!r}"
                 )
         policy.actor.load_state_dict(bc_payload["actor"])
+        if (
+            bc_payload.get("reference_sha256") != reference_hashes
+            or bc_payload.get("action_sha256") != action_hashes
+        ):
+            raise ValueError("BC checkpoint references another waypoint set")
         bc_initialization = {
             "checkpoint": str(bc_path),
             "checkpoint_sha256": sha256(bc_path),
@@ -212,6 +226,7 @@ def main() -> None:
         "max_delta": args.max_delta,
         "observation_dim": policy.observation_dim,
         "history_steps": policy.history_steps,
+        "waypoint_count": policy.waypoint_count,
         "num_envs": num_envs,
         "rollout_steps": rollout_steps,
         "minibatch_size": minibatch_size,
@@ -226,8 +241,11 @@ def main() -> None:
         "format_version": 2,
         "koopman_checkpoint": str(koopman_path),
         "koopman_checkpoint_sha256": expected_koopman_sha,
-        "reference": str(reference_path),
-        "reference_sha256": sha256(reference_path),
+        "waypoint_root": str(waypoint_root),
+        "references": [str(path) for path in reference_paths],
+        "reference_sha256": reference_hashes,
+        "actions": [str(path) for path in action_paths],
+        "action_sha256": action_hashes,
         "scenario": str(scenario),
         "seed": args.seed,
         "runtime": runtime,
@@ -249,8 +267,11 @@ def main() -> None:
             raise ValueError("Resume checkpoint is not actor-critic BC-KMPC")
         if resume_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
             raise ValueError("Resume checkpoint references another Koopman model")
-        if resume_payload.get("reference_sha256") != sha256(reference_path):
-            raise ValueError("Resume checkpoint references another target reference")
+        if (
+            resume_payload.get("reference_sha256") != reference_hashes
+            or resume_payload.get("action_sha256") != action_hashes
+        ):
+            raise ValueError("Resume checkpoint references another waypoint set")
         if resume_payload["runtime"] != runtime:
             raise ValueError("Resume runtime configuration is incompatible")
         if int(resume_payload["seed"]) != args.seed:
@@ -279,7 +300,7 @@ def main() -> None:
     envs = [
         _make_env(
             scenario=scenario,
-            target_tip=target_tip,
+            waypoint_tips=waypoint_tips,
             episode_steps=args.episode_steps,
             absolute_action_limit=args.absolute_action_limit,
             max_delta=args.max_delta,
@@ -403,6 +424,11 @@ def main() -> None:
                 "completed_success_rate": (
                     float(rollout.episode_successes.mean())
                     if len(rollout.episode_successes)
+                    else None
+                ),
+                "waypoints_completed_mean": (
+                    float(rollout.episode_waypoints_completed.mean())
+                    if len(rollout.episode_waypoints_completed)
                     else None
                 ),
                 "action_saturation_rate": float(rollout.saturation.mean()),

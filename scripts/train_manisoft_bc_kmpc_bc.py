@@ -136,6 +136,16 @@ def main() -> None:
     output = Path(args.output).expanduser().resolve()
     if not checkpoint.is_file() or not dataset_path.is_file():
         raise FileNotFoundError("Koopman checkpoint and expert dataset must exist")
+    dataset_report_path = dataset_path.with_suffix(".json")
+    if not dataset_report_path.is_file():
+        raise FileNotFoundError(
+            f"Missing expert dataset metadata: {dataset_report_path}"
+        )
+    dataset_report = json.loads(dataset_report_path.read_text(encoding="utf-8"))
+    if dataset_report.get("kind") != (
+        "manisoft_history_bc_kmpc_three_waypoint_expert"
+    ):
+        raise ValueError("Expert dataset is not the three-waypoint schema")
     output.mkdir(parents=True, exist_ok=True)
     history_path = output / "history.jsonl"
     if args.resume is None and history_path.exists():
@@ -150,6 +160,7 @@ def main() -> None:
         absolute_action_limit=args.absolute_action_limit,
         max_delta=args.max_delta,
         solver_iterations=args.solver_iterations,
+        waypoint_count=3,
     )
     policy.koopman.eval()
     policy.critic.requires_grad_(False)
@@ -164,6 +175,9 @@ def main() -> None:
         observations = np.asarray(archive["observation"], dtype=np.float32)
         targets = np.asarray(archive["expert_action"], dtype=np.float32)
         episode_ids = np.asarray(archive["episode_id"], dtype=np.int64)
+        active_waypoint_index = np.asarray(
+            archive["active_waypoint_index"], dtype=np.int64
+        )
     if observations.ndim != 2 or observations.shape[1] != policy.observation_dim:
         raise ValueError(
             f"Dataset observation must be [N,{policy.observation_dim}], "
@@ -173,6 +187,10 @@ def main() -> None:
         raise ValueError("Dataset expert_action shape is incompatible")
     if episode_ids.shape != (len(observations),):
         raise ValueError("Dataset episode_id shape is incompatible")
+    if active_waypoint_index.shape != (len(observations),) or np.any(
+        (active_waypoint_index < 0) | (active_waypoint_index >= 3)
+    ):
+        raise ValueError("Dataset active_waypoint_index is incompatible")
     if not np.isfinite(observations).all() or not np.isfinite(targets).all():
         raise ValueError("Dataset contains NaN or Inf")
     train_indices, validation_indices = _split_indices(
@@ -220,11 +238,19 @@ def main() -> None:
             raise ValueError("Resume checkpoint is not BC-KMPC behavior cloning")
         if resume_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
             raise ValueError("Resume checkpoint references another Koopman model")
+        if (
+            resume_payload.get("reference_sha256")
+            != dataset_report["reference_sha256"]
+            or resume_payload.get("action_sha256")
+            != dataset_report["action_sha256"]
+        ):
+            raise ValueError("Resume checkpoint references another waypoint set")
         expected_runtime = {
             "horizon": policy.actor.horizon,
             "solver_iterations": policy.actor.solver_iterations,
             "absolute_action_limit": args.absolute_action_limit,
             "max_delta": args.max_delta,
+            "waypoint_count": policy.waypoint_count,
         }
         for key, expected in expected_runtime.items():
             actual = resume_payload["runtime"].get(key)
@@ -245,16 +271,22 @@ def main() -> None:
         "max_delta": args.max_delta,
         "observation_dim": policy.observation_dim,
         "history_steps": policy.history_steps,
+        "waypoint_count": policy.waypoint_count,
         "train_samples": len(train_data),
         "validation_samples": len(validation_data),
     }
     metadata = {
         "method": "bc_kmpc_bc",
-        "format_version": 1,
+        "format_version": 2,
         "koopman_checkpoint": str(checkpoint),
         "koopman_checkpoint_sha256": expected_koopman_sha,
         "dataset": str(dataset_path),
         "dataset_sha256": sha256(dataset_path),
+        "waypoint_root": dataset_report["waypoint_root"],
+        "references": dataset_report["references"],
+        "reference_sha256": dataset_report["reference_sha256"],
+        "actions": dataset_report["actions"],
+        "action_sha256": dataset_report["action_sha256"],
         "seed": args.seed,
         "runtime": runtime,
     }

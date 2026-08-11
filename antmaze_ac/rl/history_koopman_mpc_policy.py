@@ -16,7 +16,7 @@ from .koopman_mpc_actor import KoopmanMPCActor, KoopmanMPCActorOutput
 class HistoryMPCObservation(NamedTuple):
     physical_state: torch.Tensor
     history_context: torch.Tensor
-    target_tip: torch.Tensor
+    task_context: torch.Tensor
     previous_action: torch.Tensor
 
 
@@ -109,8 +109,9 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     The environment observation contains all history needed by
     :class:`HistoryDeepKoopman`, so shuffled PPO minibatches reconstruct the
     same policy without hidden controller state.  The actor receives the
-    frozen Koopman lift plus a six-dimensional task context consisting of the
-    normalized target tip and normalized target-minus-current tip error.
+    frozen Koopman lift plus task context.  The legacy single-target context is
+    ``[normalized_target, normalized_target-current_tip]``.  Ordered waypoint
+    tracking uses ``[normalized_G1,G2,G3,one_hot(active_stage)]``.
     """
 
     TASK_CONTEXT_DIM = 6
@@ -124,6 +125,7 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         state_mean: torch.Tensor,
         state_std: torch.Tensor,
         *,
+        waypoint_count: int = 1,
         tip_indices: tuple[int, int, int] = (30, 31, 32),
         log_std_init: float = -7.0,
     ) -> None:
@@ -136,9 +138,20 @@ class HistoryKoopmanMPCPolicy(nn.Module):
             raise ValueError("Actor physical dimension does not match Koopman state")
         if actor.action_dim != koopman.action_dim:
             raise ValueError("Actor action dimension does not match Koopman action")
-        if actor.context_dim != self.TASK_CONTEXT_DIM:
+        if waypoint_count < 1:
+            raise ValueError("waypoint_count must be positive")
+        self.waypoint_count = int(waypoint_count)
+        self.task_observation_dim = (
+            3 if self.waypoint_count == 1 else 4 * self.waypoint_count
+        )
+        self.task_context_dim = (
+            self.TASK_CONTEXT_DIM
+            if self.waypoint_count == 1
+            else 4 * self.waypoint_count
+        )
+        if actor.context_dim != self.task_context_dim:
             raise ValueError(
-                f"Actor context_dim must be {self.TASK_CONTEXT_DIM}"
+                f"Actor context_dim must be {self.task_context_dim}"
             )
         if state_mean.shape != (koopman.state_dim,) or state_std.shape != (
             koopman.state_dim,
@@ -169,8 +182,12 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         self.action_dim = int(koopman.action_dim)
         self.history_steps = int(koopman.history_steps)
         self.history_context_dim = int(koopman.context_dim)
-        self.observation_dim = self.state_dim + self.history_context_dim + 3
-        expected_critic_input = koopman.lifted_dim + self.TASK_CONTEXT_DIM
+        self.observation_dim = (
+            self.state_dim
+            + self.history_context_dim
+            + self.task_observation_dim
+        )
+        expected_critic_input = koopman.lifted_dim + self.task_context_dim
         first_linear = next(
             (layer for layer in critic.network if isinstance(layer, nn.Linear)),
             None,
@@ -193,12 +210,12 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         context_stop = state_stop + self.history_context_dim
         physical_state = observation[..., :state_stop]
         history_context = observation[..., state_stop:context_stop]
-        target_tip = observation[..., context_stop:]
+        task_context = observation[..., context_stop:]
         previous_action = history_context[..., -self.action_dim :]
         return HistoryMPCObservation(
             physical_state,
             history_context,
-            target_tip,
+            task_context,
             previous_action,
         )
 
@@ -213,10 +230,23 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         lifted = self.koopman.lift(normalized_state, split.history_context)
         tip_mean = self.state_mean[self.tip_indices]
         tip_std = self.state_std[self.tip_indices]
-        normalized_target = (split.target_tip - tip_mean) / tip_std
-        normalized_tip = normalized_state[..., self.tip_indices]
-        target_error = normalized_target - normalized_tip
-        actor_context = torch.cat((normalized_target, target_error), dim=-1)
+        if self.waypoint_count == 1:
+            normalized_target = (split.task_context - tip_mean) / tip_std
+            normalized_tip = normalized_state[..., self.tip_indices]
+            target_error = normalized_target - normalized_tip
+            actor_context = torch.cat(
+                (normalized_target, target_error), dim=-1
+            )
+        else:
+            waypoint_stop = 3 * self.waypoint_count
+            waypoints = split.task_context[..., :waypoint_stop].reshape(
+                *split.task_context.shape[:-1], self.waypoint_count, 3
+            )
+            stage = split.task_context[..., waypoint_stop:]
+            normalized_waypoints = (waypoints - tip_mean) / tip_std
+            actor_context = torch.cat(
+                (normalized_waypoints.flatten(start_dim=-2), stage), dim=-1
+            )
         return split, lifted, actor_context
 
     def actor_mean(self, observation: torch.Tensor) -> KoopmanMPCActorOutput:

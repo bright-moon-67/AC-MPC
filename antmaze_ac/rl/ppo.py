@@ -24,6 +24,7 @@ class Rollout:
     episode_lengths: np.ndarray
     distances: np.ndarray
     episode_successes: np.ndarray
+    episode_waypoints_completed: np.ndarray
 
 
 @torch.no_grad()
@@ -35,6 +36,7 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
     observations, actions, log_probs, values = [], [], [], []
     rewards, dones, saturation, dare_retry, dare_fallback = [], [], [], [], []
     completed_returns, completed_lengths, completed_successes = [], [], []
+    completed_waypoints = []
     distances = []
     episode_return = float(getattr(env, "_ppo_episode_return", 0.0))
     episode_length = int(getattr(env, "_ppo_episode_length", 0))
@@ -69,6 +71,9 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
             completed_returns.append(episode_return)
             completed_lengths.append(episode_length)
             completed_successes.append(bool(info.get("is_success", terminated)))
+            completed_waypoints.append(
+                int(info.get("waypoints_completed", int(terminated)))
+            )
             episode_return = 0.0
             episode_length = 0
             next_observation, _ = env.reset()
@@ -101,6 +106,9 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
         episode_lengths=np.asarray(completed_lengths),
         distances=np.asarray(distances, dtype=np.float32),
         episode_successes=np.asarray(completed_successes, dtype=np.bool_),
+        episode_waypoints_completed=np.asarray(
+            completed_waypoints, dtype=np.int64
+        ),
     )
 
 
@@ -143,6 +151,7 @@ def collect_vector_rollout(
     observations, actions, log_probs, values = [], [], [], []
     rewards, dones, saturation, dare_retry, dare_fallback = [], [], [], [], []
     completed_returns, completed_lengths, completed_successes = [], [], []
+    completed_waypoints = []
     distances = []
     for _ in range(time_steps):
         observation_tensor = torch.as_tensor(
@@ -180,6 +189,9 @@ def collect_vector_rollout(
                 completed_lengths.append(episode_lengths[index])
                 completed_successes.append(
                     bool(info.get("is_success", terminated))
+                )
+                completed_waypoints.append(
+                    int(info.get("waypoints_completed", int(terminated)))
                 )
                 episode_returns[index] = 0.0
                 episode_lengths[index] = 0
@@ -264,6 +276,9 @@ def collect_vector_rollout(
         episode_lengths=np.asarray(completed_lengths),
         distances=np.asarray(distances, dtype=np.float32).reshape(steps),
         episode_successes=np.asarray(completed_successes, dtype=np.bool_),
+        episode_waypoints_completed=np.asarray(
+            completed_waypoints, dtype=np.int64
+        ),
     )
 
 

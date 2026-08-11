@@ -12,7 +12,10 @@ import torch
 
 from antmaze_ac.control.history_reference_mpc import FixedCostHistoryKoopmanMPC
 from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
-from antmaze_ac.envs.manisoft_tracking_env import ManiSoftTipTrackingEnv
+from antmaze_ac.envs.manisoft_tracking_env import (
+    ManiSoftThreeWaypointTrackingEnv,
+    load_manisoft_waypoint_references,
+)
 from antmaze_ac.koopman.checkpoint import load_checkpoint, sha256
 from antmaze_ac.koopman.history_model import HistoryDeepKoopman
 from antmaze_ac.rl.serialization import load_history_mpc_checkpoint
@@ -33,7 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--koopman-checkpoint", required=True)
     parser.add_argument("--scenario", required=True)
-    parser.add_argument("--reference", required=True)
+    parser.add_argument(
+        "--waypoint-root",
+        required=True,
+        help="Directory containing ref_4cm/ref_8cm/ref_12cm and actions/.",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--base-dataset",
@@ -74,12 +81,11 @@ def main() -> None:
     args = parse_args()
     checkpoint = Path(args.koopman_checkpoint).expanduser().resolve()
     scenario = Path(args.scenario).expanduser().resolve()
-    reference_path = Path(args.reference).expanduser().resolve()
+    waypoint_root = Path(args.waypoint_root).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     for name, path in (
         ("koopman checkpoint", checkpoint),
         ("scenario", scenario),
-        ("reference", reference_path),
     ):
         if not path.is_file():
             raise FileNotFoundError(f"Missing {name}: {path}")
@@ -104,17 +110,26 @@ def main() -> None:
         if path is not None and not path.is_file():
             raise FileNotFoundError(f"Missing {name}: {path}")
 
-    with np.load(reference_path, allow_pickle=False) as archive:
-        reference_state = np.asarray(
-            archive["reference_state"],
-            dtype=np.float32,
-        ).reshape(-1)
-        reference_action = np.asarray(
-            archive["reference_action"],
-            dtype=np.float32,
-        ).reshape(-1)
-    if reference_state.shape != (45,) or reference_action.shape != (18,):
-        raise ValueError("Reference must contain a 45-D state and 18-D action")
+    (
+        reference_states,
+        reference_actions,
+        reference_paths,
+        action_paths,
+    ) = load_manisoft_waypoint_references(waypoint_root)
+    reference_hashes = [sha256(path) for path in reference_paths]
+    action_hashes = [sha256(path) for path in action_paths]
+    if base_dataset_path is not None:
+        base_report_path = base_dataset_path.with_suffix(".json")
+        if not base_report_path.is_file():
+            raise FileNotFoundError(
+                f"Missing base dataset metadata: {base_report_path}"
+            )
+        base_report = json.loads(base_report_path.read_text(encoding="utf-8"))
+        if (
+            base_report.get("reference_sha256") != reference_hashes
+            or base_report.get("action_sha256") != action_hashes
+        ):
+            raise ValueError("Base dataset references another waypoint set")
 
     device = _device(args.device)
     model, payload = load_checkpoint(checkpoint, map_location=device)
@@ -132,6 +147,13 @@ def main() -> None:
             raise ValueError("Rollout checkpoint references another Koopman model")
         if rollout_policy.history_steps != model.history_steps:
             raise ValueError("Rollout policy history length is incompatible")
+        if rollout_policy.waypoint_count != 3:
+            raise ValueError("Rollout policy is not a three-waypoint policy")
+        if (
+            rollout_payload.get("reference_sha256") != reference_hashes
+            or rollout_payload.get("action_sha256") != action_hashes
+        ):
+            raise ValueError("Rollout checkpoint references another waypoint set")
         rollout_policy.eval()
     state_stats = payload["normalizers"]["state"]
     state_mean = torch.as_tensor(
@@ -161,9 +183,9 @@ def main() -> None:
         max_delta=args.max_delta,
         qp_max_iterations=args.qp_max_iterations,
     )
-    base_env = ManiSoftTipTrackingEnv(
+    base_env = ManiSoftThreeWaypointTrackingEnv(
         scenario,
-        target_tip=reference_state[np.asarray(TIP_INDICES)],
+        waypoint_tips=reference_states[:, np.asarray(TIP_INDICES)],
         episode_steps=args.episode_steps,
         absolute_action_limit=args.absolute_action_limit,
     )
@@ -183,6 +205,9 @@ def main() -> None:
     step_indices: list[int] = []
     expert_costs: list[float] = []
     qp_iterations: list[int] = []
+    active_waypoint_indices: list[int] = []
+    waypoint_passed: list[bool] = []
+    waypoints_completed: list[int] = []
     if base_dataset_path is not None:
         with np.load(base_dataset_path, allow_pickle=False) as archive:
             base_arrays = {
@@ -195,14 +220,15 @@ def main() -> None:
                     "step_index",
                     "expert_cost",
                     "qp_iterations",
+                    "active_waypoint_index",
+                    "waypoint_passed",
+                    "waypoints_completed",
                 )
             }
         base_count = len(base_arrays["observation"])
         if any(len(value) != base_count for value in base_arrays.values()):
             raise ValueError("Base dataset arrays have inconsistent lengths")
-        if base_arrays["observation"].shape[1:] != (
-            model.state_dim + model.context_dim + 3,
-        ):
+        if base_arrays["observation"].shape[1:] != env.observation_space.shape:
             raise ValueError("Base dataset observation dimension is incompatible")
         if base_arrays["expert_action"].shape[1:] != (model.action_dim,):
             raise ValueError("Base dataset action dimension is incompatible")
@@ -213,6 +239,15 @@ def main() -> None:
         step_indices.extend(base_arrays["step_index"].astype(np.int64).tolist())
         expert_costs.extend(base_arrays["expert_cost"].astype(np.float32).tolist())
         qp_iterations.extend(base_arrays["qp_iterations"].astype(np.int32).tolist())
+        active_waypoint_indices.extend(
+            base_arrays["active_waypoint_index"].astype(np.int64).tolist()
+        )
+        waypoint_passed.extend(
+            base_arrays["waypoint_passed"].astype(np.bool_).tolist()
+        )
+        waypoints_completed.extend(
+            base_arrays["waypoints_completed"].astype(np.int64).tolist()
+        )
     base_samples = len(observations)
     episode_offset = max(episode_ids, default=-1) + 1
     episode_returns: list[float] = []
@@ -223,6 +258,7 @@ def main() -> None:
             episode_return = 0.0
             executed_steps = 0
             for step in range(args.episode_steps):
+                active_waypoint_index = int(base_env.active_waypoint_index)
                 state = observation[: model.state_dim]
                 context_start = model.state_dim
                 context_stop = context_start + model.context_dim
@@ -231,8 +267,8 @@ def main() -> None:
                 plan = expert.solve(
                     state=state,
                     context=context,
-                    reference_state=reference_state,
-                    reference_action=reference_action,
+                    reference_state=reference_states[active_waypoint_index],
+                    reference_action=reference_actions[active_waypoint_index],
                     previous_action=previous_action,
                     initial_actions=warm_start,
                 )
@@ -268,6 +304,9 @@ def main() -> None:
                 step_indices.append(step)
                 expert_costs.append(float(plan["cost"]))
                 qp_iterations.append(int(plan["qp_iterations"]))
+                active_waypoint_indices.append(active_waypoint_index)
+                waypoint_passed.append(bool(info["waypoint_passed"]))
+                waypoints_completed.append(int(info["waypoints_completed"]))
                 episode_return += float(reward)
                 executed_steps += 1
                 observation = next_observation
@@ -284,6 +323,8 @@ def main() -> None:
                         "return": episode_return,
                         "new_samples": len(observations) - base_samples,
                         "samples": len(observations),
+                        "waypoints_completed": int(base_env.waypoints_completed),
+                        "success": bool(terminated),
                     },
                     sort_keys=True,
                 ),
@@ -303,11 +344,16 @@ def main() -> None:
             step_index=np.asarray(step_indices, dtype=np.int64),
             expert_cost=np.asarray(expert_costs, dtype=np.float32),
             qp_iterations=np.asarray(qp_iterations, dtype=np.int32),
+            active_waypoint_index=np.asarray(
+                active_waypoint_indices, dtype=np.int64
+            ),
+            waypoint_passed=np.asarray(waypoint_passed, dtype=np.bool_),
+            waypoints_completed=np.asarray(waypoints_completed, dtype=np.int64),
         )
     temporary.replace(output)
     report = {
-        "schema_version": 1,
-        "kind": "manisoft_history_bc_kmpc_expert",
+        "schema_version": 2,
+        "kind": "manisoft_history_bc_kmpc_three_waypoint_expert",
         "output": str(output),
         "samples": len(observations),
         "base_samples": base_samples,
@@ -319,8 +365,11 @@ def main() -> None:
         "history_steps": model.history_steps,
         "koopman_checkpoint": str(checkpoint),
         "koopman_checkpoint_sha256": sha256(checkpoint),
-        "reference": str(reference_path),
-        "reference_sha256": sha256(reference_path),
+        "waypoint_root": str(waypoint_root),
+        "references": [str(path) for path in reference_paths],
+        "reference_sha256": reference_hashes,
+        "actions": [str(path) for path in action_paths],
+        "action_sha256": action_hashes,
         "scenario": str(scenario),
         "base_dataset": (
             None if base_dataset_path is None else str(base_dataset_path)
