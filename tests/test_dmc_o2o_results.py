@@ -13,7 +13,11 @@ from experiments.dmc.o2o.aggregate import (
     aggregate_runs,
     curve_metrics,
 )
-from experiments.dmc.o2o.checkpoint import CHECKPOINT_KIND, atomic_torch_save
+from experiments.dmc.o2o.checkpoint import (
+    CHECKPOINT_KIND,
+    atomic_torch_save,
+    load_checkpoint,
+)
 from experiments.dmc.o2o.config import O2OConfig
 from experiments.dmc.o2o.dataset import (
     DATASET_KIND,
@@ -27,7 +31,7 @@ from experiments.dmc.o2o.evaluate import (
     evaluate_checkpoint,
     validate_run_identity,
 )
-from experiments.dmc.o2o.koopman import FrozenKoopman
+from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner
 from experiments.dmc.o2o.plot import plot_aggregate
 
@@ -164,6 +168,7 @@ def _write_run(
     koopman_path: Path,
     eval_values: tuple[float, float, float],
     include_learner: bool = False,
+    initialization: dict[str, Any] | None = None,
 ) -> Path:
     root.mkdir(parents=True)
     koopman = FrozenKoopman(koopman_path)
@@ -190,6 +195,7 @@ def _write_run(
         "online_episode": 100,
         "best_return": eval_values[-1],
         "best_online_step": 100_000,
+        "initialization": initialization,
         "learner": learner_state,
         "online_replay": OnlineReplay(8).state_dict(),
     }
@@ -202,6 +208,7 @@ def _write_run(
         "dataset": {"path": str(dataset.path), "sha256": dataset.sha256},
         "koopman": koopman.identity(),
         "environment_protocol": PROTOCOL,
+        "initialization": initialization,
         "completed": True,
         "online_steps_completed": 100_000,
     }
@@ -235,6 +242,101 @@ def _write_run(
         encoding="utf-8",
     )
     return root
+
+
+def _write_offline_fork_source(
+    path: Path,
+    *,
+    seed: int,
+    dataset: OfflineDataset,
+    koopman_path: Path,
+) -> dict[str, Any]:
+    """Create the immutable paired AC-KMPC snapshot expected by MPVE."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config = _config("Cal-RLPD-AC-KMPC", seed)
+    koopman = FrozenKoopman(koopman_path)
+    checkpoint = {
+        "kind": CHECKPOINT_KIND,
+        "config": config.to_dict(),
+        "config_fingerprint": config.fingerprint,
+        "dataset": {
+            "path": str(dataset.path),
+            "sha256": dataset.sha256,
+            "metadata": dataset.metadata,
+        },
+        "koopman": koopman.identity(),
+        "environment_protocol": PROTOCOL,
+        "phase": "offline",
+        "offline_update": config.offline_updates,
+        "online_step": 0,
+        "online_episode": 0,
+        "initialization": None,
+    }
+    atomic_torch_save(path, checkpoint)
+    resolved = path.resolve()
+    return {
+        "kind": "acmpc_o2o_offline_fork_v1",
+        "source_path": str(resolved),
+        "source_sha256": file_sha256(resolved),
+        "source_method": config.method,
+        "source_config_fingerprint": config.fingerprint,
+        "shared_state": "actor_critic_target_temperature_optimizers_rng",
+    }
+
+
+def _replace_initialization(root: Path, initialization: dict[str, Any]) -> None:
+    checkpoint = load_checkpoint(root / "latest.pt")
+    checkpoint["initialization"] = initialization
+    atomic_torch_save(root / "latest.pt", checkpoint)
+    metadata = json.loads((root / "run.json").read_text(encoding="utf-8"))
+    metadata["initialization"] = initialization
+    (root / "run.json").write_text(
+        json.dumps(metadata, sort_keys=True), encoding="utf-8"
+    )
+
+
+def _write_formal_matrix(
+    root: Path,
+    *,
+    dataset: OfflineDataset,
+    koopman_path: Path,
+    seeds: tuple[int, ...] = (11, 12),
+) -> tuple[list[Path], dict[int, dict[str, Any]]]:
+    from experiments.dmc.o2o.config import METHODS
+
+    run_dirs: list[Path] = []
+    initializations: dict[int, dict[str, Any]] = {}
+    for seed in seeds:
+        for method in METHODS:
+            if method == "Cal-RLPD-AC-KMPC-MPVE":
+                continue
+            run_dir = _write_run(
+                root / method / f"seed_{seed}",
+                config=_config(method, seed),
+                dataset=dataset,
+                koopman_path=koopman_path,
+                eval_values=(100.0, 500.0, 900.0),
+            )
+            run_dirs.append(run_dir)
+            if method == "Cal-RLPD-AC-KMPC":
+                initializations[seed] = _write_offline_fork_source(
+                    run_dir / "offline.pt",
+                    seed=seed,
+                    dataset=dataset,
+                    koopman_path=koopman_path,
+                )
+        run_dirs.append(
+            _write_run(
+                root / "Cal-RLPD-AC-KMPC-MPVE" / f"seed_{seed}",
+                config=_config("Cal-RLPD-AC-KMPC-MPVE", seed),
+                dataset=dataset,
+                koopman_path=koopman_path,
+                eval_values=(100.0, 500.0, 900.0),
+                initialization=initializations[seed],
+            )
+        )
+    return run_dirs, initializations
 
 
 class _FakeDMC:
@@ -410,6 +512,15 @@ def test_formal_aggregate_requires_full_matrix_and_identical_seed_sets(
     run_dirs = []
     from experiments.dmc.o2o.config import METHODS
 
+    mpve_initializations = {
+        seed: _write_offline_fork_source(
+            tmp_path / "mpve_sources" / f"seed_{seed}" / "offline.pt",
+            seed=seed,
+            dataset=dataset,
+            koopman_path=koopman_path,
+        )
+        for seed in (11, 13)
+    }
     for method in METHODS:
         seeds = (11, 13) if method == METHODS[-1] else (11, 12)
         for seed in seeds:
@@ -420,7 +531,52 @@ def test_formal_aggregate_requires_full_matrix_and_identical_seed_sets(
                     dataset=dataset,
                     koopman_path=koopman_path,
                     eval_values=(100.0, 500.0, 900.0),
+                    initialization=(
+                        mpve_initializations[seed]
+                        if method == "Cal-RLPD-AC-KMPC-MPVE"
+                        else None
+                    ),
                 )
             )
     with pytest.raises(ValueError, match="same ordered training-seed set"):
+        aggregate_runs(run_dirs)
+
+
+def test_formal_aggregate_requires_each_mpve_fork_from_included_same_seed_ac_run(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_dataset(tmp_path / "dataset.npz")
+    koopman_path = _write_koopman(tmp_path / "koopman.npz")
+    run_dirs, initializations = _write_formal_matrix(
+        tmp_path / "matrix",
+        dataset=dataset,
+        koopman_path=koopman_path,
+    )
+
+    result = aggregate_runs(run_dirs)
+    assert result["protocol"]["common_training_seeds"] == [11, 12]
+
+    mpve_run = tmp_path / "matrix" / "Cal-RLPD-AC-KMPC-MPVE" / "seed_12"
+    tampered_sha = dict(initializations[12])
+    tampered_sha["source_sha256"] = "0" * 64
+    _replace_initialization(mpve_run, tampered_sha)
+    with pytest.raises(ValueError, match="fork lineage"):
+        aggregate_runs(run_dirs)
+
+    missing_path = dict(initializations[12])
+    missing_path["source_path"] = str(
+        (tmp_path / "missing" / "seed_12" / "offline.pt").resolve()
+    )
+    _replace_initialization(mpve_run, missing_path)
+    with pytest.raises(FileNotFoundError, match="fork source is missing"):
+        aggregate_runs(run_dirs)
+
+    alternate = _write_offline_fork_source(
+        tmp_path / "alternate" / "seed_12" / "offline.pt",
+        seed=12,
+        dataset=dataset,
+        koopman_path=koopman_path,
+    )
+    _replace_initialization(mpve_run, alternate)
+    with pytest.raises(ValueError, match="included same-seed AC-KMPC run"):
         aggregate_runs(run_dirs)

@@ -19,6 +19,7 @@ from experiments.dmc.o2o.evaluate import (
     validate_run_identity,
 )
 from experiments.dmc.o2o.config import METHODS
+from experiments.dmc.o2o.koopman import file_sha256
 
 
 AGGREGATE_KIND = "acmpc_dmc_o2o_aggregate_v1"
@@ -245,6 +246,7 @@ def _checkpoint_evaluation(run_dir: Path, validated: Any) -> dict[str, Any] | No
         "online_step": int(validated.checkpoint["online_step"]),
         "config_fingerprint": validated.config.fingerprint,
         "environment_protocol": validated.checkpoint["environment_protocol"],
+        "initialization": validated.checkpoint.get("initialization"),
     }
     mismatches = {
         key: (report.get(key), value)
@@ -313,6 +315,7 @@ def _run_result(run_dir: Path, *, require_complete: bool) -> dict[str, Any]:
         "dataset_sha256": validated.dataset_sha256,
         "koopman_sha256": validated.koopman_sha256,
         "environment_protocol": validated.checkpoint["environment_protocol"],
+        "initialization": validated.checkpoint.get("initialization"),
         "latest_checkpoint_sha256": validated.checkpoint_sha256,
         "evaluation_curve": evaluation_curve,
         "training_curve": training_curve,
@@ -479,6 +482,34 @@ def aggregate_runs(
             ),
             "per_seed": method_runs,
         }
+
+    # Validate pairing after the common seed-set check so a malformed matrix
+    # reports its primary design error before inspecting method-specific files.
+    if require_complete:
+        source_runs = {
+            int(run["training_seed"]): run
+            for run in grouped["Cal-RLPD-AC-KMPC"]
+        }
+        for mpve_run in grouped["Cal-RLPD-AC-KMPC-MPVE"]:
+            seed = int(mpve_run["training_seed"])
+            source_run = source_runs.get(seed)
+            if source_run is None:
+                raise ValueError("MPVE has no paired same-seed AC-KMPC run")
+            source_path = (Path(source_run["run_dir"]) / "offline.pt").resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(
+                    f"Paired AC-KMPC offline snapshot is missing: {source_path}"
+                )
+            initialization = mpve_run.get("initialization")
+            if not isinstance(initialization, Mapping):
+                raise ValueError("MPVE run is missing offline-fork lineage")
+            if (
+                initialization.get("source_path") != str(source_path)
+                or initialization.get("source_sha256") != file_sha256(source_path)
+            ):
+                raise ValueError(
+                    "MPVE lineage does not match the included same-seed AC-KMPC run"
+                )
 
     return {
         "kind": AGGREGATE_KIND,

@@ -226,6 +226,9 @@ nohup python -m experiments.dmc.o2o.runner \
 dirty 摘要、训练源码逐文件 SHA、Python/Torch/CUDA 和子进程线程环境都会写入 manifest；
 运行期间训练核心源码发生变化时，后续任务会 fail-fast。`CUDA_VISIBLE_DEVICES` 原样继承，
 而 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 默认固定为 1。
+同一个 root 由进程级排他锁保护；活跃 child 会继承该锁，所以 runner 即使恰好在启动
+child 后异常退出，第二个 runner 也不能重复派发该任务。MPVE 在恢复、评估和正式聚合时
+还会重新核对同 seed AC-KMPC `offline.pt` 的绝对路径与 SHA256。
 
 `--max-parallel=1` 是保守默认值。提高并发数前应按模型显存实测；runner 不会修改或终止
 机器上已有的 GPU 进程。

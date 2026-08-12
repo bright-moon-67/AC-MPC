@@ -92,6 +92,63 @@ def _validate_counter(payload: Mapping[str, Any], key: str) -> int:
     return result
 
 
+def _validate_initialization_lineage(
+    *,
+    config: O2OConfig,
+    initialization: Any,
+    dataset_sha256: str,
+    koopman_sha256: str,
+    environment_protocol: Mapping[str, Any],
+) -> None:
+    if not config.uses_mpve:
+        if initialization is not None:
+            raise ValueError("Non-MPVE checkpoint contains fork lineage")
+        return
+    if not isinstance(initialization, Mapping):
+        raise ValueError("MPVE checkpoint is missing offline-fork lineage")
+    source_path_value = initialization.get("source_path")
+    if not isinstance(source_path_value, str) or not source_path_value:
+        raise ValueError("MPVE offline-fork source path is invalid")
+    source_path = Path(source_path_value).resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"MPVE offline-fork source is missing: {source_path}")
+    source_sha256 = file_sha256(source_path)
+    source = load_checkpoint(source_path)
+    source_config = _config_from_checkpoint(source)
+    if source_config.method != "Cal-RLPD-AC-KMPC":
+        raise ValueError("MPVE source method is not Cal-RLPD-AC-KMPC")
+    source_fields = source_config.to_dict()
+    target_fields = config.to_dict()
+    source_fields.pop("method")
+    target_fields.pop("method")
+    if source_fields != target_fields:
+        raise ValueError("MPVE source and target configs differ")
+    if source.get("dataset", {}).get("sha256") != dataset_sha256:
+        raise ValueError("MPVE source dataset differs")
+    if source.get("koopman", {}).get("sha256") != koopman_sha256:
+        raise ValueError("MPVE source Koopman model differs")
+    if source.get("environment_protocol") != dict(environment_protocol):
+        raise ValueError("MPVE source DMC protocol differs")
+    if (
+        source.get("phase") != "offline"
+        or _validate_counter(source, "offline_update") != config.offline_updates
+        or _validate_counter(source, "online_step") != 0
+        or _validate_counter(source, "online_episode") != 0
+        or source.get("initialization") is not None
+    ):
+        raise ValueError("MPVE source is not the immutable completed offline snapshot")
+    expected = {
+        "kind": "acmpc_o2o_offline_fork_v1",
+        "source_path": str(source_path),
+        "source_sha256": source_sha256,
+        "source_method": source_config.method,
+        "source_config_fingerprint": source_config.fingerprint,
+        "shared_state": "actor_critic_target_temperature_optimizers_rng",
+    }
+    if dict(initialization) != expected:
+        raise ValueError("MPVE fork lineage differs from its current source artifact")
+
+
 def validate_run_identity(
     run_dir: Path,
     *,
@@ -115,6 +172,8 @@ def validate_run_identity(
         raise ValueError("Run and checkpoint configs differ")
     if run_metadata.get("config_fingerprint") != config.fingerprint:
         raise ValueError("Run config fingerprint is invalid")
+    if run_metadata.get("initialization") != checkpoint.get("initialization"):
+        raise ValueError("Run and checkpoint initialization lineage differ")
 
     checkpoint_dataset = _require_mapping(checkpoint, "dataset")
     run_dataset = _require_mapping(run_metadata, "dataset")
@@ -146,6 +205,13 @@ def validate_run_identity(
         raise ValueError("Run and checkpoint environment protocols differ")
     if protocol.get("task") != config.task:
         raise ValueError("Saved environment protocol task differs from config")
+    _validate_initialization_lineage(
+        config=config,
+        initialization=checkpoint.get("initialization"),
+        dataset_sha256=expected_dataset_sha,
+        koopman_sha256=expected_koopman_sha,
+        environment_protocol=protocol,
+    )
     if checkpoint.get("phase") not in {"offline", "online"}:
         raise ValueError("Checkpoint phase is invalid")
     _validate_counter(checkpoint, "offline_update")
@@ -291,6 +357,7 @@ def evaluate_checkpoint(
             "sha256": validated.koopman_sha256,
         },
         "environment_protocol": expected_protocol,
+        "initialization": validated.checkpoint.get("initialization"),
         "evaluation_protocol": {
             "deterministic": True,
             "episodes": EVALUATION_EPISODES,

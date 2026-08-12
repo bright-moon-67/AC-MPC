@@ -8,6 +8,7 @@ exact argv, PID, log, timestamps, and return code are recorded atomically.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, IO, Mapping, Sequence
@@ -39,6 +41,7 @@ CHILD_ENVIRONMENT = {
     "OPENBLAS_NUM_THREADS": "1",
     "PYTHONUNBUFFERED": "1",
 }
+_ACTIVE_MATRIX_LOCK_FD: int | None = None
 
 _TRAINING_SOURCE_FILES = (
     "experiments/dmc/o2o/__init__.py",
@@ -442,6 +445,29 @@ def _check_run_identity(
         saved_koopman.get(key) != value for key, value in koopman.items()
     ):
         raise ValueError(f"Existing run Koopman identity differs: {run_dir}")
+    initialization = metadata.get("initialization")
+    if method == MPVE_METHOD:
+        source = spec.offline_source(seed).resolve()
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"Existing MPVE run is missing its paired offline source: {source}"
+            )
+        expected_lineage = {
+            "kind": "acmpc_o2o_offline_fork_v1",
+            "source_path": str(source),
+            "source_sha256": _sha256_file(source),
+            "source_method": MPVE_SOURCE_METHOD,
+            "source_config_fingerprint": spec.config(
+                MPVE_SOURCE_METHOD, seed
+            ).fingerprint,
+            "shared_state": "actor_critic_target_temperature_optimizers_rng",
+        }
+        if initialization != expected_lineage:
+            raise ValueError(
+                f"Existing MPVE run does not match its paired offline source: {run_dir}"
+            )
+    elif initialization is not None:
+        raise ValueError(f"Non-MPVE run unexpectedly has fork lineage: {run_dir}")
     latest = run_dir / "latest.pt"
     if metadata.get("completed") is True:
         expected_offline = config.offline_updates if config.uses_calql else 0
@@ -873,6 +899,14 @@ def _start_job(
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=True,
+            # Keep the root lock alive across the narrow Popen->status-write
+            # crash window.  If the runner dies, its active child retains the
+            # lock until that child (and any inherited vector workers) exits.
+            pass_fds=(
+                (_ACTIVE_MATRIX_LOCK_FD,)
+                if _ACTIVE_MATRIX_LOCK_FD is not None
+                else ()
+            ),
         )
     except BaseException:
         handle.close()
@@ -1135,14 +1169,51 @@ def _run_serial_result_jobs(
             raise RuntimeError(f"{job.job_id}: {error}")
 
 
-def run_matrix(
+@contextmanager
+def _exclusive_matrix_lock(root: Path):
+    """Hold one process-wide advisory lock for the complete matrix invocation."""
+
+    global _ACTIVE_MATRIX_LOCK_FD
+    if _ACTIVE_MATRIX_LOCK_FD is not None:
+        raise RuntimeError("This process already holds a matrix lock")
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".matrix.lock"
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"Another matrix runner holds the lock for {root}"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(
+            json.dumps(
+                {"runner_pid": os.getpid(), "acquired_utc": _utc_now()},
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+        _ACTIVE_MATRIX_LOCK_FD = handle.fileno()
+        yield
+    finally:
+        _ACTIVE_MATRIX_LOCK_FD = None
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _run_matrix_locked(
     spec: MatrixSpec,
     *,
     dry_run: bool = False,
     popen_factory: PopenFactory = subprocess.Popen,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    spec = spec.resolved()
     dataset = _expected_dataset(spec)
     koopman = _expected_koopman(spec)
     identity = _identity_bundle(spec)
@@ -1216,6 +1287,23 @@ def run_matrix(
     )
     _write_status(status_path, status)
     return status
+
+
+def run_matrix(
+    spec: MatrixSpec,
+    *,
+    dry_run: bool = False,
+    popen_factory: PopenFactory = subprocess.Popen,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    spec = spec.resolved()
+    with _exclusive_matrix_lock(spec.root):
+        return _run_matrix_locked(
+            spec,
+            dry_run=dry_run,
+            popen_factory=popen_factory,
+            sleep_fn=sleep_fn,
+        )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

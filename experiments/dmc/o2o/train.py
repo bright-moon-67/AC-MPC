@@ -77,16 +77,26 @@ def _has_metric_row(path: Path, *, phase: str, offline_update: int, online_step:
     return matches == 1
 
 
+def _checkpoint_counter(payload: dict[str, Any], key: str) -> int:
+    """Return a strict non-negative checkpoint counter (bools are not ints here)."""
+
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"Checkpoint counter {key!r} must be an integer")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"Checkpoint counter {key!r} must be non-negative")
+    return result
+
+
 def _truncate_metrics_to_checkpoint(
     path: Path, checkpoint: dict[str, Any]
 ) -> None:
     """Atomically discard rows newer than the authoritative latest checkpoint."""
 
-    checkpoint_offline = int(checkpoint["offline_update"])
-    checkpoint_online = int(checkpoint["online_step"])
-    checkpoint_episodes = int(checkpoint["online_episode"])
-    if min(checkpoint_offline, checkpoint_online, checkpoint_episodes) < 0:
-        raise ValueError("Checkpoint counters must be non-negative")
+    checkpoint_offline = _checkpoint_counter(checkpoint, "offline_update")
+    checkpoint_online = _checkpoint_counter(checkpoint, "online_step")
+    checkpoint_episodes = _checkpoint_counter(checkpoint, "online_episode")
     if not path.is_file():
         if checkpoint_offline or checkpoint_online or checkpoint_episodes:
             raise ValueError("Resume checkpoint exists but metrics.jsonl is missing")
@@ -272,29 +282,32 @@ def _validate_resume(
         raise ValueError("Resume Koopman model differs")
     if payload.get("environment_protocol") != environment_protocol:
         raise ValueError("Resume DMC protocol differs")
+    _checkpoint_counter(payload, "offline_update")
+    _checkpoint_counter(payload, "online_step")
+    _checkpoint_counter(payload, "online_episode")
     initialization = payload.get("initialization")
     if config.uses_mpve and require_initialization:
         if not isinstance(initialization, dict):
             raise ValueError("MPVE resume is missing its offline-fork lineage")
-        expected = {
-            "kind": "acmpc_o2o_offline_fork_v1",
-            "source_method": "Cal-RLPD-AC-KMPC",
-            "shared_state": "actor_critic_target_temperature_optimizers_rng",
-        }
-        for key, value in expected.items():
-            if initialization.get(key) != value:
-                raise ValueError(f"MPVE offline-fork lineage field {key!r} differs")
-        source_sha = initialization.get("source_sha256")
-        source_fingerprint = initialization.get("source_config_fingerprint")
-        if not isinstance(source_sha, str) or len(source_sha) != 64:
-            raise ValueError("MPVE offline-fork source SHA256 is invalid")
-        if not isinstance(source_fingerprint, str) or len(source_fingerprint) != 64:
-            raise ValueError("MPVE offline-fork config fingerprint is invalid")
+        source_path = initialization.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError("MPVE offline-fork source path is invalid")
+        _source, current_identity = _validated_offline_fork_source(
+            Path(source_path),
+            target_config=config,
+            dataset=dataset,
+            koopman=koopman,
+            environment_protocol=environment_protocol,
+        )
+        if initialization != current_identity:
+            raise ValueError(
+                "MPVE offline-fork lineage no longer matches the immutable source"
+            )
     elif not config.uses_mpve and initialization is not None:
         raise ValueError("Non-MPVE resume unexpectedly contains fork lineage")
 
 
-def _load_offline_fork(
+def _validated_offline_fork_source(
     path: Path,
     *,
     target_config: O2OConfig,
@@ -302,8 +315,9 @@ def _load_offline_fork(
     koopman: FrozenKoopman,
     environment_protocol: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Load the exact pre-online AC-KMPC state for the MPVE ablation."""
+    """Validate and identify the exact pre-online AC-KMPC fork source."""
 
+    path = path.resolve()
     source = load_checkpoint(path)
     source_config = O2OConfig(**source.get("config", {}))
     if source_config.method != "Cal-RLPD-AC-KMPC":
@@ -326,20 +340,41 @@ def _load_offline_fork(
         raise ValueError("Offline fork DMC protocol differs")
     if (
         source.get("phase") != "offline"
-        or int(source.get("offline_update", -1)) != target_config.offline_updates
-        or int(source.get("online_step", -1)) != 0
-        or int(source.get("online_episode", -1)) != 0
+        or _checkpoint_counter(source, "offline_update")
+        != target_config.offline_updates
+        or _checkpoint_counter(source, "online_step") != 0
+        or _checkpoint_counter(source, "online_episode") != 0
+        or source.get("initialization") is not None
     ):
         raise ValueError("MPVE fork must be the completed pre-online checkpoint")
     identity = {
         "kind": "acmpc_o2o_offline_fork_v1",
-        "source_path": str(path.resolve()),
-        "source_sha256": file_sha256(path.resolve()),
+        "source_path": str(path),
+        "source_sha256": file_sha256(path),
         "source_method": source_config.method,
         "source_config_fingerprint": source_config.fingerprint,
         "shared_state": "actor_critic_target_temperature_optimizers_rng",
     }
     return source, identity
+
+
+def _load_offline_fork(
+    path: Path,
+    *,
+    target_config: O2OConfig,
+    dataset: OfflineDataset,
+    koopman: FrozenKoopman,
+    environment_protocol: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load the exact pre-online AC-KMPC state for the MPVE ablation."""
+
+    return _validated_offline_fork_source(
+        path,
+        target_config=target_config,
+        dataset=dataset,
+        koopman=koopman,
+        environment_protocol=environment_protocol,
+    )
 
 
 def _validate_offline_snapshot(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,37 @@ def _status(jobs: list[matrix.Job]) -> dict[str, Any]:
     }
 
 
+def _write_completed_run_metadata(
+    spec: matrix.MatrixSpec,
+    *,
+    method: str,
+    initialization: dict[str, Any] | None,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    dataset = matrix._expected_dataset(spec)
+    koopman = matrix._expected_koopman(spec)
+    config = spec.config(method, 11)
+    run_dir = spec.run_dir(11, method)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "latest.pt").write_bytes(b"synthetic latest identity")
+    metadata = {
+        "kind": matrix.RUN_KIND,
+        "config": config.to_dict(),
+        "config_fingerprint": config.fingerprint,
+        "dataset": dataset,
+        "koopman": koopman,
+        "initialization": initialization,
+        "completed": True,
+        "offline_updates_completed": (
+            config.offline_updates if config.uses_calql else 0
+        ),
+        "online_steps_completed": config.online_steps,
+    }
+    (run_dir / "run.json").write_text(
+        json.dumps(metadata, sort_keys=True), encoding="utf-8"
+    )
+    return run_dir, dataset, koopman
+
+
 def test_parse_seeds_and_plan_has_exact_mpve_fork(tmp_path: Path) -> None:
     assert matrix.parse_seeds("1, 2,3") == (1, 2, 3)
     with pytest.raises(Exception, match="duplicates"):
@@ -111,6 +143,145 @@ def test_dry_run_writes_atomic_audit_without_spawning(
     assert len(manifest["jobs"]) == 12
     assert status["state"] == "dry_run"
     assert {job["state"] for job in status["jobs"].values()} == {"planned"}
+
+
+def test_second_runner_on_flocked_root_fails_closed_without_spawning(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    spec.root.mkdir(parents=True, exist_ok=True)
+    spawned = False
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("a competing runner must not spawn a child")
+
+    with (spec.root / ".matrix.lock").open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with pytest.raises(RuntimeError, match="holds the lock"):
+                matrix.run_matrix(spec, popen_factory=forbidden)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    assert not spawned
+    assert not (spec.root / "matrix_manifest.json").exists()
+    assert not (spec.root / "matrix_status.json").exists()
+
+
+def test_existing_mpve_run_requires_exact_sibling_path_and_sha_and_non_mpve_has_none(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    source = spec.offline_source(11).resolve()
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"paired immutable offline checkpoint")
+    initialization = {
+        "kind": "acmpc_o2o_offline_fork_v1",
+        "source_path": str(source),
+        "source_sha256": matrix._sha256_file(source),
+        "source_method": matrix.MPVE_SOURCE_METHOD,
+        "source_config_fingerprint": spec.config(
+            matrix.MPVE_SOURCE_METHOD, 11
+        ).fingerprint,
+        "shared_state": "actor_critic_target_temperature_optimizers_rng",
+    }
+    run_dir, dataset, koopman = _write_completed_run_metadata(
+        spec,
+        method=matrix.MPVE_METHOD,
+        initialization=initialization,
+    )
+    assert (
+        matrix._check_run_identity(
+            spec,
+            seed=11,
+            method=matrix.MPVE_METHOD,
+            dataset=dataset,
+            koopman=koopman,
+        )
+        == "completed"
+    )
+
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    other_source = tmp_path / "other" / "offline.pt"
+    other_source.parent.mkdir(parents=True)
+    other_source.write_bytes(source.read_bytes())
+    metadata["initialization"]["source_path"] = str(other_source.resolve())
+    (run_dir / "run.json").write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="paired offline source"):
+        matrix._check_run_identity(
+            spec,
+            seed=11,
+            method=matrix.MPVE_METHOD,
+            dataset=dataset,
+            koopman=koopman,
+        )
+
+    metadata["initialization"]["source_path"] = str(source)
+    metadata["initialization"]["source_sha256"] = "0" * 64
+    (run_dir / "run.json").write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="paired offline source"):
+        matrix._check_run_identity(
+            spec,
+            seed=11,
+            method=matrix.MPVE_METHOD,
+            dataset=dataset,
+            koopman=koopman,
+        )
+
+    _non_mpve_dir, dataset, koopman = _write_completed_run_metadata(
+        spec,
+        method="RLPD-MLP",
+        initialization=initialization,
+    )
+    with pytest.raises(ValueError, match="Non-MPVE"):
+        matrix._check_run_identity(
+            spec,
+            seed=11,
+            method="RLPD-MLP",
+            dataset=dataset,
+            koopman=koopman,
+        )
+
+
+def test_child_receives_current_matrix_lock_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = _spec(tmp_path)
+    job = matrix.Job(
+        job_id="lock-inheritance",
+        stage="train",
+        argv=("fake", "train"),
+        log_path=tmp_path / "lock-inheritance.log",
+        output_paths=(),
+    )
+    status = _status([job])
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        pid = 301
+
+    def fake_popen(_argv: list[str], **kwargs: Any) -> FakeProcess:
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(matrix, "_assert_source_unchanged", lambda *_a, **_k: None)
+    with matrix._exclusive_matrix_lock(spec.root):
+        current_fd = matrix._ACTIVE_MATRIX_LOCK_FD
+        assert isinstance(current_fd, int)
+        active = matrix._start_job(
+            job,
+            spec=spec,
+            identity=_identity(),
+            status=status,
+            status_path=tmp_path / "status.json",
+            popen_factory=fake_popen,
+        )
+        try:
+            assert captured["pass_fds"] == (current_fd,)
+        finally:
+            active.log_handle.close()
 
 
 def test_mpve_starts_as_soon_as_offline_artifact_exists(
