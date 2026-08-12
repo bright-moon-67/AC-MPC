@@ -1201,10 +1201,12 @@ def _exclusive_matrix_lock(root: Path):
         yield
     finally:
         _ACTIVE_MATRIX_LOCK_FD = None
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
+        # Do not issue LOCK_UN here.  Active children inherit this exact open
+        # file description; explicitly unlocking it in the parent would also
+        # release their crash-window protection.  Closing only the parent's
+        # descriptor keeps the lock until the last inheriting child exits, and
+        # releases it immediately when no child exists.
+        handle.close()
 
 
 def _run_matrix_locked(

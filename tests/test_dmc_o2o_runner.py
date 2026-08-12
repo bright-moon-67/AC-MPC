@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -282,6 +284,37 @@ def test_child_receives_current_matrix_lock_fd(
             assert captured["pass_fds"] == (current_fd,)
         finally:
             active.log_handle.close()
+
+
+def test_inherited_lock_survives_parent_context_until_real_child_exits(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    child: subprocess.Popen[str] | None = None
+    contender = None
+    try:
+        with matrix._exclusive_matrix_lock(spec.root):
+            lock_fd = matrix._ACTIVE_MATRIX_LOCK_FD
+            assert isinstance(lock_fd, int)
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                pass_fds=(lock_fd,),
+                text=True,
+            )
+        contender = (spec.root / ".matrix.lock").open("a+", encoding="utf-8")
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        child.terminate()
+        child.wait(timeout=5)
+        fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        if contender is not None:
+            fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+            contender.close()
 
 
 def test_mpve_starts_as_soon_as_offline_artifact_exists(
