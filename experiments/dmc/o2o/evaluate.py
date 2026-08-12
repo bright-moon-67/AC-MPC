@@ -1,0 +1,350 @@
+"""Strict deterministic evaluation of an O2O ``latest`` or ``best`` checkpoint."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+import numpy as np
+import torch
+
+from experiments.dmc.o2o.checkpoint import load_checkpoint
+from experiments.dmc.o2o.config import O2OConfig
+from experiments.dmc.o2o.dataset import OfflineDataset
+from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
+from experiments.dmc.o2o.learner import O2OLearner
+from experiments.dmc.tasks.adapter import make_dmc_adapter
+
+
+RUN_KIND = "acmpc_dmc_o2o_run_v1"
+EVALUATION_KIND = "acmpc_dmc_o2o_checkpoint_evaluation_v1"
+CHECKPOINT_NAMES = ("latest", "best")
+EVALUATION_EPISODES = 10
+EVALUATION_SEED_BASE = 9_100_000
+
+
+@dataclass(frozen=True)
+class ValidatedRun:
+    run_dir: Path
+    checkpoint_name: str
+    checkpoint_path: Path
+    checkpoint_sha256: str
+    run_metadata: dict[str, Any]
+    checkpoint: dict[str, Any]
+    config: O2OConfig
+    dataset: OfflineDataset | None
+    dataset_path: Path
+    dataset_sha256: str
+    koopman: FrozenKoopman | None
+    koopman_path: Path
+    koopman_sha256: str
+
+
+def _read_mapping(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Required result file does not exist: {path}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return value
+
+
+def _require_mapping(parent: Mapping[str, Any], key: str) -> dict[str, Any]:
+    value = parent.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Identity field {key!r} must be a mapping")
+    return dict(value)
+
+
+def _resolve_saved_path(saved: Any, override: Path | None, *, field: str) -> Path:
+    if not isinstance(saved, str) or not saved:
+        raise ValueError(f"Saved {field} path is missing")
+    return (override if override is not None else Path(saved)).resolve()
+
+
+def _config_from_checkpoint(payload: Mapping[str, Any]) -> O2OConfig:
+    mapping = _require_mapping(payload, "config")
+    try:
+        config = O2OConfig(**mapping)
+    except TypeError as exc:
+        raise ValueError("Checkpoint contains an invalid O2O config") from exc
+    config.validate()
+    if payload.get("config_fingerprint") != config.fingerprint:
+        raise ValueError("Checkpoint config fingerprint is invalid")
+    return config
+
+
+def _validate_counter(payload: Mapping[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"Checkpoint field {key!r} must be an integer")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"Checkpoint field {key!r} must be non-negative")
+    return result
+
+
+def validate_run_identity(
+    run_dir: Path,
+    *,
+    checkpoint_name: str = "latest",
+    dataset_override: Path | None = None,
+    koopman_override: Path | None = None,
+    load_artifacts: bool = True,
+) -> ValidatedRun:
+    """Cross-check run, checkpoint, config, dataset, and Koopman identities."""
+
+    if checkpoint_name not in CHECKPOINT_NAMES:
+        raise ValueError(f"checkpoint_name must be one of {CHECKPOINT_NAMES}")
+    run_dir = run_dir.resolve()
+    run_metadata = _read_mapping(run_dir / "run.json")
+    if run_metadata.get("kind") != RUN_KIND:
+        raise ValueError("Unsupported O2O run metadata kind")
+    checkpoint_path = run_dir / f"{checkpoint_name}.pt"
+    checkpoint = load_checkpoint(checkpoint_path)
+    config = _config_from_checkpoint(checkpoint)
+    if run_metadata.get("config") != config.to_dict():
+        raise ValueError("Run and checkpoint configs differ")
+    if run_metadata.get("config_fingerprint") != config.fingerprint:
+        raise ValueError("Run config fingerprint is invalid")
+
+    checkpoint_dataset = _require_mapping(checkpoint, "dataset")
+    run_dataset = _require_mapping(run_metadata, "dataset")
+    if (
+        checkpoint_dataset.get("path") != run_dataset.get("path")
+        or checkpoint_dataset.get("sha256") != run_dataset.get("sha256")
+    ):
+        raise ValueError("Run and checkpoint dataset identities differ")
+    expected_dataset_sha = checkpoint_dataset.get("sha256")
+    if not isinstance(expected_dataset_sha, str) or len(expected_dataset_sha) != 64:
+        raise ValueError("Checkpoint dataset SHA256 is invalid")
+    dataset_path = _resolve_saved_path(
+        checkpoint_dataset.get("path"), dataset_override, field="dataset"
+    )
+
+    checkpoint_koopman = _require_mapping(checkpoint, "koopman")
+    run_koopman = _require_mapping(run_metadata, "koopman")
+    if checkpoint_koopman != run_koopman:
+        raise ValueError("Run and checkpoint Koopman identities differ")
+    expected_koopman_sha = checkpoint_koopman.get("sha256")
+    if not isinstance(expected_koopman_sha, str) or len(expected_koopman_sha) != 64:
+        raise ValueError("Checkpoint Koopman SHA256 is invalid")
+    koopman_path = _resolve_saved_path(
+        checkpoint_koopman.get("path"), koopman_override, field="Koopman"
+    )
+
+    protocol = _require_mapping(checkpoint, "environment_protocol")
+    if run_metadata.get("environment_protocol") != protocol:
+        raise ValueError("Run and checkpoint environment protocols differ")
+    if protocol.get("task") != config.task:
+        raise ValueError("Saved environment protocol task differs from config")
+    if checkpoint.get("phase") not in {"offline", "online"}:
+        raise ValueError("Checkpoint phase is invalid")
+    _validate_counter(checkpoint, "offline_update")
+    _validate_counter(checkpoint, "online_step")
+    _validate_counter(checkpoint, "online_episode")
+    if not isinstance(checkpoint.get("learner"), Mapping):
+        raise ValueError("Checkpoint is missing learner state")
+
+    dataset: OfflineDataset | None = None
+    koopman: FrozenKoopman | None = None
+    if load_artifacts:
+        dataset = OfflineDataset.load(dataset_path)
+        if dataset.sha256 != expected_dataset_sha:
+            raise ValueError("Offline dataset SHA256 differs from checkpoint")
+        if checkpoint_dataset.get("metadata") != dataset.metadata:
+            raise ValueError("Offline dataset metadata differs from checkpoint")
+        koopman = FrozenKoopman(koopman_path)
+        if koopman.sha256 != expected_koopman_sha:
+            raise ValueError("Koopman SHA256 differs from checkpoint")
+        actual_koopman = koopman.identity()
+        for key in (
+            "sha256",
+            "architecture",
+            "best_validation_rollout_normalized_mse",
+        ):
+            if checkpoint_koopman.get(key) != actual_koopman.get(key):
+                raise ValueError(f"Koopman identity field {key!r} differs")
+        if (koopman.state_dim, koopman.action_dim) != (5, 1):
+            raise ValueError("Cartpole O2O evaluation requires Koopman dimensions 5/1")
+    else:
+        if not dataset_path.is_file() or file_sha256(dataset_path) != expected_dataset_sha:
+            raise ValueError("Offline dataset SHA256 differs from checkpoint")
+        if not koopman_path.is_file() or file_sha256(koopman_path) != expected_koopman_sha:
+            raise ValueError("Koopman SHA256 differs from checkpoint")
+
+    return ValidatedRun(
+        run_dir=run_dir,
+        checkpoint_name=checkpoint_name,
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=file_sha256(checkpoint_path),
+        run_metadata=run_metadata,
+        checkpoint=checkpoint,
+        config=config,
+        dataset=dataset,
+        dataset_path=dataset_path,
+        dataset_sha256=expected_dataset_sha,
+        koopman=koopman,
+        koopman_path=koopman_path,
+        koopman_sha256=expected_koopman_sha,
+    )
+
+
+def _device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA evaluation requested but CUDA is unavailable")
+    return torch.device(name)
+
+
+@torch.no_grad()
+def evaluate_checkpoint(
+    run_dir: Path,
+    *,
+    checkpoint_name: str = "latest",
+    dataset_override: Path | None = None,
+    koopman_override: Path | None = None,
+    device_name: str = "cpu",
+) -> dict[str, Any]:
+    """Evaluate exactly ten deterministic episodes under fixed reset seeds."""
+
+    validated = validate_run_identity(
+        run_dir,
+        checkpoint_name=checkpoint_name,
+        dataset_override=dataset_override,
+        koopman_override=koopman_override,
+        load_artifacts=True,
+    )
+    assert validated.koopman is not None
+    device = _device(device_name)
+    learner = O2OLearner(validated.config, validated.koopman, device)
+    # CUDA Philox and CPU MT19937 generator states are intentionally not
+    # interchangeable.  Evaluation is deterministic and consumes no sampling
+    # noise, so load all learned/optimizer state while skipping only that
+    # device-specific training RNG state.
+    learner.load_state_dict(
+        validated.checkpoint["learner"], restore_sampling_rng=False
+    )
+
+    expected_protocol = validated.checkpoint["environment_protocol"]
+    returns: list[float] = []
+    lengths: list[int] = []
+    for index in range(EVALUATION_EPISODES):
+        reset_seed = EVALUATION_SEED_BASE + index
+        env = make_dmc_adapter(validated.config.task, seed=reset_seed)
+        try:
+            runtime_protocol = env.protocol_metadata()
+            if runtime_protocol != expected_protocol:
+                raise ValueError("Live DMC protocol differs from checkpoint")
+            observation = env.reset(seed=reset_seed)
+            episode_return = 0.0
+            finished = False
+            for step in range(int(env.step_limit)):
+                action = np.asarray(
+                    learner.act(observation, deterministic=True)[0],
+                    dtype=np.float32,
+                )
+                if action.shape != (1,) or not np.isfinite(action).all():
+                    raise RuntimeError("Policy emitted an invalid Cartpole action")
+                observation, reward, done, _info = env.step(action)
+                if not math.isfinite(float(reward)):
+                    raise RuntimeError("DMC emitted a non-finite reward")
+                episode_return += float(reward)
+                if done:
+                    lengths.append(step + 1)
+                    finished = True
+                    break
+            if not finished:
+                raise RuntimeError("DMC episode did not finish at its saved step limit")
+            returns.append(episode_return)
+        finally:
+            env.close()
+
+    values = np.asarray(returns, dtype=np.float64)
+    result = {
+        "kind": EVALUATION_KIND,
+        "task": validated.config.task,
+        "method": validated.config.method,
+        "training_seed": validated.config.seed,
+        "checkpoint_name": checkpoint_name,
+        "checkpoint_path": str(validated.checkpoint_path),
+        "checkpoint_sha256": validated.checkpoint_sha256,
+        "checkpoint_phase": validated.checkpoint["phase"],
+        "offline_update": int(validated.checkpoint["offline_update"]),
+        "online_step": int(validated.checkpoint["online_step"]),
+        "config_fingerprint": validated.config.fingerprint,
+        "dataset": {
+            "path": str(validated.dataset_path),
+            "sha256": validated.dataset_sha256,
+        },
+        "koopman": {
+            "path": str(validated.koopman_path),
+            "sha256": validated.koopman_sha256,
+        },
+        "environment_protocol": expected_protocol,
+        "evaluation_protocol": {
+            "deterministic": True,
+            "episodes": EVALUATION_EPISODES,
+            "seed_base": EVALUATION_SEED_BASE,
+            "episode_seeds": list(
+                range(EVALUATION_SEED_BASE, EVALUATION_SEED_BASE + EVALUATION_EPISODES)
+            ),
+            "device": str(device),
+        },
+        "returns": returns,
+        "return_mean": float(values.mean()),
+        "return_std_population": float(values.std(ddof=0)),
+        "return_min": float(values.min()),
+        "return_max": float(values.max()),
+        "return_median": float(np.median(values)),
+        "episode_lengths": lengths,
+        "episode_length_mean": float(np.mean(lengths)),
+    }
+    return result
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(dict(value), handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint", choices=CHECKPOINT_NAMES, default="latest")
+    parser.add_argument("--dataset", type=Path)
+    parser.add_argument("--koopman", type=Path)
+    parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    result = evaluate_checkpoint(
+        args.run_dir,
+        checkpoint_name=args.checkpoint,
+        dataset_override=args.dataset,
+        koopman_override=args.koopman,
+        device_name=args.device,
+    )
+    output = args.output or (
+        args.run_dir / f"evaluation_{args.checkpoint}_{EVALUATION_EPISODES}.json"
+    )
+    _atomic_json(output, result)
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+
+
+if __name__ == "__main__":
+    main()

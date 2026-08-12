@@ -1,0 +1,914 @@
+"""Train SAC/RLPD/Cal-RLPD and AC-KMPC offline-to-online on DMC."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import random
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from experiments.dmc.o2o.checkpoint import (
+    CHECKPOINT_KIND,
+    atomic_torch_save,
+    load_checkpoint,
+    restore_rng,
+    rng_state,
+)
+from experiments.dmc.o2o.config import METHODS, O2OConfig
+from experiments.dmc.o2o.dataset import (
+    OfflineDataset,
+    OnlineReplay,
+    mark_offline,
+    mixed_batch,
+)
+from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
+from experiments.dmc.o2o.learner import O2OLearner, TensorBatch
+from experiments.dmc.tasks.adapter import make_dmc_adapter
+from experiments.dmc.ppo.vector_env import make_dmc_vector_env
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _has_metric_row(path: Path, *, phase: str, offline_update: int, online_step: int) -> bool:
+    if not path.is_file():
+        return False
+    matches = 0
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in metrics.jsonl line {line_number}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"metrics.jsonl line {line_number} is not an object")
+        if (
+            row.get("phase") == phase
+            and row.get("offline_update") == offline_update
+            and row.get("online_step") == online_step
+        ):
+            matches += 1
+    if matches > 1:
+        raise ValueError(
+            f"metrics.jsonl repeats {phase!r} at offline={offline_update}, online={online_step}"
+        )
+    return matches == 1
+
+
+def _truncate_metrics_to_checkpoint(
+    path: Path, checkpoint: dict[str, Any]
+) -> None:
+    """Atomically discard rows newer than the authoritative latest checkpoint."""
+
+    checkpoint_offline = int(checkpoint["offline_update"])
+    checkpoint_online = int(checkpoint["online_step"])
+    checkpoint_episodes = int(checkpoint["online_episode"])
+    if min(checkpoint_offline, checkpoint_online, checkpoint_episodes) < 0:
+        raise ValueError("Checkpoint counters must be non-negative")
+    if not path.is_file():
+        if checkpoint_offline or checkpoint_online or checkpoint_episodes:
+            raise ValueError("Resume checkpoint exists but metrics.jsonl is missing")
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    retained: list[dict[str, Any]] = []
+    online_episode_steps: set[int] = set()
+    retained_episode_ids: set[int] = set()
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            # A killed writer can leave only the final line incomplete.
+            if line_number == len(lines):
+                break
+            raise ValueError(
+                f"metrics.jsonl line {line_number} is invalid JSON"
+            ) from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"metrics.jsonl line {line_number} is not an object")
+        offline_update = row.get("offline_update")
+        online_step = row.get("online_step")
+        if (
+            isinstance(offline_update, bool)
+            or not isinstance(offline_update, int)
+            or offline_update < 0
+            or isinstance(online_step, bool)
+            or not isinstance(online_step, int)
+            or online_step < 0
+        ):
+            raise ValueError(
+                f"metrics.jsonl line {line_number} has invalid counters"
+            )
+        if offline_update > checkpoint_offline or online_step > checkpoint_online:
+            continue
+        if row.get("phase") == "online_episode":
+            episode = row.get("episode")
+            if isinstance(episode, bool) or not isinstance(episode, int) or episode < 0:
+                raise ValueError(
+                    f"metrics.jsonl line {line_number} has an invalid episode"
+                )
+            if episode >= checkpoint_episodes:
+                continue
+            if episode in retained_episode_ids:
+                raise ValueError("metrics.jsonl repeats an online episode id")
+            if online_step in online_episode_steps:
+                raise ValueError("online episode metric rows repeat online_step")
+            retained_episode_ids.add(episode)
+            online_episode_steps.add(online_step)
+        retained.append(row)
+    if checkpoint_episodes and retained_episode_ids != set(range(checkpoint_episodes)):
+        raise ValueError("metrics.jsonl does not contain every checkpointed episode")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in retained:
+            handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _seed_everything(seed: int) -> np.random.Generator:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return np.random.default_rng(seed + 17)
+
+
+@torch.no_grad()
+def evaluate(
+    learner: O2OLearner,
+    *,
+    episodes: int,
+    seed_base: int,
+) -> dict[str, Any]:
+    if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes < 1:
+        raise ValueError("Evaluation episodes must be a positive integer")
+    # Keep the ten canonical reset seeds and all 10,000 environment steps, but
+    # evaluate the policy as one batch.  This matters for AC-KMPC: ten scalar
+    # GPU planner calls per control step are pure launch overhead.  A single
+    # in-process vector worker avoids process-spawn cost at every 5k checkpoint.
+    env = make_dmc_vector_env(
+        "cartpole_swingup", episodes, seed=seed_base, workers=1
+    )
+    try:
+        observation = env.reset()
+        totals = np.zeros(episodes, dtype=np.float64)
+        lengths = np.zeros(episodes, dtype=np.int64)
+        completed = np.zeros(episodes, dtype=np.bool_)
+        step_limit = int(env.protocol["step_limit"])
+        for _step in range(step_limit):
+            action = learner.act(observation, deterministic=True)
+            vector_step = env.step(action)
+            totals += np.asarray(vector_step.reward, dtype=np.float64)
+            lengths += ~completed
+            boundary = np.asarray(vector_step.reset_boundary, dtype=np.bool_)
+            if bool(boundary.any()) != bool(boundary.all()):
+                raise RuntimeError("Canonical evaluation episodes lost synchronization")
+            completed |= boundary
+            observation = vector_step.observation
+            if completed.all():
+                break
+        if not completed.all() or np.any(lengths != step_limit):
+            raise RuntimeError("Canonical Cartpole evaluation did not end synchronously")
+        returns = totals.tolist()
+    finally:
+        env.close()
+    return {
+        "return_mean": float(np.mean(returns)),
+        "return_std_population": float(np.std(returns)),
+        "return_min": float(np.min(returns)),
+        "return_max": float(np.max(returns)),
+        "episode_length_mean": float(np.mean(lengths)),
+        "returns": returns,
+    }
+
+
+def _checkpoint_payload(
+    *,
+    config: O2OConfig,
+    dataset: OfflineDataset,
+    koopman: FrozenKoopman,
+    learner: O2OLearner,
+    replay: OnlineReplay,
+    generator: np.random.Generator,
+    phase: str,
+    offline_update: int,
+    online_step: int,
+    online_episode: int,
+    environment_protocol: dict[str, Any],
+    best_return: float,
+    best_online_step: int,
+    initialization: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "kind": CHECKPOINT_KIND,
+        "config": config.to_dict(),
+        "config_fingerprint": config.fingerprint,
+        "dataset": {
+            "path": str(dataset.path),
+            "sha256": dataset.sha256,
+            "metadata": dataset.metadata,
+        },
+        "koopman": koopman.identity(),
+        "environment_protocol": environment_protocol,
+        "phase": phase,
+        "offline_update": offline_update,
+        "online_step": online_step,
+        "online_episode": online_episode,
+        "best_return": best_return,
+        "best_online_step": best_online_step,
+        "initialization": initialization,
+        "learner": learner.state_dict(),
+        "online_replay": replay.state_dict(),
+        "rng": rng_state(generator),
+        "saved_unix_seconds": time.time(),
+    }
+
+
+def _validate_resume(
+    payload: dict[str, Any],
+    config: O2OConfig,
+    dataset: OfflineDataset,
+    koopman: FrozenKoopman,
+    environment_protocol: dict[str, Any],
+    *,
+    require_initialization: bool = True,
+) -> None:
+    if payload.get("config_fingerprint") != config.fingerprint:
+        raise ValueError("Resume config fingerprint differs")
+    if payload.get("dataset", {}).get("sha256") != dataset.sha256:
+        raise ValueError("Resume offline dataset differs")
+    if payload.get("koopman", {}).get("sha256") != koopman.sha256:
+        raise ValueError("Resume Koopman model differs")
+    if payload.get("environment_protocol") != environment_protocol:
+        raise ValueError("Resume DMC protocol differs")
+    initialization = payload.get("initialization")
+    if config.uses_mpve and require_initialization:
+        if not isinstance(initialization, dict):
+            raise ValueError("MPVE resume is missing its offline-fork lineage")
+        expected = {
+            "kind": "acmpc_o2o_offline_fork_v1",
+            "source_method": "Cal-RLPD-AC-KMPC",
+            "shared_state": "actor_critic_target_temperature_optimizers_rng",
+        }
+        for key, value in expected.items():
+            if initialization.get(key) != value:
+                raise ValueError(f"MPVE offline-fork lineage field {key!r} differs")
+        source_sha = initialization.get("source_sha256")
+        source_fingerprint = initialization.get("source_config_fingerprint")
+        if not isinstance(source_sha, str) or len(source_sha) != 64:
+            raise ValueError("MPVE offline-fork source SHA256 is invalid")
+        if not isinstance(source_fingerprint, str) or len(source_fingerprint) != 64:
+            raise ValueError("MPVE offline-fork config fingerprint is invalid")
+    elif not config.uses_mpve and initialization is not None:
+        raise ValueError("Non-MPVE resume unexpectedly contains fork lineage")
+
+
+def _load_offline_fork(
+    path: Path,
+    *,
+    target_config: O2OConfig,
+    dataset: OfflineDataset,
+    koopman: FrozenKoopman,
+    environment_protocol: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load the exact pre-online AC-KMPC state for the MPVE ablation."""
+
+    source = load_checkpoint(path)
+    source_config = O2OConfig(**source.get("config", {}))
+    if source_config.method != "Cal-RLPD-AC-KMPC":
+        raise ValueError("MPVE must fork a Cal-RLPD-AC-KMPC offline checkpoint")
+    if target_config.method != "Cal-RLPD-AC-KMPC-MPVE":
+        raise ValueError("Offline checkpoint forking is reserved for the MPVE ablation")
+    source_fields = source_config.to_dict()
+    target_fields = target_config.to_dict()
+    source_fields.pop("method")
+    target_fields.pop("method")
+    if source_fields != target_fields:
+        raise ValueError("MPVE fork config differs from the AC-KMPC source")
+    if source.get("config_fingerprint") != source_config.fingerprint:
+        raise ValueError("Offline fork source config fingerprint is invalid")
+    if source.get("dataset", {}).get("sha256") != dataset.sha256:
+        raise ValueError("Offline fork dataset differs")
+    if source.get("koopman", {}).get("sha256") != koopman.sha256:
+        raise ValueError("Offline fork Koopman model differs")
+    if source.get("environment_protocol") != environment_protocol:
+        raise ValueError("Offline fork DMC protocol differs")
+    if (
+        source.get("phase") != "offline"
+        or int(source.get("offline_update", -1)) != target_config.offline_updates
+        or int(source.get("online_step", -1)) != 0
+        or int(source.get("online_episode", -1)) != 0
+    ):
+        raise ValueError("MPVE fork must be the completed pre-online checkpoint")
+    identity = {
+        "kind": "acmpc_o2o_offline_fork_v1",
+        "source_path": str(path.resolve()),
+        "source_sha256": file_sha256(path.resolve()),
+        "source_method": source_config.method,
+        "source_config_fingerprint": source_config.fingerprint,
+        "shared_state": "actor_critic_target_temperature_optimizers_rng",
+    }
+    return source, identity
+
+
+def _validate_offline_snapshot(
+    path: Path,
+    *,
+    config: O2OConfig,
+    dataset: OfflineDataset,
+    koopman: FrozenKoopman,
+    environment_protocol: dict[str, Any],
+) -> None:
+    payload = load_checkpoint(path)
+    _validate_resume(
+        payload,
+        config,
+        dataset,
+        koopman,
+        environment_protocol,
+        require_initialization=False,
+    )
+    expected = {
+        "phase": "offline",
+        "offline_update": config.offline_updates,
+        "online_step": 0,
+        "online_episode": 0,
+        "initialization": None,
+    }
+    mismatches = {
+        key: {"actual": payload.get(key), "expected": value}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"AC-KMPC offline snapshot is not pre-online: {mismatches}")
+
+
+def run(
+    config: O2OConfig,
+    dataset_path: Path,
+    koopman_path: Path,
+    output: Path,
+    *,
+    initialize_from_offline: Path | None = None,
+) -> None:
+    config.validate()
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    metrics_path = output / "metrics.jsonl"
+    dataset = OfflineDataset.load(dataset_path)
+    if config.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but no CUDA device is available")
+    device = torch.device(config.device)
+    generator = _seed_everything(config.seed)
+    koopman = FrozenKoopman(koopman_path)
+    if (koopman.state_dim, koopman.action_dim) != (5, 1):
+        raise ValueError("Cartpole O2O requires Koopman state/action dimensions 5/1")
+    learner = O2OLearner(config, koopman, device)
+    replay = OnlineReplay(config.replay_capacity)
+    protocol_env = make_dmc_adapter(config.task, seed=config.seed)
+    environment_protocol = protocol_env.protocol_metadata()
+    protocol_env.close()
+
+    offline_update = 0
+    online_step = 0
+    online_episode = 0
+    best_return = float("-inf")
+    best_online_step = -1
+    latest_path = output / "latest.pt"
+    resumed = latest_path.is_file()
+    if resumed and initialize_from_offline is not None:
+        raise ValueError("Cannot combine --initialize-from-offline with resume")
+    if config.uses_mpve and not resumed and initialize_from_offline is None:
+        raise ValueError(
+            "AC-KMPC-MPVE requires --initialize-from-offline from the paired "
+            "Cal-RLPD-AC-KMPC offline.pt"
+        )
+    if not config.uses_mpve and initialize_from_offline is not None:
+        raise ValueError("--initialize-from-offline is only valid for AC-KMPC-MPVE")
+    initialization: dict[str, Any] | None = None
+    if resumed:
+        payload = load_checkpoint(latest_path)
+        _validate_resume(payload, config, dataset, koopman, environment_protocol)
+        learner.load_state_dict(payload["learner"])
+        replay.load_state_dict(payload["online_replay"])
+        restore_rng(payload["rng"], generator)
+        offline_update = int(payload["offline_update"])
+        online_step = int(payload["online_step"])
+        online_episode = int(payload["online_episode"])
+        best_return = float(payload["best_return"])
+        best_online_step = int(payload["best_online_step"])
+        initialization = payload.get("initialization")
+        _truncate_metrics_to_checkpoint(metrics_path, payload)
+    elif initialize_from_offline is not None:
+        payload, initialization = _load_offline_fork(
+            initialize_from_offline,
+            target_config=config,
+            dataset=dataset,
+            koopman=koopman,
+            environment_protocol=environment_protocol,
+        )
+        learner.load_state_dict(payload["learner"])
+        restore_rng(payload["rng"], generator)
+        offline_update = int(payload["offline_update"])
+
+    run_metadata = {
+        "kind": "acmpc_dmc_o2o_run_v1",
+        "config": config.to_dict(),
+        "config_fingerprint": config.fingerprint,
+        "dataset": {"path": str(dataset.path), "sha256": dataset.sha256},
+        "koopman": koopman.identity(),
+        "environment_protocol": environment_protocol,
+        "device": str(device),
+        "started_unix_seconds": time.time(),
+        "resumed": resumed,
+        "algorithm_label": "Cal-QL/RLPD-style core; not an official implementation",
+        "calibration_reference": "finite_horizon_discounted_episode_return_v1",
+        "online_collection": {
+            "runner": "ProcessDMCVectorEnv",
+            "num_envs": config.num_envs,
+            "env_workers": config.env_workers,
+            "online_step_counter": "total_real_environment_transitions",
+            "interaction_order": "batched_actor_then_batched_env_step",
+            "learner_updates": "one_fused_UTD_update_per_real_transition",
+            "latest_checkpoint": "synchronized_all_env_reset_boundary_only",
+        },
+        "initialization": initialization,
+        "mpve": {
+            "enabled": config.uses_mpve,
+            "scope": "online_only",
+            "updates_per_real_environment_step": 1 if config.uses_mpve else 0,
+            "total_td_horizon": config.mpve_total_horizon if config.uses_mpve else None,
+            "composition": "one_real_plus_nine_model" if config.uses_mpve else None,
+        },
+    }
+    _atomic_json(output / "run.json", run_metadata)
+
+    # A checkpoint is always written after a metrics flush.  Avoid duplicating
+    # the same step-zero evaluation when a detached run resumes.
+    if not resumed:
+        initial_eval = evaluate(
+            learner, episodes=config.eval_episodes, seed_base=9_100_000
+        )
+        _append_jsonl(
+            metrics_path,
+            {
+                "phase": (
+                    "offline_evaluation"
+                    if initialization is not None
+                    else "initial"
+                ),
+                "offline_update": offline_update,
+                "online_step": online_step,
+                **initial_eval,
+            },
+        )
+        # Establish a recoverable zero-step boundary before the first expensive
+        # update.  A host/SSH failure during the first checkpoint interval can
+        # then restart without leaving an ambiguous run.json-only directory.
+        atomic_torch_save(
+            latest_path,
+            _checkpoint_payload(
+                config=config,
+                dataset=dataset,
+                koopman=koopman,
+                learner=learner,
+                replay=replay,
+                generator=generator,
+                phase=("offline" if config.uses_offline_pretraining else "online"),
+                offline_update=offline_update,
+                online_step=online_step,
+                online_episode=online_episode,
+                environment_protocol=environment_protocol,
+                best_return=best_return,
+                best_online_step=best_online_step,
+                initialization=initialization,
+            ),
+        )
+
+    started = time.time()
+    if config.requires_own_offline_pretraining:
+        while offline_update < config.offline_updates:
+            batch_np = mark_offline(dataset.sample(config.batch_size, generator))
+            metrics = learner.update(
+                TensorBatch.from_numpy(batch_np, device),
+                utd=1,
+                phase="offline",
+            )
+            offline_update += 1
+            if offline_update % config.log_interval_updates == 0:
+                row = {
+                    "phase": "offline",
+                    "offline_update": offline_update,
+                    "online_step": 0,
+                    "elapsed_seconds": time.time() - started,
+                    **metrics,
+                }
+                _append_jsonl(metrics_path, row)
+                print(
+                    f"method={config.method} offline={offline_update}/{config.offline_updates} "
+                    f"q={metrics['q_mean']:.3f} loss={metrics['critic_loss']:.4g}",
+                    flush=True,
+                )
+            if offline_update % config.checkpoint_interval_updates == 0:
+                atomic_torch_save(
+                    latest_path,
+                    _checkpoint_payload(
+                        config=config,
+                        dataset=dataset,
+                        koopman=koopman,
+                        learner=learner,
+                        replay=replay,
+                        generator=generator,
+                        phase="offline",
+                        offline_update=offline_update,
+                        online_step=0,
+                        online_episode=0,
+                        environment_protocol=environment_protocol,
+                        best_return=best_return,
+                        best_online_step=best_online_step,
+                        initialization=initialization,
+                    ),
+                )
+        # The configured budget need not be a multiple of the periodic
+        # checkpoint interval.  Make the completed offline learner/RNG state
+        # authoritative before evaluating or exposing the fork artifact.
+        if online_step == 0:
+            atomic_torch_save(
+                latest_path,
+                _checkpoint_payload(
+                    config=config,
+                    dataset=dataset,
+                    koopman=koopman,
+                    learner=learner,
+                    replay=replay,
+                    generator=generator,
+                    phase="offline",
+                    offline_update=offline_update,
+                    online_step=0,
+                    online_episode=0,
+                    environment_protocol=environment_protocol,
+                    best_return=best_return,
+                    best_online_step=best_online_step,
+                    initialization=initialization,
+                ),
+            )
+        has_offline_evaluation = _has_metric_row(
+            metrics_path,
+            phase="offline_evaluation",
+            offline_update=config.offline_updates,
+            online_step=0,
+        )
+        if not has_offline_evaluation:
+            if online_step != 0:
+                raise ValueError(
+                    "Cannot reconstruct a missing offline evaluation after online updates"
+                )
+            offline_eval = evaluate(
+                learner, episodes=config.eval_episodes, seed_base=9_100_000
+            )
+            _append_jsonl(
+                metrics_path,
+                {
+                    "phase": "offline_evaluation",
+                    "offline_update": offline_update,
+                    "online_step": 0,
+                    **offline_eval,
+                },
+            )
+        if config.method == "Cal-RLPD-AC-KMPC":
+            # Preserve the exact common state before either structured online
+            # branch sees a real transition.  MPVE forks this file.  Once
+            # online learning starts it is immutable: a resume must never
+            # replace it with a post-online learner state.
+            offline_path = output / "offline.pt"
+            if offline_path.is_file():
+                _validate_offline_snapshot(
+                    offline_path,
+                    config=config,
+                    dataset=dataset,
+                    koopman=koopman,
+                    environment_protocol=environment_protocol,
+                )
+            elif online_step == 0:
+                atomic_torch_save(
+                    offline_path,
+                    _checkpoint_payload(
+                        config=config,
+                        dataset=dataset,
+                        koopman=koopman,
+                        learner=learner,
+                        replay=replay,
+                        generator=generator,
+                        phase="offline",
+                        offline_update=offline_update,
+                        online_step=0,
+                        online_episode=0,
+                        environment_protocol=environment_protocol,
+                        best_return=best_return,
+                        best_online_step=best_online_step,
+                        initialization=initialization,
+                    ),
+                )
+            else:
+                raise ValueError(
+                    "Online AC-KMPC resume is missing its immutable offline.pt"
+                )
+
+    if online_step % config.num_envs:
+        raise ValueError("Resume online_step is not aligned to the vector width")
+    if online_episode % config.num_envs:
+        raise ValueError("Latest checkpoint is not at a synchronized reset boundary")
+    # A completed checkpoint needs no simulator reconstruction.  In
+    # particular, rerunning a finished detached command must be an idempotent
+    # no-op rather than creating a fresh vector environment and then failing
+    # the boundary assertion below.
+    if online_step == config.online_steps:
+        run_metadata.update(
+            completed=True,
+            offline_updates_completed=offline_update,
+            online_steps_completed=online_step,
+            best_return=best_return,
+            best_online_step=best_online_step,
+            wall_time_seconds=0.0,
+        )
+        _atomic_json(output / "run.json", run_metadata)
+        return
+    env = make_dmc_vector_env(
+        config.task,
+        config.num_envs,
+        seed=config.seed + 100_000 + online_episode,
+        workers=config.env_workers,
+    )
+    if env.protocol != environment_protocol:
+        env.close()
+        raise ValueError("Vector collector protocol differs from checkpoint protocol")
+    observations = env.reset()
+    episode_returns = np.zeros(config.num_envs, dtype=np.float64)
+    episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
+    latest_checkpoint_online_step = online_step
+    try:
+        while online_step < config.online_steps:
+            if config.online_steps - online_step < config.num_envs:
+                raise ValueError("Online budget ends inside a vector step")
+            random_warmup = (
+                not config.uses_offline_pretraining
+                and online_step < config.online_warmup_steps
+            )
+            if random_warmup:
+                actions = generator.uniform(
+                    -1.0,
+                    1.0,
+                    size=(config.num_envs, koopman.action_dim),
+                ).astype(np.float32)
+            else:
+                actions = learner.act(observations, deterministic=False)
+            actions = np.asarray(actions, dtype=np.float32)
+            if actions.shape != (config.num_envs, koopman.action_dim):
+                raise RuntimeError("Batched policy emitted an invalid action shape")
+            vector_step = env.step(actions)
+            episode_returns += np.asarray(vector_step.reward, dtype=np.float64)
+            episode_lengths += 1
+            reset_boundary = np.asarray(vector_step.reset_boundary, dtype=np.bool_)
+            if bool(reset_boundary.any()) != bool(reset_boundary.all()):
+                raise RuntimeError(
+                    "Cartpole vector environments lost synchronized episode boundaries"
+                )
+            completed_rows: list[dict[str, Any]] = []
+            for environment_index in range(config.num_envs):
+                replay.add(
+                    observations[environment_index],
+                    vector_step.applied_action[environment_index],
+                    float(vector_step.reward[environment_index]),
+                    float(vector_step.discount[environment_index]),
+                    vector_step.transition_observation[environment_index],
+                )
+                online_step += 1
+                ready = (
+                    config.uses_offline_pretraining
+                    or online_step >= config.online_warmup_steps
+                )
+                if ready:
+                    ratio = (
+                        config.offline_replay_ratio
+                        if config.uses_offline_replay_online
+                        else 0.0
+                    )
+                    batch_np = mixed_batch(
+                        dataset,
+                        replay,
+                        batch_size=config.batch_size,
+                        utd=config.online_utd,
+                        offline_ratio=ratio,
+                        generator=generator,
+                    )
+                    metrics = learner.update(
+                        TensorBatch.from_numpy(batch_np, device),
+                        utd=config.online_utd,
+                        phase="online",
+                    )
+                else:
+                    metrics = {}
+                if reset_boundary[environment_index]:
+                    completed_rows.append(
+                        {
+                            "phase": "online_episode",
+                            "offline_update": offline_update,
+                            # Processing one transition at a time gives each
+                            # completed environment a unique real-step count.
+                            "online_step": online_step,
+                            "episode": online_episode,
+                            "environment_index": environment_index,
+                            "environment_episode": online_episode // config.num_envs,
+                            "reset_seed": int(vector_step.reset_seed[environment_index]),
+                            "episode_return": float(
+                                episode_returns[environment_index]
+                            ),
+                            "episode_length": int(
+                                episode_lengths[environment_index]
+                            ),
+                            **metrics,
+                        }
+                    )
+                    online_episode += 1
+            observations = vector_step.observation
+            for row in completed_rows:
+                _append_jsonl(metrics_path, row)
+            at_reset_boundary = bool(reset_boundary.all())
+            if at_reset_boundary:
+                episode_returns.fill(0.0)
+                episode_lengths.fill(0)
+
+            should_evaluate = (
+                online_step == 1_000
+                or online_step % config.eval_interval_online_steps == 0
+                or online_step == config.online_steps
+            )
+            if should_evaluate:
+                evaluation = evaluate(
+                    learner, episodes=config.eval_episodes, seed_base=9_100_000
+                )
+                row = {
+                    "phase": "online_evaluation",
+                    "offline_update": offline_update,
+                    "online_step": online_step,
+                    "elapsed_seconds": time.time() - started,
+                    **evaluation,
+                }
+                _append_jsonl(metrics_path, row)
+                if evaluation["return_mean"] > best_return:
+                    best_return = evaluation["return_mean"]
+                    best_online_step = online_step
+                    atomic_torch_save(
+                        output / "best.pt",
+                        _checkpoint_payload(
+                            config=config,
+                            dataset=dataset,
+                            koopman=koopman,
+                            learner=learner,
+                            replay=replay,
+                            generator=generator,
+                            phase="online",
+                            offline_update=offline_update,
+                            online_step=online_step,
+                            online_episode=online_episode,
+                            environment_protocol=environment_protocol,
+                            best_return=best_return,
+                            best_online_step=best_online_step,
+                            initialization=initialization,
+                        ),
+                    )
+                print(
+                    f"method={config.method} online={online_step}/{config.online_steps} "
+                    f"eval={evaluation['return_mean']:.2f} best={best_return:.2f}",
+                    flush=True,
+                )
+
+            # Resume never depends on unsaved simulator state: only a point at
+            # which all five environments have autoreset is authoritative.
+            if at_reset_boundary:
+                atomic_torch_save(
+                    latest_path,
+                    _checkpoint_payload(
+                        config=config,
+                        dataset=dataset,
+                        koopman=koopman,
+                        learner=learner,
+                        replay=replay,
+                        generator=generator,
+                        phase="online",
+                        offline_update=offline_update,
+                        online_step=online_step,
+                        online_episode=online_episode,
+                        environment_protocol=environment_protocol,
+                        best_return=best_return,
+                        best_online_step=best_online_step,
+                        initialization=initialization,
+                    ),
+                )
+                latest_checkpoint_online_step = online_step
+    finally:
+        env.close()
+
+    if latest_checkpoint_online_step != online_step:
+        raise RuntimeError(
+            "Online training ended away from a checkpointable reset boundary"
+        )
+
+    run_metadata.update(
+        completed=True,
+        offline_updates_completed=offline_update,
+        online_steps_completed=online_step,
+        best_return=best_return,
+        best_online_step=best_online_step,
+        wall_time_seconds=time.time() - started,
+    )
+    _atomic_json(output / "run.json", run_metadata)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--method", choices=METHODS, required=True)
+    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--koopman", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--seed", type=int, default=20260821)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--offline-updates", type=int, default=500_000)
+    parser.add_argument("--online-steps", type=int, default=100_000)
+    parser.add_argument("--online-utd", type=int, default=20)
+    parser.add_argument("--num-envs", type=int, default=5)
+    parser.add_argument("--env-workers", type=int, default=5)
+    parser.add_argument("--cql-weight", type=float, default=0.01)
+    parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--initialize-from-offline", type=Path)
+    parser.add_argument("--smoke", action="store_true")
+    args = parser.parse_args()
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    # Cartpole only exposes a recoverable simulator boundary after its full
+    # 1000-step time limit.  A smoke run therefore uses exactly one episode
+    # per vector member rather than ending after an unrecoverable partial 10
+    # transitions.
+    smoke_online_steps = 1_000 * args.num_envs
+    config = O2OConfig(
+        method=args.method,
+        seed=args.seed,
+        device=args.device,
+        offline_updates=20 if args.smoke else args.offline_updates,
+        online_steps=smoke_online_steps if args.smoke else args.online_steps,
+        online_utd=2 if args.smoke else args.online_utd,
+        online_warmup_steps=smoke_online_steps if args.smoke else 5_000,
+        num_envs=args.num_envs,
+        env_workers=args.env_workers,
+        cql_weight=args.cql_weight,
+        eval_interval_online_steps=smoke_online_steps if args.smoke else 5_000,
+        eval_episodes=2 if args.smoke else args.eval_episodes,
+        checkpoint_interval_updates=10 if args.smoke else 10_000,
+        log_interval_updates=5 if args.smoke else 1_000,
+    )
+    run(
+        config,
+        args.dataset,
+        args.koopman,
+        args.output_dir,
+        initialize_from_offline=args.initialize_from_offline,
+    )
+
+
+if __name__ == "__main__":
+    main()
