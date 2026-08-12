@@ -1,0 +1,3 @@
+playground[cuda] @ git+https://github.com/google-deepmind/mujoco_playground.git@d5e6b47531328468da1eec33b8b304a00bb0873c
+dm-control==1.0.44
+pytest>=8

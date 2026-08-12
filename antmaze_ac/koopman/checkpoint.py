@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ def save_checkpoint(
     history: list[dict[str, Any]] | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     training_state: dict[str, Any] | None = None,
+    extra_payload: Mapping[str, Any] | None = None,
 ) -> None:
     payload = {
         "format_version": FORMAT_VERSION,
@@ -51,6 +53,16 @@ def save_checkpoint(
         "history": history if history is not None else [],
         "training_state": training_state,
     }
+    if extra_payload is not None:
+        if not isinstance(extra_payload, Mapping):
+            raise TypeError("extra_payload must be a mapping or None")
+        collisions = payload.keys() & extra_payload.keys()
+        if collisions:
+            raise ValueError(
+                "extra_payload cannot replace core checkpoint fields: "
+                f"{sorted(collisions)}"
+            )
+        payload.update(extra_payload)
     # A process interruption must never leave a partially written checkpoint
     # at a path that a resume script would trust.  Replace atomically after
     # torch has fully serialized the payload and flushed the temporary file.

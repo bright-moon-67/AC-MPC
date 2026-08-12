@@ -1,0 +1,124 @@
+schema_version: dmc_experiment_v2
+task: cartpole_swingup
+status: proposed_before_first_training
+protocol:
+  name: dmc_native_v1
+  control_timestep: native
+  action_repeat: 1
+  time_limit_seconds: 10.0
+  episode_steps: 1000
+  score: sum_official_reward
+seeds:
+  # The completed data-source PPO/Koopman lineage used 20260811.  Actor
+  # comparison starts from a disjoint but shared seed; benchmark retains the
+  # same three-seed set in comparison order.
+  train: [20260812, 20260811, 20260813]
+  evaluation: [20260901, 20260902, 20260903, 20260904, 20260905, 20260906, 20260907, 20260908, 20260909, 20260910]
+profiles:
+  development:
+    train_seed_count: 1
+    num_envs: 256
+    rollout_steps: 8
+    minibatch_size: 256
+    update_epochs: 2
+    # Formal Cartpole comparison budget: 4,882 complete 2,048-transition
+    # learner batches, the closest non-exceeding batch-aligned value to 10M.
+    total_timesteps: 9998336
+    learning_rate: 0.0003
+  benchmark:
+    train_seed_count: 3
+    num_envs: 256
+    rollout_steps: 8
+    minibatch_size: 256
+    update_epochs: 2
+    total_timesteps: 999424
+    learning_rate: 0.0003
+ppo:
+  anneal_learning_rate: false
+  discount: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  value_coefficient: 1.0
+  entropy_coefficient: 0.0003
+  initial_std: 1.0
+  max_grad_norm: 0.5
+  target_kl: null
+  checkpoint_interval_updates: 10
+  max_wall_time_seconds: null
+  critic_hidden_dim: 256
+  collect_flush_transitions: 50000
+  normalize_observation: true
+  normalize_advantage: true
+  normalize_value: true
+  normalization_ema_tau: 0.995
+  value_clip: false
+  value_clipping_epsilon: 0.2
+  max_abs_reward: null
+  adam_epsilon: 0.0000001
+  mpve_horizon: 10
+  mpve_value_loss_coefficient: 1.0
+  mpve_reward_source: dmc_official_observation_oracle_v1
+data:
+  source: ppo_training_stages
+  max_transitions_per_train_seed: 300000
+  collection_total_updates: 488
+  split: episode_interleaved_8_1_1
+koopman:
+  lift_dim: 10
+  k_step: 50
+  activation: silu
+  rollout_discount: 0.99
+  epochs: 500
+  batch_size: 2048
+  max_windows: 500000
+  learning_rate: 0.0003
+  weight_decay: 0.000001
+  gradient_clip: 1.0
+  hidden_dims: [256, 256]
+  reward_hidden_dims: [256, 256]
+  reward_loss_weight: 1.0
+  seed: 43
+  linear_weight: 10.0
+  rollout_weight: 1.0
+  stability_weight: 1.0
+  latent_std_weight: 0.1
+  identity_weight: 0.0001
+  controllability_svd_weight: 0.0
+  augmentation_weight: 0.0
+  reconstruction_weight: 1.0
+  svd_min_singular_value: 0.0
+  spectral_radius_limit: 0.95
+  stability_reference_dt: 0.04
+  target_latent_std: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 0.00000001
+  adam_amsgrad: false
+  checkpoint_every: 25
+  patience: 40
+actors:
+  types: [PPO, KLQR, AB-PQ, KMPC, AC-MPC-MPVE]
+  architecture:
+    hidden_dim: 128
+    ppo_hidden_dim: 256
+    ppo_hidden_layers: 3
+    ppo_activation: relu
+    ppo_distribution: tanh_squashed_state_dependent_gaussian
+    ab_rank: 4
+    kmpc_horizon: 20
+    kmpc_solver_iterations: 20
+    action_limit: 1.0
+evaluation:
+  deterministic: true
+  episodes_per_seed: 10
+  reference_episodes_per_seed: 1
+  diagnostic_every_steps: 50000
+  checkpoint: latest
+proposed_gates:
+  ppo_mean_return_min: 750.0
+  koopman_rollout_nmse_max: 0.25
+  koopman_vs_hold_rmse_ratio_max: 0.70
+  kmpc_to_ppo_return_ratio_min: 0.90
+  action_bound_fraction_max: 0.50
+  reward_model_rmse_max: 0.05
+  ac_mpc_mpve_to_kmpc_return_ratio_min: 1.00

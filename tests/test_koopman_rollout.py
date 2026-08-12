@@ -1,6 +1,7 @@
 import tempfile
 from pathlib import Path
 
+import pytest
 import torch
 
 from antmaze_ac.koopman.checkpoint import load_checkpoint, save_checkpoint
@@ -38,6 +39,37 @@ def test_shape_loss_rollout_backward_and_checkpoint():
         assert payload["epoch"] == 2
         for expected, actual in zip(model.parameters(), restored.parameters()):
             torch.testing.assert_close(expected, actual)
+
+
+def test_checkpoint_extra_payload_is_preserved_and_cannot_shadow_core_fields(
+    tmp_path: Path,
+):
+    model = DeepKoopman(3, 1, lift_dim=2, hidden_dims=(8,))
+    path = tmp_path / "extra.pt"
+    save_checkpoint(
+        path,
+        model,
+        epoch=1,
+        best_validation=0.2,
+        config={},
+        normalizers={},
+        elapsed_seconds=0.0,
+        extra_payload={"auxiliary_state": {"value": torch.tensor(3.0)}},
+    )
+    _, payload = load_checkpoint(path)
+    assert float(payload["auxiliary_state"]["value"]) == 3.0
+
+    with pytest.raises(ValueError, match="cannot replace core"):
+        save_checkpoint(
+            path,
+            model,
+            epoch=1,
+            best_validation=0.2,
+            config={},
+            normalizers={},
+            elapsed_seconds=0.0,
+            extra_payload={"epoch": 99},
+        )
 
 
 def test_full_a_reference_initialization_and_one_step_forward():

@@ -97,6 +97,10 @@ pytest -q
 
 当前本地测试覆盖 Koopman rollout、quadratic actor、PPO smoke、数据边界和控制器数值稳定性。
 
+## DMC benchmark 子项目
+
+`experiments/dmc/` 是独立的 DeepMind Control Suite 迁移线，按 Cartpole Swingup → Reacher Hard → Hopper Hop → Walker Run →（可选）Humanoid Run Pure State 推进；`experiments/playground/` 提供对应的 MuJoCo Playground/JAX GPU 实验线。协议、配置和运行说明见各子项目 README。大规模训练输出保存在被 Git 忽略的 `runs/`，不会因导入模块或运行测试而自动启动训练。
+
 ## License
 
 本仓库代码使用 MIT License。外部算法和数据集仍需遵守各自的许可证与使用条件。
