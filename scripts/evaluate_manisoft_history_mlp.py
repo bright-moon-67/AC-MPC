@@ -69,7 +69,6 @@ def main() -> None:
     target_tip = reference_state[np.asarray(TIP_INDICES)]
     runtime = policy_payload["runtime"]
     absolute_action_limit = float(runtime["absolute_action_limit"])
-    max_delta = float(runtime["max_delta"])
     state_stats = koopman_payload["normalizers"]["state"]
 
     output = Path(args.output).expanduser().resolve()
@@ -90,7 +89,6 @@ def main() -> None:
             history_steps=policy.history_steps,
             state_mean=state_stats["mean"],
             state_std=state_stats["std"],
-            max_delta=max_delta,
             tip_indices=TIP_INDICES,
         )
         observations: list[np.ndarray] = []

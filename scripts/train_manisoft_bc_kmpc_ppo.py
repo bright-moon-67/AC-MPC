@@ -55,7 +55,6 @@ def _make_env(
     waypoint_tips: np.ndarray,
     episode_steps: int,
     absolute_action_limit: float,
-    max_delta: float,
     history_steps: int,
     state_mean: np.ndarray,
     state_std: np.ndarray,
@@ -71,7 +70,6 @@ def _make_env(
         history_steps=history_steps,
         state_mean=state_mean,
         state_std=state_std,
-        max_delta=max_delta,
         tip_indices=TIP_INDICES,
     )
 
@@ -90,7 +88,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-steps", type=int, default=300)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--solver-iterations", type=int, default=20)
-    parser.add_argument("--max-delta", type=float, default=0.001)
     parser.add_argument("--absolute-action-limit", type=float, default=0.30)
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--rollout-steps", type=int, default=None)
@@ -99,6 +96,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update-epochs", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--actor-learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--log-std-init",
+        type=float,
+        default=None,
+        help="Override the policy exploration log_std (default uses the "
+        "BC-KMPC value, typically -3 for physical-action std ~= 0.05).",
+    )
     parser.add_argument("--target-kl", type=float, default=0.02)
     parser.add_argument("--checkpoint-interval-updates", type=int, default=None)
     parser.add_argument("--max-wall-time-hours", type=float, default=None)
@@ -145,7 +149,6 @@ def main() -> None:
         device,
         horizon=args.horizon,
         absolute_action_limit=args.absolute_action_limit,
-        max_delta=args.max_delta,
         solver_iterations=args.solver_iterations,
         waypoint_count=3,
     )
@@ -176,14 +179,19 @@ def main() -> None:
         bc_payload = torch.load(bc_path, map_location=device, weights_only=False)
         if bc_payload.get("method") != "bc_kmpc_bc":
             raise ValueError("--bc-checkpoint is not a BC-KMPC BC checkpoint")
+        if int(bc_payload.get("format_version", 0)) < 4:
+            raise ValueError(
+                "BC checkpoint predates absolute-action box FISTA and must be retrained"
+            )
         if bc_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
             raise ValueError("BC checkpoint references another Koopman model")
         for key, expected in (
             ("horizon", policy.actor.horizon),
             ("solver_iterations", policy.actor.solver_iterations),
-            ("max_delta", args.max_delta),
             ("absolute_action_limit", args.absolute_action_limit),
             ("waypoint_count", 3),
+            ("solver", "absolute_box_fista_v1"),
+            ("fixed_smoothness", False),
         ):
             actual = bc_payload["runtime"].get(key)
             if actual != expected:
@@ -201,6 +209,15 @@ def main() -> None:
             "checkpoint_sha256": sha256(bc_path),
             "best_validation_mse": float(bc_payload["best_validation_mse"]),
         }
+
+    if args.log_std_init is not None:
+        with torch.no_grad():
+            policy.log_std.fill_(float(args.log_std_init))
+        print(
+            f"Overriding policy log_std to {args.log_std_init} "
+            f"(sigma={float(np.exp(args.log_std_init)):.4f})",
+            flush=True,
+        )
 
     actor_parameters = list(policy.actor.parameters())
     auxiliary_parameters = [*policy.critic.parameters(), policy.log_std]
@@ -223,7 +240,6 @@ def main() -> None:
         "horizon": policy.actor.horizon,
         "solver_iterations": policy.actor.solver_iterations,
         "absolute_action_limit": args.absolute_action_limit,
-        "max_delta": args.max_delta,
         "observation_dim": policy.observation_dim,
         "history_steps": policy.history_steps,
         "waypoint_count": policy.waypoint_count,
@@ -235,10 +251,12 @@ def main() -> None:
         "actor_learning_rate": args.actor_learning_rate,
         "auxiliary_learning_rate": learning_rate,
         "target_kl": args.target_kl,
+        "solver": "absolute_box_fista_v1",
+        "fixed_smoothness": False,
     }
     metadata = {
         "method": "actor_critic_bc_kmpc",
-        "format_version": 2,
+        "format_version": 4,
         "koopman_checkpoint": str(koopman_path),
         "koopman_checkpoint_sha256": expected_koopman_sha,
         "waypoint_root": str(waypoint_root),
@@ -265,6 +283,10 @@ def main() -> None:
         )
         if resume_payload.get("method") != "actor_critic_bc_kmpc":
             raise ValueError("Resume checkpoint is not actor-critic BC-KMPC")
+        if int(resume_payload.get("format_version", 0)) < 4:
+            raise ValueError(
+                "Resume checkpoint predates absolute-action box FISTA and is incompatible"
+            )
         if resume_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
             raise ValueError("Resume checkpoint references another Koopman model")
         if (
@@ -303,7 +325,6 @@ def main() -> None:
             waypoint_tips=waypoint_tips,
             episode_steps=args.episode_steps,
             absolute_action_limit=args.absolute_action_limit,
-            max_delta=args.max_delta,
             history_steps=policy.history_steps,
             state_mean=np.asarray(state_stats["mean"], dtype=np.float32),
             state_std=np.asarray(state_stats["std"], dtype=np.float32),

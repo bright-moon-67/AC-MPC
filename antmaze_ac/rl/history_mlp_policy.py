@@ -6,9 +6,9 @@ from typing import NamedTuple
 
 import torch
 from torch import nn
+from torch.distributions import Normal
 
 from .critic import Critic
-from .history_koopman_mpc_policy import RateLimitedSquashedNormal
 
 
 def _activation(name: str) -> type[nn.Module]:
@@ -22,6 +22,66 @@ def _activation(name: str) -> type[nn.Module]:
         return choices[name.lower()]
     except KeyError as exc:
         raise ValueError(f"Unsupported MLP activation {name!r}") from exc
+
+
+class RateLimitedSquashedNormal:
+    """Gaussian transformed into the History-MLP baseline's action-rate box."""
+
+    def __init__(
+        self,
+        median: torch.Tensor,
+        previous_action: torch.Tensor,
+        action_low: torch.Tensor,
+        action_high: torch.Tensor,
+        max_delta: torch.Tensor,
+        log_std: torch.Tensor,
+        boundary_margin: float = 0.02,
+        inverse_epsilon: float = 1e-6,
+        straight_through_median: bool = False,
+    ) -> None:
+        lower = torch.maximum(action_low, previous_action - max_delta)
+        upper = torch.minimum(action_high, previous_action + max_delta)
+        self.center = 0.5 * (lower + upper)
+        self.half_width = (0.5 * (upper - lower)).clamp_min(inverse_epsilon)
+        unconstrained_median = (median - self.center) / self.half_width
+        hard_normalized_median = unconstrained_median.clamp(
+            -1.0 + boundary_margin,
+            1.0 - boundary_margin,
+        )
+        hard_location = torch.atanh(hard_normalized_median)
+        self.location = (
+            unconstrained_median
+            + (hard_location - unconstrained_median).detach()
+            if straight_through_median
+            else hard_location
+        )
+        self.scale = log_std.exp().expand_as(median)
+        self.base = Normal(self.location, self.scale)
+        self.inverse_epsilon = float(inverse_epsilon)
+
+    def _transform(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.center + self.half_width * torch.tanh(latent)
+
+    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        return self._transform(self.base.sample(sample_shape))
+
+    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        return self._transform(self.base.rsample(sample_shape))
+
+    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        normalized = ((action - self.center) / self.half_width).clamp(
+            -1.0 + self.inverse_epsilon,
+            1.0 - self.inverse_epsilon,
+        )
+        latent = torch.atanh(normalized)
+        log_jacobian = torch.log(self.half_width) + torch.log1p(
+            -normalized.square() + self.inverse_epsilon
+        )
+        return (self.base.log_prob(latent) - log_jacobian).sum(dim=-1)
+
+    def entropy(self) -> torch.Tensor:
+        action = self.rsample()
+        return -self.log_prob(action)
 
 
 class HistoryMLPObservation(NamedTuple):

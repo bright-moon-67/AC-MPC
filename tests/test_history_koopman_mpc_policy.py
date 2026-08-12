@@ -45,13 +45,12 @@ class _ThreeWaypointHistoryEnv(_HistoryEnv):
         return super().step(action)
 
 
-def test_history_wrapper_alignment_and_action_constraints():
+def test_history_wrapper_alignment_and_absolute_action_constraints():
     wrapped = HistoryContextTrackingWrapper(
         _HistoryEnv(),
         history_steps=3,
         state_mean=np.zeros(5),
         state_std=np.ones(5),
-        max_delta=0.02,
         tip_indices=(0, 1, 2),
     )
     observation, _ = wrapped.reset(seed=3)
@@ -60,10 +59,10 @@ def test_history_wrapper_alignment_and_action_constraints():
     np.testing.assert_allclose(context, 0.0)
 
     following, _, _, _, info = wrapped.step(np.asarray([0.2, -0.2]))
-    np.testing.assert_allclose(info["applied_action"], [0.02, -0.02])
+    np.testing.assert_allclose(info["applied_action"], [0.2, -0.2])
     following_context = following[5:-3]
     action_context = following_context[3 * 5 :].reshape(3, 2)
-    np.testing.assert_allclose(action_context[-1], [0.02, -0.02])
+    np.testing.assert_allclose(action_context[-1], [0.2, -0.2])
     np.testing.assert_allclose(following[-3:], wrapped.target_tip)
 
 
@@ -73,7 +72,6 @@ def test_history_wrapper_exposes_all_waypoints_and_active_stage():
         history_steps=2,
         state_mean=np.zeros(5),
         state_std=np.ones(5),
-        max_delta=0.02,
         tip_indices=(0, 1, 2),
     )
     observation, _ = wrapped.reset(seed=3)
@@ -108,7 +106,6 @@ def test_history_mpc_policy_reconstructs_actor_and_critic_gradients():
         hidden_dims=(12,),
         action_low=-0.3,
         action_high=0.3,
-        max_delta=0.02,
         solver_iterations=5,
     )
     critic = Critic(koopman.lifted_dim + 6, hidden_dims=(12,))
@@ -130,11 +127,8 @@ def test_history_mpc_policy_reconstructs_actor_and_critic_gradients():
     assert output.value.shape == (4,)
     assert output.mpc.action_sequence.shape == (4, 3, 2)
     actions = output.distribution.sample().detach()
-    previous_action = policy.split_observation(observations).previous_action
-    lower = torch.maximum(actor.action_low, previous_action - actor.max_delta)
-    upper = torch.minimum(actor.action_high, previous_action + actor.max_delta)
-    assert torch.all(actions >= lower)
-    assert torch.all(actions <= upper)
+    assert actions.shape == (4, 2)
+    assert torch.isfinite(actions).all()
     log_prob, entropy, values, _ = policy.evaluate_actions(observations, actions)
     assert torch.isfinite(log_prob).all()
     assert torch.isfinite(entropy).all()
@@ -165,7 +159,6 @@ def test_history_mpc_policy_three_waypoint_context():
         hidden_dims=(12,),
         action_low=-0.3,
         action_high=0.3,
-        max_delta=0.02,
         solver_iterations=3,
     )
     critic = Critic(koopman.lifted_dim + 12, hidden_dims=(12,))

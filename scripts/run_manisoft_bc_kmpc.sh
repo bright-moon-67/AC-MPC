@@ -17,7 +17,6 @@ ppo_output="$6"
 device="${7:-cuda}"
 horizon="${BC_KMPC_HORIZON:-10}"
 solver_iterations="${BC_KMPC_SOLVER_ITERATIONS:-20}"
-max_delta="${BC_KMPC_MAX_DELTA:-0.001}"
 
 for path in "${koopman_checkpoint}" "${scenario}"; do
     if [[ ! -f "${path}" ]]; then
@@ -40,12 +39,16 @@ if [[ ! -f "${expert_data}" ]]; then
         --episodes "${BC_KMPC_EXPERT_EPISODES:-10}" \
         --episode-steps "${BC_KMPC_EPISODE_STEPS:-300}" \
         --horizon "${horizon}" \
-        --max-delta "${max_delta}" \
         --device "${device}"
 elif [[ ! -f "${expert_data%.npz}.json" ]] \
     || ! grep -q 'manisoft_history_bc_kmpc_three_waypoint_expert' \
         "${expert_data%.npz}.json"; then
     echo "Existing expert dataset is not the three-waypoint schema: ${expert_data}" >&2
+    echo "Use a new EXPERT_DATA path." >&2
+    exit 1
+fi
+if ! grep -q '"schema_version": 5' "${expert_data%.npz}.json"; then
+    echo "Existing expert dataset predates randomized waypoint-bank BC-KMPC: ${expert_data}" >&2
     echo "Use a new EXPERT_DATA path." >&2
     exit 1
 fi
@@ -69,7 +72,7 @@ if [[ "${bc_complete}" != true ]]; then
         --batch-size "${BC_KMPC_BC_BATCH_SIZE:-256}" \
         --horizon "${horizon}" \
         --solver-iterations "${solver_iterations}" \
-        --max-delta "${max_delta}" \
+        --sequence-weight "${BC_KMPC_SEQUENCE_WEIGHT:-0.25}" \
         --device "${device}" \
         "${resume_bc[@]}"
 fi
@@ -90,9 +93,8 @@ fi
     --episode-steps "${BC_KMPC_EPISODE_STEPS:-300}" \
     --horizon "${horizon}" \
     --solver-iterations "${solver_iterations}" \
-    --max-delta "${max_delta}" \
     --num-envs "${BC_KMPC_NUM_ENVS:-1}" \
-    --actor-learning-rate "${BC_KMPC_ACTOR_LEARNING_RATE:-0.0000003}" \
+    --actor-learning-rate "${BC_KMPC_ACTOR_LEARNING_RATE:-0.0001}" \
     --target-kl "${BC_KMPC_TARGET_KL:-0.02}" \
     --device "${device}" \
     "${ppo_initialization[@]}"

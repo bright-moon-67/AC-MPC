@@ -56,7 +56,6 @@ def _policy() -> HistoryMLPPolicy:
         hidden_dims=(32, 32),
         action_low=-0.30,
         action_high=0.30,
-        max_delta=0.001,
     )
     critic = Critic(feature_dim, hidden_dims=(32,), activation="tanh")
     return HistoryMLPPolicy(
@@ -193,7 +192,6 @@ def test_history_mlp_ppo_smoke_with_h10_wrapper():
         history_steps=10,
         state_mean=np.zeros(45, dtype=np.float32),
         state_std=np.ones(45, dtype=np.float32),
-        max_delta=0.001,
     )
     observation, _ = env.reset(seed=31)
     env._ppo_observation = observation

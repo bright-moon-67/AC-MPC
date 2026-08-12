@@ -52,7 +52,6 @@ def _make_env(
     target_tip: np.ndarray,
     episode_steps: int,
     absolute_action_limit: float,
-    max_delta: float,
     history_steps: int,
     state_mean: np.ndarray,
     state_std: np.ndarray,
@@ -68,7 +67,6 @@ def _make_env(
         history_steps=history_steps,
         state_mean=state_mean,
         state_std=state_std,
-        max_delta=max_delta,
         tip_indices=TIP_INDICES,
     )
 
@@ -272,7 +270,6 @@ def main() -> None:
             target_tip=target_tip,
             episode_steps=args.episode_steps,
             absolute_action_limit=args.absolute_action_limit,
-            max_delta=args.max_delta,
             history_steps=policy.history_steps,
             state_mean=np.asarray(state_stats["mean"], dtype=np.float32),
             state_std=np.asarray(state_stats["std"], dtype=np.float32),

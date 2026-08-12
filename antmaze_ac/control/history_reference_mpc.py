@@ -14,8 +14,7 @@ class FixedCostHistoryKoopmanMPC:
     This is the reusable form of the controller validated by
     ``validate_koopman_mpc_reference_history.py``.  It operates on the same
     absolute-action history model and adds the fixed reference tracking,
-    control, smoothness, absolute-action and change-rate terms used by that
-    validation script.
+    control and absolute-action terms used by the ManiSoft adaptation.
     """
 
     def __init__(
@@ -28,13 +27,11 @@ class FixedCostHistoryKoopmanMPC:
         action_high: np.ndarray,
         horizon: int = 10,
         state_weight: float = 200.0,
-        action_weight: float = 30.0,
+        action_weight: float = 8000.0,
         control_weight: float = 1.0,
-        smoothness_weight: float = 10.0,
         track_tip_only: bool = False,
         tip_indices: tuple[int, int, int] = (30, 31, 32),
-        tip_state_scale: float = 20.0,
-        max_delta: float = 0.001,
+        tip_state_scale: float = 5.0,
         qp_max_iterations: int = 4000,
         qp_absolute_tolerance: float = 1e-5,
         qp_relative_tolerance: float = 1e-5,
@@ -45,9 +42,7 @@ class FixedCostHistoryKoopmanMPC:
         if min(
             state_weight,
             control_weight,
-            smoothness_weight,
             tip_state_scale,
-            max_delta,
             qp_absolute_tolerance,
             qp_relative_tolerance,
         ) <= 0:
@@ -71,8 +66,6 @@ class FixedCostHistoryKoopmanMPC:
         self.state_weight = float(state_weight)
         self.action_weight = float(action_weight)
         self.control_weight = float(control_weight)
-        self.smoothness_weight = float(smoothness_weight)
-        self.max_delta = float(max_delta)
         if self.action_low.shape != (self.action_dim,) or self.action_high.shape != (
             self.action_dim,
         ):
@@ -120,8 +113,6 @@ class FixedCostHistoryKoopmanMPC:
             physical_std[:, None] * normalized_action_prediction
         )
         self.physical_mean = np.tile(self.state_mean, self.horizon)
-        self.difference = self._difference_matrix()
-
         state_diagonal = np.tile(
             self.state_weight * np.square(self.state_scales),
             self.horizon,
@@ -132,39 +123,11 @@ class FixedCostHistoryKoopmanMPC:
         hessian += (self.action_weight + self.control_weight) * np.eye(
             self.variable_dim
         )
-        hessian += self.smoothness_weight * (
-            self.difference.T @ self.difference
-        )
         hessian = 2.0 * ((hessian + hessian.T) * 0.5)
 
-        first_selector = np.zeros(
-            (self.action_dim, self.variable_dim),
-            dtype=np.float64,
-        )
-        first_selector[:, : self.action_dim] = np.eye(self.action_dim)
-        constraint_matrix = sparse.vstack(
-            (
-                sparse.eye(self.variable_dim, format="csc"),
-                sparse.csc_matrix(self.difference),
-                sparse.csc_matrix(first_selector),
-            ),
-            format="csc",
-        )
-        rate_rows = (self.horizon - 1) * self.action_dim
-        initial_lower = np.concatenate(
-            (
-                np.tile(self.action_low, self.horizon),
-                np.full(rate_rows, -self.max_delta),
-                np.full(self.action_dim, -self.max_delta),
-            )
-        )
-        initial_upper = np.concatenate(
-            (
-                np.tile(self.action_high, self.horizon),
-                np.full(rate_rows, self.max_delta),
-                np.full(self.action_dim, self.max_delta),
-            )
-        )
+        constraint_matrix = sparse.eye(self.variable_dim, format="csc")
+        initial_lower = np.tile(self.action_low, self.horizon)
+        initial_upper = np.tile(self.action_high, self.horizon)
         self.solver = osqp.OSQP()
         self.solver.setup(
             P=sparse.triu(sparse.csc_matrix(hessian), format="csc"),
@@ -180,29 +143,6 @@ class FixedCostHistoryKoopmanMPC:
             eps_rel=float(qp_relative_tolerance),
         )
         self.setup_seconds = float(time.perf_counter() - setup_started)
-
-    def _difference_matrix(self) -> np.ndarray:
-        if self.horizon == 1:
-            return np.zeros((0, self.variable_dim), dtype=np.float64)
-        difference = np.zeros(
-            ((self.horizon - 1) * self.action_dim, self.variable_dim),
-            dtype=np.float64,
-        )
-        identity = np.eye(self.action_dim, dtype=np.float64)
-        for step in range(self.horizon - 1):
-            rows = slice(
-                step * self.action_dim,
-                (step + 1) * self.action_dim,
-            )
-            difference[
-                rows,
-                step * self.action_dim : (step + 1) * self.action_dim,
-            ] = -identity
-            difference[
-                rows,
-                (step + 1) * self.action_dim : (step + 2) * self.action_dim,
-            ] = identity
-        return difference
 
     def lift(self, state: np.ndarray, context: np.ndarray) -> np.ndarray:
         state_tensor = torch.as_tensor(
@@ -232,19 +172,15 @@ class FixedCostHistoryKoopmanMPC:
         context: np.ndarray,
         reference_state: np.ndarray,
         reference_action: np.ndarray,
-        previous_action: np.ndarray,
         initial_actions: np.ndarray | None = None,
     ) -> dict[str, np.ndarray | float | int | str]:
         started = time.perf_counter()
         reference_state = np.asarray(reference_state, dtype=np.float64).reshape(-1)
         reference_action = np.asarray(reference_action, dtype=np.float64).reshape(-1)
-        previous_action = np.asarray(previous_action, dtype=np.float64).reshape(-1)
         if reference_state.shape != (self.physical_dim,):
             raise ValueError("reference_state has the wrong shape")
         if reference_action.shape != (self.action_dim,):
             raise ValueError("reference_action has the wrong shape")
-        if previous_action.shape != (self.action_dim,):
-            raise ValueError("previous_action has the wrong shape")
 
         free_physical = (
             self.free_prediction @ self.lift(state, context)
@@ -263,22 +199,7 @@ class FixedCostHistoryKoopmanMPC:
             self.horizon,
         )
 
-        rate_rows = (self.horizon - 1) * self.action_dim
-        lower = np.concatenate(
-            (
-                np.tile(self.action_low, self.horizon),
-                np.full(rate_rows, -self.max_delta),
-                previous_action - self.max_delta,
-            )
-        )
-        upper = np.concatenate(
-            (
-                np.tile(self.action_high, self.horizon),
-                np.full(rate_rows, self.max_delta),
-                previous_action + self.max_delta,
-            )
-        )
-        self.solver.update(q=linear, l=lower, u=upper)
+        self.solver.update(q=linear)
         if initial_actions is not None:
             initial_actions = np.asarray(initial_actions, dtype=np.float64)
             if initial_actions.shape != (self.horizon, self.action_dim):
@@ -306,9 +227,6 @@ class FixedCostHistoryKoopmanMPC:
             actions - reference_action
         ).sum()
         cost += self.control_weight * np.square(actions).sum()
-        cost += self.smoothness_weight * np.square(
-            np.diff(actions, axis=0)
-        ).sum()
         return {
             "actions": actions.astype(np.float32),
             "action": actions[0].astype(np.float32),

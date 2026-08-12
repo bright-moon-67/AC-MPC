@@ -17,12 +17,11 @@ class HistoryMPCObservation(NamedTuple):
     physical_state: torch.Tensor
     history_context: torch.Tensor
     task_context: torch.Tensor
-    previous_action: torch.Tensor
 
 
 @dataclass
 class HistoryKoopmanMPCPolicyOutput:
-    distribution: "RateLimitedSquashedNormal"
+    distribution: Normal
     mean: torch.Tensor
     value: torch.Tensor
     lifted_state: torch.Tensor
@@ -42,67 +41,6 @@ class HistoryKoopmanMPCPolicyOutput:
         return self.mpc.linear_term
 
 
-class RateLimitedSquashedNormal:
-    """Gaussian policy transformed into the state-dependent action-rate box.
-
-    Sampling an unconstrained Gaussian and clipping it in the environment
-    changes the executed action without changing the stored PPO log-probability.
-    This distribution instead maps a latent Gaussian through tanh into the exact
-    interval allowed by both the absolute and rate constraints, so rollout and
-    update probabilities describe the action that is actually executed.
-    """
-
-    def __init__(
-        self,
-        median: torch.Tensor,
-        previous_action: torch.Tensor,
-        action_low: torch.Tensor,
-        action_high: torch.Tensor,
-        max_delta: torch.Tensor,
-        log_std: torch.Tensor,
-        boundary_margin: float = 0.02,
-        inverse_epsilon: float = 1e-6,
-    ) -> None:
-        lower = torch.maximum(action_low, previous_action - max_delta)
-        upper = torch.minimum(action_high, previous_action + max_delta)
-        self.center = 0.5 * (lower + upper)
-        self.half_width = (0.5 * (upper - lower)).clamp_min(inverse_epsilon)
-        normalized_median = ((median - self.center) / self.half_width).clamp(
-            -1.0 + boundary_margin,
-            1.0 - boundary_margin,
-        )
-        self.location = torch.atanh(normalized_median)
-        self.scale = log_std.exp().expand_as(median)
-        self.base = Normal(self.location, self.scale)
-        self.inverse_epsilon = float(inverse_epsilon)
-
-    def _transform(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.center + self.half_width * torch.tanh(latent)
-
-    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
-        return self._transform(self.base.sample(sample_shape))
-
-    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
-        return self._transform(self.base.rsample(sample_shape))
-
-    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
-        normalized = ((action - self.center) / self.half_width).clamp(
-            -1.0 + self.inverse_epsilon,
-            1.0 - self.inverse_epsilon,
-        )
-        latent = torch.atanh(normalized)
-        log_jacobian = torch.log(self.half_width) + torch.log1p(
-            -normalized.square() + self.inverse_epsilon
-        )
-        return (self.base.log_prob(latent) - log_jacobian).sum(dim=-1)
-
-    def entropy(self) -> torch.Tensor:
-        # One-sample reparameterized estimate is sufficient for the PPO entropy
-        # diagnostic and remains valid if entropy regularization is enabled.
-        action = self.rsample()
-        return -self.log_prob(action)
-
-
 class HistoryKoopmanMPCPolicy(nn.Module):
     """Actor-critic policy for history-context, absolute-action BC-KMPC.
 
@@ -115,7 +53,7 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     """
 
     TASK_CONTEXT_DIM = 6
-    ACTION_DISTRIBUTION = "rate_limited_squashed_normal_v1"
+    ACTION_DISTRIBUTION = "diagonal_normal_v1"
 
     def __init__(
         self,
@@ -127,7 +65,7 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         *,
         waypoint_count: int = 1,
         tip_indices: tuple[int, int, int] = (30, 31, 32),
-        log_std_init: float = -7.0,
+        log_std_init: float = -3.0,
     ) -> None:
         super().__init__()
         if not isinstance(koopman, HistoryDeepKoopman):
@@ -211,12 +149,10 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         physical_state = observation[..., :state_stop]
         history_context = observation[..., state_stop:context_stop]
         task_context = observation[..., context_stop:]
-        previous_action = history_context[..., -self.action_dim :]
         return HistoryMPCObservation(
             physical_state,
             history_context,
             task_context,
-            previous_action,
         )
 
     def features(
@@ -250,12 +186,8 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         return split, lifted, actor_context
 
     def actor_mean(self, observation: torch.Tensor) -> KoopmanMPCActorOutput:
-        split, lifted, actor_context = self.features(observation)
-        return self.actor(
-            lifted,
-            split.previous_action,
-            actor_context,
-        )
+        _, lifted, actor_context = self.features(observation)
+        return self.actor(lifted, actor_context)
 
     def forward(
         self,
@@ -263,8 +195,8 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     ) -> HistoryKoopmanMPCPolicyOutput:
         single = observation.ndim == 1
         observation_batch = observation.unsqueeze(0) if single else observation
-        split, lifted, actor_context = self.features(observation_batch)
-        mpc = self.actor(lifted, split.previous_action, actor_context)
+        _, lifted, actor_context = self.features(observation_batch)
+        mpc = self.actor(lifted, actor_context)
         if not (
             torch.isfinite(mpc.action).all()
             and torch.isfinite(mpc.quadratic_diagonal).all()
@@ -272,13 +204,9 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         ):
             raise FloatingPointError("BC-KMPC actor produced NaN or Inf")
         mean_batch = mpc.action
-        distribution = RateLimitedSquashedNormal(
+        distribution = Normal(
             mean_batch,
-            split.previous_action,
-            self.actor.action_low,
-            self.actor.action_high,
-            self.actor.max_delta,
-            self.log_std,
+            self.log_std.exp().expand_as(mean_batch),
         )
         value_batch = self.critic(torch.cat((lifted, actor_context), dim=-1))
         mean = mean_batch[0] if single else mean_batch
@@ -305,7 +233,7 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         if observation.ndim == 1 and action.ndim == 2:
             action = action[0]
         distribution_action = action.unsqueeze(0) if action.ndim == 1 else action
-        log_prob = output.distribution.log_prob(distribution_action)
+        log_prob = output.distribution.log_prob(distribution_action).sum(dim=-1)
         if observation.ndim == 1:
             log_prob = log_prob[0]
         result = (action, log_prob, output.value)
@@ -318,8 +246,8 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     ):
         output = self(observations)
         return (
-            output.distribution.log_prob(actions),
-            output.distribution.entropy(),
+            output.distribution.log_prob(actions).sum(dim=-1),
+            output.distribution.entropy().sum(dim=-1),
             output.value,
             output,
         )

@@ -18,7 +18,7 @@ def _randomize(module: torch.nn.Module, seed: int) -> None:
             )
 
 
-def test_soft_koopman_mpc_enforces_absolute_and_rate_limits_with_gradients():
+def test_soft_koopman_mpc_enforces_absolute_limits_with_gradients():
     dtype = torch.float64
     actor = KoopmanMPCActor(
         torch.tensor([[0.95, 0.05], [0.0, 0.9]], dtype=dtype),
@@ -29,22 +29,18 @@ def test_soft_koopman_mpc_enforces_absolute_and_rate_limits_with_gradients():
         hidden_dims=(5,),
         action_low=-0.15,
         action_high=0.2,
-        max_delta=0.03,
         linear_scale=4.0,
         solver_iterations=30,
     )
     _randomize(actor, seed=211)
     state = torch.randn(6, 2, dtype=dtype, requires_grad=True)
     context = torch.randn(6, 2, dtype=dtype, requires_grad=True)
-    previous = torch.linspace(-0.1, 0.1, 6, dtype=dtype).unsqueeze(-1)
-    output = actor(state, previous, context)
+    output = actor(state, context)
 
     assert output.action.shape == (6, 1)
     assert output.action_sequence.shape == (6, 4, 1)
     assert bool((output.action_sequence >= -0.15).all())
     assert bool((output.action_sequence <= 0.2).all())
-    all_actions = torch.cat((previous.unsqueeze(-2), output.action_sequence), dim=-2)
-    assert bool((torch.diff(all_actions, dim=-2).abs() <= 0.0300001).all())
     assert torch.all(torch.linalg.eigvalsh(output.qp_hessian) > 0)
 
     loss = output.action.square().mean() + 0.03 * output.qp_linear.square().mean()
@@ -69,8 +65,6 @@ def test_condensed_cost_matches_explicit_normalized_rollout():
         hidden_dims=(),
         action_low=-10.0,
         action_high=10.0,
-        max_delta=20.0,
-        smoothness_weight=0.0,
     )
     state = torch.tensor([[0.4, -0.3]], dtype=dtype)
     q = torch.tensor(
@@ -104,3 +98,22 @@ def test_condensed_cost_matches_explicit_normalized_rollout():
 
     explicit_delta = rollout(actions[0]) - rollout(torch.zeros_like(actions[0]))
     torch.testing.assert_close(condensed_delta, explicit_delta)
+
+
+def test_absolute_box_projection_reaches_action_boundary():
+    dtype = torch.float64
+    actor = KoopmanMPCActor(
+        torch.eye(1, dtype=dtype),
+        torch.ones(1, 1, dtype=dtype),
+        torch.eye(1, dtype=dtype),
+        horizon=4,
+        hidden_dims=(),
+        action_low=-0.3,
+        action_high=0.3,
+        solver_iterations=30,
+    )
+    with torch.no_grad():
+        actor.network[-1].bias[actor.horizon * actor.augmented_dim :] = -10.0
+    output = actor(torch.zeros(1, 1, dtype=dtype))
+    assert bool((output.action_sequence >= -0.3).all())
+    assert bool((output.action_sequence <= 0.3).all())

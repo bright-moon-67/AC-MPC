@@ -89,14 +89,12 @@ bc_kmpc:
   activation: gelu
   quadratic_log_scale: 1.5
   linear_scale: 10.0
-  smoothness_weight: 10.0
   solver_iterations: 20
   step_fraction: 0.95
   solver_epsilon: 1.0e-06
   absolute_action_limit: 0.30
-  max_delta: 0.001
-  # Latent scale before the tanh map into the state-dependent rate box.
-  log_std_init: -0.5
+  # Physical-action Gaussian std ~= exp(-3) ~= 0.05, as in the reference PPO.
+  log_std_init: -3.0
   critic_hidden_dims:
   - 256
   - 256
@@ -106,6 +104,7 @@ bc_kmpc:
   bc_learning_rate: 0.0003
   bc_weight_decay: 0.0
   bc_gradient_clip_norm: 1.0
+  bc_sequence_weight: 0.25
   bc_validation_fraction: 0.1
   checkpoint_interval_epochs: 10
 history_mlp_baseline:

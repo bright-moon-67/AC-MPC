@@ -14,7 +14,7 @@ from antmaze_ac.control.history_reference_mpc import FixedCostHistoryKoopmanMPC
 from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
 from antmaze_ac.envs.manisoft_tracking_env import (
     ManiSoftThreeWaypointTrackingEnv,
-    load_manisoft_waypoint_references,
+    load_manisoft_waypoint_reference_bank,
 )
 from antmaze_ac.koopman.checkpoint import load_checkpoint, sha256
 from antmaze_ac.koopman.history_model import HistoryDeepKoopman
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waypoint-root",
         required=True,
-        help="Directory containing ref_4cm/ref_8cm/ref_12cm and actions/.",
+        help="Directory containing the certified waypoint-bank manifest.json.",
     )
     parser.add_argument("--output", required=True)
     parser.add_argument(
@@ -59,11 +59,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-steps", type=int, default=300)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--state-weight", type=float, default=200.0)
-    parser.add_argument("--tip-state-scale", type=float, default=20.0)
-    parser.add_argument("--action-weight", type=float, default=30.0)
+    parser.add_argument(
+        "--tip-state-scale",
+        type=float,
+        default=5.0,
+        help="Tip-state multiplier tuned for the no-max-delta absolute-action MPC.",
+    )
+    parser.add_argument(
+        "--action-weight",
+        type=float,
+        default=8000.0,
+        help="Reference-action weight tuned to keep plans in Koopman support.",
+    )
     parser.add_argument("--control-weight", type=float, default=1.0)
-    parser.add_argument("--smoothness-weight", type=float, default=10.0)
-    parser.add_argument("--max-delta", type=float, default=0.001)
     parser.add_argument("--absolute-action-limit", type=float, default=0.30)
     parser.add_argument("--rollout-noise-std", type=float, default=0.0002)
     parser.add_argument("--qp-max-iterations", type=int, default=4000)
@@ -110,14 +118,11 @@ def main() -> None:
         if path is not None and not path.is_file():
             raise FileNotFoundError(f"Missing {name}: {path}")
 
-    (
-        reference_states,
-        reference_actions,
-        reference_paths,
-        action_paths,
-    ) = load_manisoft_waypoint_references(waypoint_root)
-    reference_hashes = [sha256(path) for path in reference_paths]
-    action_hashes = [sha256(path) for path in action_paths]
+    waypoint_bank = load_manisoft_waypoint_reference_bank(waypoint_root)
+    reference_states = waypoint_bank.states
+    reference_actions = waypoint_bank.actions
+    if waypoint_bank.scenario_sha256 != sha256(scenario):
+        raise ValueError("Waypoint bank was certified with another scenario")
     if base_dataset_path is not None:
         base_report_path = base_dataset_path.with_suffix(".json")
         if not base_report_path.is_file():
@@ -125,10 +130,11 @@ def main() -> None:
                 f"Missing base dataset metadata: {base_report_path}"
             )
         base_report = json.loads(base_report_path.read_text(encoding="utf-8"))
-        if (
-            base_report.get("reference_sha256") != reference_hashes
-            or base_report.get("action_sha256") != action_hashes
-        ):
+        if int(base_report.get("schema_version", 0)) < 5:
+            raise ValueError(
+                "Base dataset predates randomized waypoint-bank BC-KMPC"
+            )
+        if base_report.get("waypoint_bank_sha256") != waypoint_bank.manifest_sha256:
             raise ValueError("Base dataset references another waypoint set")
 
     device = _device(args.device)
@@ -149,10 +155,7 @@ def main() -> None:
             raise ValueError("Rollout policy history length is incompatible")
         if rollout_policy.waypoint_count != 3:
             raise ValueError("Rollout policy is not a three-waypoint policy")
-        if (
-            rollout_payload.get("reference_sha256") != reference_hashes
-            or rollout_payload.get("action_sha256") != action_hashes
-        ):
+        if rollout_payload.get("waypoint_bank_sha256") != waypoint_bank.manifest_sha256:
             raise ValueError("Rollout checkpoint references another waypoint set")
         rollout_policy.eval()
     state_stats = payload["normalizers"]["state"]
@@ -178,14 +181,12 @@ def main() -> None:
         state_weight=args.state_weight,
         action_weight=args.action_weight,
         control_weight=args.control_weight,
-        smoothness_weight=args.smoothness_weight,
         tip_state_scale=args.tip_state_scale,
-        max_delta=args.max_delta,
         qp_max_iterations=args.qp_max_iterations,
     )
     base_env = ManiSoftThreeWaypointTrackingEnv(
         scenario,
-        waypoint_tips=reference_states[:, np.asarray(TIP_INDICES)],
+        waypoint_tips=reference_states[:, :, np.asarray(TIP_INDICES)],
         episode_steps=args.episode_steps,
         absolute_action_limit=args.absolute_action_limit,
     )
@@ -194,10 +195,18 @@ def main() -> None:
         history_steps=model.history_steps,
         state_mean=state_stats["mean"],
         state_std=state_stats["std"],
-        max_delta=args.max_delta,
         tip_indices=TIP_INDICES,
     )
     rng = np.random.default_rng(args.seed)
+    waypoint_schedule = np.concatenate(
+        [
+            rng.permutation(waypoint_bank.triplet_count)
+            for _ in range(
+                (args.episodes + waypoint_bank.triplet_count - 1)
+                // waypoint_bank.triplet_count
+            )
+        ]
+    )[: args.episodes]
     observations: list[np.ndarray] = []
     expert_actions: list[np.ndarray] = []
     applied_actions: list[np.ndarray] = []
@@ -206,6 +215,7 @@ def main() -> None:
     expert_costs: list[float] = []
     qp_iterations: list[int] = []
     active_waypoint_indices: list[int] = []
+    waypoint_triplet_indices: list[int] = []
     waypoint_passed: list[bool] = []
     waypoints_completed: list[int] = []
     if base_dataset_path is not None:
@@ -221,6 +231,7 @@ def main() -> None:
                     "expert_cost",
                     "qp_iterations",
                     "active_waypoint_index",
+                    "waypoint_triplet_index",
                     "waypoint_passed",
                     "waypoints_completed",
                 )
@@ -242,6 +253,9 @@ def main() -> None:
         active_waypoint_indices.extend(
             base_arrays["active_waypoint_index"].astype(np.int64).tolist()
         )
+        waypoint_triplet_indices.extend(
+            base_arrays["waypoint_triplet_index"].astype(np.int64).tolist()
+        )
         waypoint_passed.extend(
             base_arrays["waypoint_passed"].astype(np.bool_).tolist()
         )
@@ -253,7 +267,13 @@ def main() -> None:
     episode_returns: list[float] = []
     try:
         for episode in range(args.episodes):
-            observation, _ = env.reset(seed=args.seed + episode)
+            observation, reset_info = env.reset(
+                seed=args.seed + episode,
+                options={
+                    "waypoint_triplet_index": int(waypoint_schedule[episode])
+                },
+            )
+            waypoint_triplet_index = int(reset_info["waypoint_triplet_index"])
             warm_start = None
             episode_return = 0.0
             executed_steps = 0
@@ -263,13 +283,15 @@ def main() -> None:
                 context_start = model.state_dim
                 context_stop = context_start + model.context_dim
                 context = observation[context_start:context_stop]
-                previous_action = context[-model.action_dim :]
                 plan = expert.solve(
                     state=state,
                     context=context,
-                    reference_state=reference_states[active_waypoint_index],
-                    reference_action=reference_actions[active_waypoint_index],
-                    previous_action=previous_action,
+                    reference_state=reference_states[
+                        waypoint_triplet_index, active_waypoint_index
+                    ],
+                    reference_action=reference_actions[
+                        waypoint_triplet_index, active_waypoint_index
+                    ],
                     initial_actions=warm_start,
                 )
                 target_action = np.asarray(plan["action"], dtype=np.float32)
@@ -305,6 +327,7 @@ def main() -> None:
                 expert_costs.append(float(plan["cost"]))
                 qp_iterations.append(int(plan["qp_iterations"]))
                 active_waypoint_indices.append(active_waypoint_index)
+                waypoint_triplet_indices.append(waypoint_triplet_index)
                 waypoint_passed.append(bool(info["waypoint_passed"]))
                 waypoints_completed.append(int(info["waypoints_completed"]))
                 episode_return += float(reward)
@@ -324,6 +347,7 @@ def main() -> None:
                         "new_samples": len(observations) - base_samples,
                         "samples": len(observations),
                         "waypoints_completed": int(base_env.waypoints_completed),
+                        "waypoint_triplet_index": waypoint_triplet_index,
                         "success": bool(terminated),
                     },
                     sort_keys=True,
@@ -347,12 +371,17 @@ def main() -> None:
             active_waypoint_index=np.asarray(
                 active_waypoint_indices, dtype=np.int64
             ),
+            waypoint_triplet_index=np.asarray(
+                waypoint_triplet_indices, dtype=np.int64
+            ),
             waypoint_passed=np.asarray(waypoint_passed, dtype=np.bool_),
             waypoints_completed=np.asarray(waypoints_completed, dtype=np.int64),
         )
     temporary.replace(output)
     report = {
-        "schema_version": 2,
+        "schema_version": 5,
+        "fixed_smoothness": False,
+        "action_constraints": "absolute_box",
         "kind": "manisoft_history_bc_kmpc_three_waypoint_expert",
         "output": str(output),
         "samples": len(observations),
@@ -366,10 +395,11 @@ def main() -> None:
         "koopman_checkpoint": str(checkpoint),
         "koopman_checkpoint_sha256": sha256(checkpoint),
         "waypoint_root": str(waypoint_root),
-        "references": [str(path) for path in reference_paths],
-        "reference_sha256": reference_hashes,
-        "actions": [str(path) for path in action_paths],
-        "action_sha256": action_hashes,
+        "waypoint_bank_manifest": str(waypoint_bank.manifest_path),
+        "waypoint_bank_sha256": waypoint_bank.manifest_sha256,
+        "waypoint_triplet_count": waypoint_bank.triplet_count,
+        "waypoint_sampling": "shuffled_without_replacement_per_cycle",
+        "references": [str(path) for path in waypoint_bank.reference_paths],
         "scenario": str(scenario),
         "base_dataset": (
             None if base_dataset_path is None else str(base_dataset_path)

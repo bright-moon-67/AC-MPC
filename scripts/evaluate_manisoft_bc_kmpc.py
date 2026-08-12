@@ -14,7 +14,7 @@ import torch
 from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
 from antmaze_ac.envs.manisoft_tracking_env import (
     ManiSoftThreeWaypointTrackingEnv,
-    load_manisoft_waypoint_references,
+    load_manisoft_waypoint_reference_bank,
 )
 from antmaze_ac.koopman.checkpoint import sha256
 from antmaze_ac.rl.serialization import load_history_mpc_checkpoint
@@ -30,13 +30,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waypoint-root",
         default=None,
-        help="Directory containing ref_4cm/ref_8cm/ref_12cm and actions/.",
+        help="Directory containing the certified waypoint-bank manifest.json.",
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--episode-steps", type=int, default=300)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--allow-other-waypoint-bank",
+        action="store_true",
+        help=( "Allow evaluating on a waypoint bank that differs from the "
+               "checkpoint's training bank (generalisation test)." ),
+    )
     return parser.parse_args()
 
 
@@ -64,22 +70,20 @@ def main() -> None:
             "--waypoint-root is required for a checkpoint without waypoint metadata"
         )
     waypoint_root = Path(waypoint_root_value).expanduser().resolve()
-    reference_states, _, reference_paths, action_paths = (
-        load_manisoft_waypoint_references(waypoint_root)
-    )
-    waypoint_tips = reference_states[:, np.asarray(TIP_INDICES)]
-    reference_hashes = [sha256(path) for path in reference_paths]
-    action_hashes = [sha256(path) for path in action_paths]
+    waypoint_bank = load_manisoft_waypoint_reference_bank(waypoint_root)
+    if waypoint_bank.scenario_sha256 != sha256(scenario):
+        raise ValueError("Waypoint bank was certified with another scenario")
+    waypoint_tips = waypoint_bank.states[:, :, np.asarray(TIP_INDICES)]
     if policy.waypoint_count != 3:
         raise ValueError("Checkpoint is not a three-waypoint BC-KMPC policy")
     if (
-        policy_payload.get("reference_sha256") != reference_hashes
-        or policy_payload.get("action_sha256") != action_hashes
+        not args.allow_other_waypoint_bank
+        and policy_payload.get("waypoint_bank_sha256")
+        != waypoint_bank.manifest_sha256
     ):
         raise ValueError("Checkpoint references another waypoint set")
     runtime = policy_payload["runtime"]
     absolute_action_limit = float(runtime["absolute_action_limit"])
-    max_delta = float(runtime["max_delta"])
     state_stats = koopman_payload["normalizers"]["state"]
 
     output = Path(args.output).expanduser().resolve()
@@ -87,6 +91,16 @@ def main() -> None:
     trajectories: list[dict[str, np.ndarray]] = []
     episode_summaries: list[dict] = []
     inference_times: list[float] = []
+    waypoint_rng = np.random.default_rng(args.seed)
+    waypoint_schedule = np.concatenate(
+        [
+            waypoint_rng.permutation(waypoint_bank.triplet_count)
+            for _ in range(
+                (args.episodes + waypoint_bank.triplet_count - 1)
+                // waypoint_bank.triplet_count
+            )
+        ]
+    )[: args.episodes]
     started = time.perf_counter()
     for episode in range(args.episodes):
         base = ManiSoftThreeWaypointTrackingEnv(
@@ -100,7 +114,6 @@ def main() -> None:
             history_steps=policy.history_steps,
             state_mean=state_stats["mean"],
             state_std=state_stats["std"],
-            max_delta=max_delta,
             tip_indices=TIP_INDICES,
         )
         observations: list[np.ndarray] = []
@@ -114,7 +127,13 @@ def main() -> None:
         waypoint_events: list[bool] = []
         all_waypoint_distances: list[np.ndarray] = []
         try:
-            observation, info = env.reset(seed=args.seed + episode)
+            observation, info = env.reset(
+                seed=args.seed + episode,
+                options={
+                    "waypoint_triplet_index": int(waypoint_schedule[episode])
+                },
+            )
+            waypoint_triplet_index = int(info["waypoint_triplet_index"])
             distances.append(float(info["distance"]))
             all_waypoint_distances.append(
                 np.asarray(info["all_waypoint_distances"], dtype=np.float32)
@@ -168,6 +187,7 @@ def main() -> None:
         final_completed = max(completed_waypoints, default=0)
         summary = {
             "episode": episode,
+            "waypoint_triplet_index": waypoint_triplet_index,
             "steps": len(rewards),
             "return": float(np.sum(rewards)),
             "initial_distance": float(distance_array[0]),
@@ -183,6 +203,9 @@ def main() -> None:
         trajectories.append(
             {
                 "observation": np.asarray(observations, dtype=np.float32),
+                "waypoint_triplet_index": np.full(
+                    len(observations), waypoint_triplet_index, dtype=np.int64
+                ),
                 "requested_action": np.asarray(requested_actions, dtype=np.float32),
                 "applied_action": np.asarray(applied_actions, dtype=np.float32),
                 "distance": distance_array,
@@ -211,10 +234,10 @@ def main() -> None:
         "checkpoint_sha256": sha256(checkpoint),
         "scenario": str(scenario),
         "waypoint_root": str(waypoint_root),
-        "references": [str(path) for path in reference_paths],
-        "reference_sha256": reference_hashes,
-        "actions": [str(path) for path in action_paths],
-        "action_sha256": action_hashes,
+        "waypoint_bank_manifest": str(waypoint_bank.manifest_path),
+        "waypoint_bank_sha256": waypoint_bank.manifest_sha256,
+        "waypoint_triplet_count": waypoint_bank.triplet_count,
+        "references": [str(path) for path in waypoint_bank.reference_paths],
         "episodes": args.episodes,
         "success_rate": float(np.mean([row["success"] for row in episode_summaries])),
         "waypoints_completed_mean": float(

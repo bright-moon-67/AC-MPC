@@ -15,10 +15,10 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
     ``[s_t, context_t, task_context]``
 
     where ``context_t=[normalized s[t-H+1:t+1], u[t-H:t]]``.  The current
-    absolute action is deliberately absent.  The last action in the context
-    is ``u[t-1]`` and is therefore sufficient to reproduce the action-rate
-    constraints when PPO later evaluates shuffled minibatches.  For a single
-    goal ``task_context=target_tip``.  For an ordered waypoint task it is
+    absolute action is deliberately absent.  Past actions remain part of the
+    history Koopman input needed to model the soft robot; BC-KMPC does not use
+    them as an action-rate constraint.  For a single goal
+    ``task_context=target_tip``.  For an ordered waypoint task it is
     ``[G1,G2,G3,one_hot(active_index)]``.
     """
 
@@ -29,7 +29,6 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         history_steps: int,
         state_mean: Sequence[float] | np.ndarray,
         state_std: Sequence[float] | np.ndarray,
-        max_delta: float | Sequence[float] = 0.002,
         tip_indices: Sequence[int] = (30, 31, 32),
     ) -> None:
         super().__init__(env)
@@ -74,11 +73,6 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
             raise ValueError("State normalizer contains NaN or Inf")
         self.state_std = np.maximum(self.state_std, 1e-6)
 
-        delta = np.asarray(max_delta, dtype=np.float32)
-        self.max_delta = np.broadcast_to(delta, (self.action_dim,)).copy()
-        if not np.isfinite(self.max_delta).all() or np.any(self.max_delta <= 0):
-            raise ValueError("max_delta must be finite and positive")
-
         self.state_history: deque[np.ndarray] = deque(maxlen=self.history_steps)
         self.action_history: deque[np.ndarray] = deque(maxlen=self.history_steps)
         self.previous_action = np.zeros(self.action_dim, dtype=np.float32)
@@ -91,8 +85,8 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
             high=np.full(observation_dim, np.inf, dtype=np.float32),
             dtype=np.float32,
         )
-        # The wrapper accepts requested absolute actions. It applies the same
-        # absolute/rate limits as the differentiable MPC actor before stepping.
+        # The wrapper accepts requested absolute actions and applies only the
+        # environment's absolute bounds.
         self.action_space = gym.spaces.Box(
             low=np.full(self.action_dim, -np.inf, dtype=np.float32),
             high=np.full(self.action_dim, np.inf, dtype=np.float32),
@@ -175,12 +169,7 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
 
         base_low = np.asarray(self.env.action_space.low, dtype=np.float32)
         base_high = np.asarray(self.env.action_space.high, dtype=np.float32)
-        rate_low = self.previous_action - self.max_delta
-        rate_high = self.previous_action + self.max_delta
-        applied = np.maximum(
-            np.minimum(requested, np.minimum(base_high, rate_high)),
-            np.maximum(base_low, rate_low),
-        ).astype(np.float32)
+        applied = np.clip(requested, base_low, base_high).astype(np.float32)
         state, reward, terminated, truncated, info = self.env.step(applied)
         state = np.asarray(state, dtype=np.float32).reshape(-1)
         previous = self.previous_action.copy()

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -30,6 +32,105 @@ MANISOFT_WAYPOINT_ACTION_FILES = (
     "actions/u_scale_0p50.json",
     "actions/u_scale_0p75.json",
 )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class ManiSoftWaypointReferenceBank:
+    """Validated three-waypoint state/action reference bank."""
+
+    states: np.ndarray
+    actions: np.ndarray
+    reference_paths: tuple[Path, ...]
+    manifest_path: Path
+    manifest_sha256: str
+    scenario_sha256: str
+
+    @property
+    def triplet_count(self) -> int:
+        return int(self.states.shape[0])
+
+
+def load_manisoft_waypoint_reference_bank(
+    root: str | Path,
+) -> ManiSoftWaypointReferenceBank:
+    """Load a certified bank shaped ``[triplet, waypoint, feature]``."""
+
+    root = Path(root).expanduser().resolve()
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing waypoint-bank manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("kind") != (
+        "manisoft_certified_three_waypoint_reference_bank"
+    ):
+        raise ValueError(f"Unsupported waypoint-bank manifest: {manifest_path}")
+    rows = manifest.get("triplets")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("Waypoint-bank manifest must contain at least one triplet")
+    if manifest.get("triplet_count") != len(rows):
+        raise ValueError("Waypoint-bank triplet_count does not match its contents")
+    if manifest.get("waypoint_count") != 3:
+        raise ValueError("Waypoint-bank must contain exactly three waypoints per triplet")
+
+    state_triplets: list[np.ndarray] = []
+    action_triplets: list[np.ndarray] = []
+    reference_paths: list[Path] = []
+    for triplet_index, row in enumerate(rows):
+        if row.get("index") != triplet_index:
+            raise ValueError("Waypoint-bank triplet indices must be contiguous")
+        waypoints = row.get("waypoints")
+        if not isinstance(waypoints, list) or len(waypoints) != 3:
+            raise ValueError(f"Triplet {triplet_index} must contain three waypoints")
+        states: list[np.ndarray] = []
+        actions: list[np.ndarray] = []
+        for waypoint_index, waypoint in enumerate(waypoints):
+            if waypoint.get("index") != waypoint_index:
+                raise ValueError(
+                    f"Triplet {triplet_index} waypoint indices must be contiguous"
+                )
+            relative = Path(str(waypoint.get("reference", "")))
+            path = (root / relative).resolve()
+            if root not in path.parents or not path.is_file():
+                raise FileNotFoundError(f"Missing or invalid waypoint reference: {path}")
+            if _sha256(path) != waypoint.get("sha256"):
+                raise ValueError(f"Waypoint reference hash mismatch: {path}")
+            with np.load(path, allow_pickle=False) as archive:
+                state = np.asarray(archive["reference_state"], dtype=np.float32).reshape(-1)
+                action = np.asarray(archive["reference_action"], dtype=np.float32).reshape(-1)
+                stored_tip = np.asarray(
+                    archive["reference_tip_position"], dtype=np.float32
+                ).reshape(-1)
+            if state.shape != (KOOPMAN_PHYSICAL_STATE_DIM,) or action.shape != (18,):
+                raise ValueError(f"{path} must contain a 45-D state and 18-D action")
+            if stored_tip.shape != (3,) or not np.allclose(
+                stored_tip, state[KOOPMAN_TIP_POSITION_SLICE], atol=1e-7, rtol=1e-6
+            ):
+                raise ValueError(f"Reference tip does not match reference state: {path}")
+            if not np.isfinite(state).all() or not np.isfinite(action).all():
+                raise ValueError(f"{path} contains NaN or Inf")
+            if np.max(np.abs(action)) > 0.30 + 1e-7:
+                raise ValueError(f"{path} exceeds the absolute action limit 0.30")
+            states.append(state)
+            actions.append(action)
+            reference_paths.append(path)
+        state_triplets.append(np.stack(states))
+        action_triplets.append(np.stack(actions))
+    return ManiSoftWaypointReferenceBank(
+        states=np.stack(state_triplets),
+        actions=np.stack(action_triplets),
+        reference_paths=tuple(reference_paths),
+        manifest_path=manifest_path,
+        manifest_sha256=_sha256(manifest_path),
+        scenario_sha256=str(manifest.get("scenario_sha256", "")),
+    )
 
 
 def load_manisoft_waypoint_references(
@@ -257,15 +358,12 @@ class ManiSoftTipTrackingEnv(gym.Env):
         target_scale = self.target_scale
         progress = (self.previous_distance - distance) / target_scale
 
-        # 有界奖励，避免距离增大时产生过大的负回报。
-        distance_ratio = distance / target_scale
-        bounded_progress = float(np.clip(progress, -0.2, 0.2))
         normalized_action = action / self.absolute_action_limit
 
         reward = (
-            float(np.exp(-distance_ratio) - np.exp(-1.0))
-            + 2.0 * bounded_progress
-            - 0.01 * float(np.mean(normalized_action ** 2))
+            float(progress)
+            - 0.01
+            - 0.001 * float(np.mean(normalized_action ** 2))
         )
 
         self.step_count += 1
@@ -303,7 +401,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
 
 
 class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
-    """按 4 cm -> 8 cm -> 12 cm 顺序连续跟踪三个固定末端目标。"""
+    """Track one coherently sampled three-waypoint reference triplet."""
 
     waypoint_count = 3
 
@@ -314,25 +412,33 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
         episode_steps: int = 300,
         success_threshold: float = 0.0015,
         success_streak: int = 5,
-        waypoint_event_reward: float = 1.0,
+        waypoint_event_reward: float = 3.0,
         absolute_action_limit: float = 0.30,
     ) -> None:
-        waypoints = np.asarray(waypoint_tips, dtype=np.float32)
-        if waypoints.shape != (self.waypoint_count, 3):
-            raise ValueError("waypoint_tips必须是[3,3]")
-        if not np.isfinite(waypoints).all():
+        waypoint_bank = np.asarray(waypoint_tips, dtype=np.float32)
+        if waypoint_bank.shape == (self.waypoint_count, 3):
+            waypoint_bank = waypoint_bank[None, ...]
+        if (
+            waypoint_bank.ndim != 3
+            or waypoint_bank.shape[1:] != (self.waypoint_count, 3)
+            or waypoint_bank.shape[0] < 1
+        ):
+            raise ValueError("waypoint_tips必须是[3,3]或[N,3,3]")
+        if not np.isfinite(waypoint_bank).all():
             raise ValueError("waypoint_tips出现NaN或Inf")
         if waypoint_event_reward < 0:
             raise ValueError("waypoint_event_reward必须非负")
         super().__init__(
             scenario_path,
-            target_tip=waypoints[0],
+            target_tip=waypoint_bank[0, 0],
             episode_steps=episode_steps,
             success_threshold=success_threshold,
             success_streak=success_streak,
             absolute_action_limit=absolute_action_limit,
         )
-        self.fixed_waypoints = waypoints.copy()
+        self.waypoint_tip_bank = waypoint_bank.copy()
+        self.fixed_waypoints = self.waypoint_tip_bank[0].copy()
+        self.active_waypoint_triplet_index = 0
         self.waypoint_event_reward = float(waypoint_event_reward)
         self.active_waypoint_index = 0
         self.waypoints_completed = 0
@@ -343,6 +449,17 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         observation, info = super().reset(seed=seed, options=options)
+        forced_index = None if options is None else options.get("waypoint_triplet_index")
+        if forced_index is None:
+            triplet_index = int(self.np_random.integers(len(self.waypoint_tip_bank)))
+        else:
+            if not isinstance(forced_index, (int, np.integer)):
+                raise ValueError("waypoint_triplet_index必须是整数")
+            triplet_index = int(forced_index)
+            if not 0 <= triplet_index < len(self.waypoint_tip_bank):
+                raise ValueError("waypoint_triplet_index超出参考库范围")
+        self.active_waypoint_triplet_index = triplet_index
+        self.fixed_waypoints = self.waypoint_tip_bank[triplet_index].copy()
         self.active_waypoint_index = 0
         self.waypoints_completed = 0
         self.target_tip = self.fixed_waypoints[0].copy()
@@ -354,6 +471,7 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
             {
                 "target_tip": self.target_tip.copy(),
                 "waypoints": self.fixed_waypoints.copy(),
+                "waypoint_triplet_index": self.active_waypoint_triplet_index,
                 "active_waypoint_index": self.active_waypoint_index,
                 "waypoints_completed": self.waypoints_completed,
                 "waypoint_passed": False,
@@ -386,13 +504,15 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
             )
             self.previous_distance = next_distance
             self.target_scale = max(next_distance, np.finfo(np.float32).eps)
-            # Replace the single-task terminal bonus with an intermediate
-            # waypoint event reward.
+            # Replace the single-task terminal bonus with the reward for
+            # passing one waypoint. The final waypoint receives both this
+            # event reward and the extra all-waypoints completion reward.
             reward = reward - 5.0 + self.waypoint_event_reward
             truncated = self.step_count >= self.episode_steps
 
         if terminated:
             self.waypoints_completed = self.waypoint_count
+            reward += self.waypoint_event_reward
 
         tip = self._tip_position(observation)
         distances = np.linalg.norm(self.fixed_waypoints - tip[None, :], axis=1)
@@ -402,6 +522,7 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
                 "distance": active_distance,
                 "target_tip": self.target_tip.copy(),
                 "waypoints": self.fixed_waypoints.copy(),
+                "waypoint_triplet_index": self.active_waypoint_triplet_index,
                 "active_waypoint_index": self.active_waypoint_index,
                 "waypoints_completed": self.waypoints_completed,
                 "waypoint_passed": waypoint_passed,

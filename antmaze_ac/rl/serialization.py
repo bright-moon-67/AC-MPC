@@ -170,7 +170,6 @@ def make_history_mpc_policy(
     *,
     horizon: int | None = None,
     absolute_action_limit: float | None = None,
-    max_delta: float | None = None,
     solver_iterations: int | None = None,
     waypoint_count: int = 1,
 ) -> tuple[HistoryKoopmanMPCPolicy, dict]:
@@ -190,25 +189,24 @@ def make_history_mpc_policy(
         "activation": "gelu",
         "quadratic_log_scale": 1.5,
         "linear_scale": 10.0,
-        "smoothness_weight": 10.0,
         "solver_iterations": 20,
         "step_fraction": 0.95,
         "solver_epsilon": 1e-6,
         "absolute_action_limit": 0.30,
-        "max_delta": 0.001,
-        # Latent standard deviation for the rate-limited tanh distribution.
-        # exp(-0.5) explores a useful fraction of the +/- max_delta interval.
-        "log_std_init": -0.5,
+        # Match the reference PPO's physical-action standard deviation ~= 0.05.
+        "log_std_init": -3.0,
         "critic_hidden_dims": [256, 256],
         "critic_activation": "gelu",
     }
     settings.update(config.get("bc_kmpc", {}))
+    # Older Koopman checkpoints may embed the retired BC-KMPC setting. It is
+    # deliberately ignored: the current actor contains no fixed smoothness.
+    settings.pop("smoothness_weight", None)
+    settings.pop("max_delta", None)
     if horizon is not None:
         settings["horizon"] = int(horizon)
     if absolute_action_limit is not None:
         settings["absolute_action_limit"] = float(absolute_action_limit)
-    if max_delta is not None:
-        settings["max_delta"] = float(max_delta)
     if solver_iterations is not None:
         settings["solver_iterations"] = int(solver_iterations)
 
@@ -230,10 +228,8 @@ def make_history_mpc_policy(
         activation=str(settings["activation"]),
         action_low=-limit,
         action_high=limit,
-        max_delta=float(settings["max_delta"]),
         quadratic_log_scale=float(settings["quadratic_log_scale"]),
         linear_scale=float(settings["linear_scale"]),
-        smoothness_weight=float(settings["smoothness_weight"]),
         solver_iterations=int(settings["solver_iterations"]),
         step_fraction=float(settings["step_fraction"]),
         solver_epsilon=float(settings["solver_epsilon"]),
@@ -266,6 +262,10 @@ def load_history_mpc_checkpoint(
     method = policy_payload.get("method")
     if method not in {"bc_kmpc_bc", "actor_critic_bc_kmpc"}:
         raise ValueError(f"{path} is not a BC-KMPC checkpoint")
+    if int(policy_payload.get("format_version", 0)) < 4:
+        raise ValueError(
+            "BC-KMPC checkpoint predates absolute-action box FISTA and is incompatible"
+        )
     koopman_checkpoint = Path(policy_payload["koopman_checkpoint"])
     if not koopman_checkpoint.is_file():
         raise FileNotFoundError(
@@ -280,7 +280,6 @@ def load_history_mpc_checkpoint(
         device,
         horizon=runtime.get("horizon"),
         absolute_action_limit=runtime.get("absolute_action_limit"),
-        max_delta=runtime.get("max_delta"),
         solver_iterations=runtime.get("solver_iterations"),
         waypoint_count=int(runtime.get("waypoint_count", 1)),
     )
