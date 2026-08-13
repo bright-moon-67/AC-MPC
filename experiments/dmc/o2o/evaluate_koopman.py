@@ -16,7 +16,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from experiments.dmc.o2o.dataset import _cartpole_reward
+from experiments.dmc.o2o.dataset import (
+    _cartpole_reward,
+    _episode_index_identity,
+    temporal_stratified_episode_indices,
+)
 
 
 EVALUATION_KIND = "acmpc_exorl_cartpole_koopman_test_evaluation_v1"
@@ -108,6 +112,38 @@ PROTO1M_PROTOCOL = EvaluationProtocol(
     episode_steps=1000,
     horizon_steps=50,
 )
+
+
+def protocol_from_data_manifest(data_dir: Path) -> EvaluationProtocol:
+    """Derive the strict stage layout from a bound adapter manifest."""
+
+    manifest = _read_json_object(data_dir.resolve() / "manifest.json")
+    stage_mapping = _require_mapping(manifest.get("stages"), field="manifest.stages")
+    rows: list[tuple[str, int, int]] = []
+    for name, value in stage_mapping.items():
+        metadata = _require_mapping(value, field=f"manifest.stages.{name}")
+        left = metadata.get("episode_id_start_inclusive")
+        right = metadata.get("episode_id_end_exclusive")
+        if (
+            isinstance(left, bool)
+            or not isinstance(left, int)
+            or isinstance(right, bool)
+            or not isinstance(right, int)
+        ):
+            raise ValueError(f"Manifest stage {name!r} has invalid episode bounds")
+        rows.append((name, left, right))
+    rows.sort(key=lambda row: row[1])
+    order = manifest.get("stage_order")
+    if order is not None and order != [name for name, _left, _right in rows]:
+        raise ValueError("Manifest stage_order differs from episode-bound order")
+    episode_steps = manifest.get("episode_steps")
+    if isinstance(episode_steps, bool) or not isinstance(episode_steps, int):
+        raise ValueError("Manifest episode_steps must be an integer")
+    return EvaluationProtocol(
+        stage_ranges=tuple(rows),
+        episode_steps=episode_steps,
+        horizon_steps=50,
+    )
 
 
 @dataclass(frozen=True)
@@ -249,6 +285,30 @@ def _validate_manifest_header(
         manifest.get("source_episode_identity_sha256"),
         field="manifest.source_episode_identity_sha256",
     )
+    if "stage_order" in manifest and manifest.get("stage_order") != [
+        name for name, _left, _right in protocol.stage_ranges
+    ]:
+        raise ValueError("Manifest stage_order differs from the formal protocol")
+    selection = manifest.get("selection")
+    if selection is not None:
+        if not isinstance(selection, Mapping) or selection.get("kind") != (
+            "temporal_block_microstratum_start_v1"
+        ):
+            raise ValueError("Unsupported stratified source selection contract")
+        expected_indices = temporal_stratified_episode_indices(
+            source_total_episodes=10_000,
+            temporal_deciles=10,
+            episodes_per_decile=100,
+        )
+        actual_indices = manifest.get("source_episode_indices")
+        if actual_indices != list(expected_indices):
+            raise ValueError("Manifest does not contain the canonical stratified IDs")
+        expected_identity = _episode_index_identity(expected_indices)
+        if manifest.get("source_episode_indices_sha256") != expected_identity:
+            raise ValueError("Manifest stratified episode-ID SHA256 differs")
+        expected_stage_counts = {f"decile_{index:02d}": 100 for index in range(10)}
+        if protocol.stage_counts != expected_stage_counts:
+            raise ValueError("Stratified protocol must retain ten 100-episode deciles")
 
 
 def _validate_stage_metadata(
@@ -259,6 +319,7 @@ def _validate_stage_metadata(
     left: int,
     right: int,
     protocol: EvaluationProtocol,
+    source_episode_indices: list[int] | None = None,
 ) -> None:
     episodes = right - left
     expected = {
@@ -271,6 +332,12 @@ def _validate_stage_metadata(
         "actions_shape": [episodes, protocol.episode_steps, protocol.action_dim],
         "rewards_shape": [episodes, protocol.episode_steps],
     }
+    if source_episode_indices is not None:
+        expected.update(
+            source_episode_indices=source_episode_indices,
+            source_episode_index_first=source_episode_indices[0],
+            source_episode_index_last=source_episode_indices[-1],
+        )
     mismatches = {
         key: {"actual": metadata.get(key), "expected": value}
         for key, value in expected.items()
@@ -362,6 +429,7 @@ def load_proto_data(
     stages: list[StageData] = []
     reward_parity_max = 0.0
     training_states: list[np.ndarray] = []
+    all_source_episode_indices = manifest.get("source_episode_indices")
     for name, left, right in protocol.stage_ranges:
         path = (data_dir / f"{name}.npz").resolve()
         if not path.is_file():
@@ -377,6 +445,11 @@ def load_proto_data(
             left=left,
             right=right,
             protocol=protocol,
+            source_episode_indices=(
+                all_source_episode_indices[left:right]
+                if isinstance(all_source_episode_indices, list)
+                else None
+            ),
         )
         states, actions, rewards = _load_stage(
             path,
@@ -774,7 +847,9 @@ def _evaluate_model(
     *,
     protocol: EvaluationProtocol,
     batch_size: int,
-) -> tuple[dict[str, Any], dict[str, int], dict[str, int]]:
+) -> tuple[
+    dict[str, Any], dict[str, dict[str, Any]], dict[str, int], dict[str, int]
+]:
     full_weights = protocol.rollout_discount ** np.arange(
         protocol.horizon_steps, dtype=np.float64
     )
@@ -787,6 +862,12 @@ def _evaluate_model(
         report_horizons = (*report_horizons, protocol.horizon_steps)
     accumulated = {
         horizon: _empty_metrics(protocol.state_dim) for horizon in report_horizons
+    }
+    accumulated_by_stage = {
+        stage.name: {
+            horizon: _empty_metrics(protocol.state_dim) for horizon in report_horizons
+        }
+        for stage in data.stages
     }
     test_episodes_by_stage: dict[str, int] = {}
     windows_by_stage: dict[str, int] = {}
@@ -853,6 +934,14 @@ def _evaluate_model(
                     reward_error=reward_error[:, prefix],
                     weights=full_weights[prefix],
                 )
+                _update_metrics(
+                    accumulated_by_stage[stage.name][horizon],
+                    normalized_error_square=normalized_error_square[:, prefix],
+                    normalized_hold_error_square=normalized_hold_error_square[:, prefix],
+                    physical_error_square=physical_error_square[:, prefix],
+                    reward_error=reward_error[:, prefix],
+                    weights=full_weights[prefix],
+                )
     return (
         {
             str(horizon): _finalize_metrics(
@@ -862,6 +951,18 @@ def _evaluate_model(
                 weights=full_weights[:horizon],
             )
             for horizon in report_horizons
+        },
+        {
+            stage.name: {
+                str(horizon): _finalize_metrics(
+                    accumulated_by_stage[stage.name][horizon],
+                    protocol=protocol,
+                    horizon_steps=horizon,
+                    weights=full_weights[:horizon],
+                )
+                for horizon in report_horizons
+            }
+            for stage in data.stages
         },
         test_episodes_by_stage,
         windows_by_stage,
@@ -873,10 +974,12 @@ def evaluate_models(
     named_models: Sequence[tuple[str, Path]],
     *,
     batch_size: int = 2048,
-    protocol: EvaluationProtocol = PROTO1M_PROTOCOL,
+    protocol: EvaluationProtocol | None = None,
 ) -> dict[str, Any]:
     """Evaluate one or more exports on every legal test-split rollout window."""
 
+    if protocol is None:
+        protocol = protocol_from_data_manifest(data_dir)
     protocol.validate()
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -893,7 +996,12 @@ def evaluate_models(
     common_test_counts: dict[str, int] | None = None
     common_window_counts: dict[str, int] | None = None
     for name, model in models.items():
-        metrics_by_horizon, test_counts, window_counts = _evaluate_model(
+        (
+            metrics_by_horizon,
+            metrics_by_stage_and_horizon,
+            test_counts,
+            window_counts,
+        ) = _evaluate_model(
             model,
             data,
             protocol=protocol,
@@ -925,6 +1033,11 @@ def evaluate_models(
             },
             "metrics": metrics_by_horizon[str(protocol.horizon_steps)],
             "metrics_by_horizon": metrics_by_horizon,
+            "metrics_by_stage": {
+                stage: values[str(protocol.horizon_steps)]
+                for stage, values in metrics_by_stage_and_horizon.items()
+            },
+            "metrics_by_stage_and_horizon": metrics_by_stage_and_horizon,
         }
     assert common_test_counts is not None and common_window_counts is not None
     expected_test_episodes = protocol.split_counts()["test"]

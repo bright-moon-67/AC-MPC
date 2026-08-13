@@ -1,10 +1,13 @@
-"""Stochastic MLP/KMPC actors and a lifted-state REDQ critic ensemble."""
+"""Stochastic raw-state/AC-KMPC actors and REDQ/Cal-QL critics."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -17,6 +20,75 @@ from experiments.dmc.o2o.koopman import FrozenKoopman
 # one, for both the MLP and AC-KMPC actors.
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
+EXORL_CQL_LOG_STD_MIN = -10.0
+
+
+class FrozenObservationNormalizer(nn.Module):
+    """Dataset-bound raw-observation transform for non-Koopman baselines."""
+
+    KIND = "acmpc_offline_observation_normalizer_v1"
+
+    def __init__(
+        self,
+        center: np.ndarray | torch.Tensor,
+        scale: np.ndarray | torch.Tensor,
+        *,
+        dataset_sha256: str,
+    ) -> None:
+        super().__init__()
+        center_tensor = torch.as_tensor(center, dtype=torch.float32)
+        scale_tensor = torch.as_tensor(scale, dtype=torch.float32)
+        if center_tensor.ndim != 1 or scale_tensor.shape != center_tensor.shape:
+            raise ValueError("Raw observation center/scale shapes disagree")
+        if center_tensor.numel() != 5:
+            raise ValueError("Cartpole raw normalizer must have dimension five")
+        if not torch.isfinite(center_tensor).all() or not torch.isfinite(scale_tensor).all():
+            raise FloatingPointError("Raw observation normalizer is non-finite")
+        if torch.any(scale_tensor <= 0):
+            raise ValueError("Raw observation scales must be positive")
+        if not isinstance(dataset_sha256, str) or len(dataset_sha256) != 64:
+            raise ValueError("Raw normalizer requires the source dataset SHA256")
+        self.register_buffer("center", center_tensor.clone())
+        self.register_buffer("scale", scale_tensor.clone())
+        self.dataset_sha256 = dataset_sha256
+
+    @classmethod
+    def from_offline_observations(
+        cls, observations: np.ndarray, *, dataset_sha256: str
+    ) -> "FrozenObservationNormalizer":
+        observations = np.asarray(observations)
+        if observations.ndim != 2 or observations.shape[1] != 5:
+            raise ValueError("Offline observations must have shape [N,5]")
+        if observations.shape[0] < 1 or not np.isfinite(observations).all():
+            raise ValueError("Offline observations must be non-empty and finite")
+        # Accumulate in float64 for a stable, dataset-independent artifact;
+        # training/evaluation buffers are stored in float32 like the networks.
+        center = observations.astype(np.float64).mean(axis=0)
+        scale = observations.astype(np.float64).std(axis=0)
+        scale = np.maximum(scale, 1e-6)
+        return cls(center, scale, dataset_sha256=dataset_sha256)
+
+    @property
+    def observation_dim(self) -> int:
+        return int(self.center.numel())
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        return (observation - self.center) / self.scale
+
+    def identity(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kind": self.KIND,
+            "source": "offline_dataset_observation_only",
+            "dataset_sha256": self.dataset_sha256,
+            "estimator": "population_mean_std_float64_then_float32_v1",
+            "minimum_scale": 1e-6,
+            "center": self.center.detach().cpu().tolist(),
+            "scale": self.scale.detach().cpu().tolist(),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        return {**payload, "sha256": hashlib.sha256(encoded).hexdigest()}
 
 
 def atanh_clipped(value: torch.Tensor) -> torch.Tensor:
@@ -60,12 +132,28 @@ def tanh_normal_sample(
 
 
 class MLPActor(nn.Module):
-    """RLPD-style tanh Gaussian actor over the frozen lifted state."""
+    """Tanh Gaussian actor over an explicitly selected state representation."""
 
-    def __init__(self, lifted_dim: int, action_dim: int, hidden_dim: int = 256):
+    def __init__(
+        self,
+        state_dim: int | None = None,
+        action_dim: int = 1,
+        hidden_dim: int = 256,
+        *,
+        lifted_dim: int | None = None,
+    ):
         super().__init__()
+        # ``lifted_dim`` is retained solely as a construction alias for older
+        # unit fixtures.  Method identity, not this generic module, enforces
+        # whether the tensor represents raw observations or Koopman features.
+        if state_dim is None:
+            state_dim = lifted_dim
+        elif lifted_dim is not None and lifted_dim != state_dim:
+            raise ValueError("state_dim and lifted_dim aliases disagree")
+        if state_dim is None:
+            raise ValueError("MLPActor requires state_dim")
         self.net = nn.Sequential(
-            nn.Linear(lifted_dim, hidden_dim),
+            nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -75,21 +163,81 @@ class MLPActor(nn.Module):
         nn.init.uniform_(self.net[-1].weight, -1e-3, 1e-3)
         nn.init.uniform_(self.net[-1].bias, -1e-3, 1e-3)
 
-    def distribution(self, lifted_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        location, raw_log_std = self.net(lifted_state).chunk(2, dim=-1)
+    def distribution(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        location, raw_log_std = self.net(state).chunk(2, dim=-1)
         log_std = raw_log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
         return location, log_std
 
     def sample(
         self,
-        lifted_state: torch.Tensor,
+        state: torch.Tensor,
         *,
         deterministic: bool = False,
         samples: int = 1,
         return_plan: bool = False,
         generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        location, log_std = self.distribution(lifted_state)
+        location, log_std = self.distribution(state)
+        sample_shape = () if samples == 1 else (samples,)
+        action, log_prob = tanh_normal_sample(
+            location,
+            log_std,
+            deterministic=deterministic,
+            sample_shape=sample_shape,
+            generator=generator,
+        )
+        return action, log_prob, None
+
+
+def _orthogonal_linear(module: nn.Module) -> None:
+    """Match ExORL's ``utils.weight_init`` for fully connected layers."""
+
+    if isinstance(module, nn.Linear):
+        nn.init.orthogonal_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+class ExORLCQLActor(nn.Module):
+    """Task-matched ExORL CQL MLP with the project's SAC distribution contract.
+
+    ExORL applies ``tanh`` to the Gaussian location and then applies a second
+    tanh through ``SquashedNormal``.  We retain its layer layout and orthogonal
+    initialization, but deliberately use one standard tanh-Gaussian transform;
+    this avoids the double-tanh compatibility quirk while preserving the
+    Cal-QL/ExORL loss semantics.
+    """
+
+    DISTRIBUTION_PROFILE = "standard_single_tanh_gaussian_exorl_compat_v1"
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.policy = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2 * action_dim),
+        )
+        self.action_dim = action_dim
+        self.apply(_orthogonal_linear)
+
+    def distribution(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        location, raw_log_std = self.policy(state).chunk(2, dim=-1)
+        return location, raw_log_std.clamp(EXORL_CQL_LOG_STD_MIN, LOG_STD_MAX)
+
+    def sample(
+        self,
+        state: torch.Tensor,
+        *,
+        deterministic: bool = False,
+        samples: int = 1,
+        return_plan: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        del return_plan
+        location, log_std = self.distribution(state)
         sample_shape = () if samples == 1 else (samples,)
         action, log_prob = tanh_normal_sample(
             location,
@@ -259,22 +407,29 @@ class EnsembleLayerNorm(nn.Module):
 
 
 class QEnsemble(nn.Module):
-    """Vectorized lifted-state Q ensemble with per-head LayerNorm."""
+    """Vectorized Q ensemble with RLPD-style per-head LayerNorm."""
 
     def __init__(
         self,
-        lifted_dim: int,
-        action_dim: int,
+        state_dim: int | None = None,
+        action_dim: int = 1,
         *,
+        lifted_dim: int | None = None,
         ensemble_size: int = 10,
         hidden_dim: int = 256,
         hidden_layers: int = 2,
     ) -> None:
         super().__init__()
+        if state_dim is None:
+            state_dim = lifted_dim
+        elif lifted_dim is not None and lifted_dim != state_dim:
+            raise ValueError("state_dim and lifted_dim aliases disagree")
+        if state_dim is None:
+            raise ValueError("QEnsemble requires state_dim")
         if hidden_layers < 1:
             raise ValueError("Q ensemble needs at least one hidden layer")
         self.ensemble_size = ensemble_size
-        dimensions = [lifted_dim + action_dim] + [hidden_dim] * hidden_layers
+        dimensions = [state_dim + action_dim] + [hidden_dim] * hidden_layers
         self.layers = nn.ModuleList(
             EnsembleLinear(ensemble_size, left, right)
             for left, right in zip(dimensions[:-1], dimensions[1:], strict=True)
@@ -284,27 +439,102 @@ class QEnsemble(nn.Module):
         )
         self.output = EnsembleLinear(ensemble_size, hidden_dim, 1)
 
-    def forward(self, lifted_state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        value = torch.cat((lifted_state, action), dim=-1)
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        value = torch.cat((state, action), dim=-1)
         for layer, norm in zip(self.layers, self.norms, strict=True):
             value = F.relu(norm(layer(value)))
         return self.output(value)[..., 0]
 
 
+class ExORLCQLQEnsemble(nn.Module):
+    """Vectorized two-Q version of ExORL's DMC CQL critic."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        *,
+        ensemble_size: int,
+        hidden_dim: int,
+        hidden_layers: int,
+    ) -> None:
+        super().__init__()
+        if ensemble_size != 2:
+            raise ValueError("The ExORL CQL critic profile requires exactly two Q heads")
+        if hidden_layers != 2:
+            raise ValueError("The ExORL CQL critic profile requires two hidden layers")
+        self.ensemble_size = ensemble_size
+        self.q_nets = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(state_dim + action_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            for _ in range(ensemble_size)
+        )
+        self.apply(_orthogonal_linear)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        value = torch.cat((state, action), dim=-1)
+        return torch.stack([network(value)[..., 0] for network in self.q_nets], dim=0)
+
+
 def build_actor(
     method: str,
-    koopman: FrozenKoopman,
+    koopman: FrozenKoopman | None,
     *,
+    network_profile: str = "rlpd",
+    state_dim: int,
+    action_dim: int,
     hidden_dim: int,
     controller_hidden_dim: int,
     kmpc_horizon: int,
     kmpc_solver_iterations: int,
 ) -> nn.Module:
     if "AC-KMPC" in method:
+        if koopman is None:
+            raise ValueError("AC-KMPC actor requires a Koopman model")
         return KMPCTanhGaussianActor(
             koopman,
             horizon=kmpc_horizon,
             solver_iterations=kmpc_solver_iterations,
             hidden_dim=controller_hidden_dim,
         )
-    return MLPActor(koopman.lifted_dim, koopman.action_dim, hidden_dim)
+    if koopman is not None:
+        raise ValueError("Raw MLP actor must not receive a Koopman model")
+    if network_profile == "exorl_cql":
+        return ExORLCQLActor(state_dim, action_dim, hidden_dim)
+    if network_profile != "rlpd":
+        raise ValueError(f"Unknown actor network profile {network_profile!r}")
+    return MLPActor(state_dim, action_dim, hidden_dim)
+
+
+def build_critic(
+    *,
+    network_profile: str,
+    state_dim: int,
+    action_dim: int,
+    ensemble_size: int,
+    hidden_dim: int,
+    hidden_layers: int,
+) -> nn.Module:
+    if network_profile == "exorl_cql":
+        return ExORLCQLQEnsemble(
+            state_dim,
+            action_dim,
+            ensemble_size=ensemble_size,
+            hidden_dim=hidden_dim,
+            hidden_layers=hidden_layers,
+        )
+    if network_profile != "rlpd":
+        raise ValueError(f"Unknown critic network profile {network_profile!r}")
+    return QEnsemble(
+        state_dim,
+        action_dim,
+        ensemble_size=ensemble_size,
+        hidden_dim=hidden_dim,
+        hidden_layers=hidden_layers,
+    )

@@ -16,7 +16,11 @@ from torch.nn import functional as F
 
 from experiments.dmc.o2o.config import O2OConfig
 from experiments.dmc.o2o.koopman import FrozenKoopman
-from experiments.dmc.o2o.networks import QEnsemble, build_actor
+from experiments.dmc.o2o.networks import (
+    FrozenObservationNormalizer,
+    build_actor,
+    build_critic,
+)
 from experiments.dmc.reward_oracle import cartpole_swingup_official_reward
 
 
@@ -151,8 +155,8 @@ class CriticProposalCache:
     and current-Q values must be evaluated again after every critic update.
     """
 
-    lifted: torch.Tensor
-    next_lifted: torch.Tensor
+    state: torch.Tensor
+    next_state: torch.Tensor
     target_next_action: torch.Tensor
     target_next_log_prob: torch.Tensor
     cql_current_actions: torch.Tensor | None = None
@@ -164,11 +168,22 @@ class CriticProposalCache:
         def slice_samples(value: torch.Tensor | None) -> torch.Tensor | None:
             return None if value is None else value[:, index]
 
+        target_action = (
+            self.target_next_action[:, index]
+            if self.target_next_action.ndim == 3
+            else self.target_next_action[index]
+        )
+        target_log_prob = (
+            self.target_next_log_prob[:, index]
+            if self.target_next_log_prob.ndim == 2
+            else self.target_next_log_prob[index]
+        )
+
         return CriticProposalCache(
-            lifted=self.lifted[index],
-            next_lifted=self.next_lifted[index],
-            target_next_action=self.target_next_action[index],
-            target_next_log_prob=self.target_next_log_prob[index],
+            state=self.state[index],
+            next_state=self.next_state[index],
+            target_next_action=target_action,
+            target_next_log_prob=target_log_prob,
             cql_current_actions=slice_samples(self.cql_current_actions),
             cql_current_log_prob=slice_samples(self.cql_current_log_prob),
             cql_next_actions=slice_samples(self.cql_next_actions),
@@ -182,8 +197,10 @@ class O2OLearner:
     def __init__(
         self,
         config: O2OConfig,
-        koopman: FrozenKoopman,
+        koopman: FrozenKoopman | None,
         device: torch.device,
+        *,
+        observation_normalizer: FrozenObservationNormalizer | None = None,
     ) -> None:
         config.validate()
         device = torch.device(device)
@@ -193,7 +210,24 @@ class O2OLearner:
             device = torch.device("cuda", torch.cuda.current_device())
         self.config = config
         self.device = device
-        self.koopman = koopman.to(device).eval()
+        if config.requires_koopman:
+            if koopman is None:
+                raise ValueError(f"{config.method} requires a Koopman model")
+            if observation_normalizer is not None:
+                raise ValueError("Structured methods use Koopman normalization only")
+            self.koopman: FrozenKoopman | None = koopman.to(device).eval()
+            self.observation_normalizer: FrozenObservationNormalizer | None = None
+            self.state_dim = koopman.lifted_dim
+            self.action_dim = koopman.action_dim
+        else:
+            if koopman is not None:
+                raise ValueError(f"{config.method} is raw-only and forbids Koopman")
+            if observation_normalizer is None:
+                raise ValueError("Raw methods require an offline-dataset normalizer")
+            self.koopman = None
+            self.observation_normalizer = observation_normalizer.to(device).eval()
+            self.state_dim = observation_normalizer.observation_dim
+            self.action_dim = 1
         self.rng_substream_seeds = {
             name: _substream_seed(config.seed, name)
             for name in _RNG_SUBSTREAM_NAMES
@@ -212,15 +246,19 @@ class O2OLearner:
             self.actor = build_actor(
                 config.method,
                 self.koopman,
+                network_profile=config.network_profile,
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
                 hidden_dim=config.hidden_dim,
                 controller_hidden_dim=config.controller_hidden_dim,
                 kmpc_horizon=config.kmpc_horizon,
                 kmpc_solver_iterations=config.kmpc_solver_iterations,
             ).to(device)
         with _cpu_initialization_stream(self.rng_substream_seeds["critic_init"]):
-            self.critic = QEnsemble(
-                koopman.lifted_dim,
-                koopman.action_dim,
+            self.critic = build_critic(
+                network_profile=config.network_profile,
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
                 ensemble_size=config.critic_ensemble_size,
                 hidden_dim=config.hidden_dim,
                 hidden_layers=config.critic_hidden_layers,
@@ -251,38 +289,72 @@ class O2OLearner:
     def temperature(self) -> torch.Tensor:
         return self.log_temperature.exp()
 
+    def representation_identity(self) -> dict[str, Any]:
+        if self.config.requires_koopman:
+            assert self.koopman is not None
+            return {
+                "kind": "koopman_lifted_state_v1",
+                "state_dim": self.koopman.state_dim,
+                "lift_dim": self.koopman.lift_dim,
+                "input_dim": self.koopman.lifted_dim,
+                "koopman_sha256": self.koopman.sha256,
+            }
+        assert self.observation_normalizer is not None
+        return {
+            "kind": "normalized_raw_observation_v1",
+            "input_dim": self.observation_normalizer.observation_dim,
+            "normalizer": self.observation_normalizer.identity(),
+        }
+
+    def _encode(self, observation: torch.Tensor) -> torch.Tensor:
+        if self.config.requires_koopman:
+            assert self.koopman is not None
+            return self.koopman.lift(observation)
+        assert self.observation_normalizer is not None
+        return self.observation_normalizer(observation)
+
     @torch.no_grad()
     def act(self, observation: np.ndarray, deterministic: bool) -> np.ndarray:
         tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
         if tensor.ndim == 1:
             tensor = tensor.unsqueeze(0)
-        lifted = self.koopman.lift(tensor)
+        state = self._encode(tensor)
         action, _, _ = self.actor.sample(
-            lifted,
+            state,
             deterministic=deterministic,
             generator=self.training_generator,
         )
         return action.cpu().numpy()
 
     @torch.no_grad()
-    def _prepare_critic_cache(self, batch: TensorBatch) -> CriticProposalCache:
+    def _prepare_critic_cache(
+        self,
+        batch: TensorBatch,
+        *,
+        phase: Literal["offline", "online"] = "offline",
+    ) -> CriticProposalCache:
         """Sample fixed proposals once while the actor is fixed across UTD."""
 
-        lifted = self.koopman.lift(batch.observation)
-        next_lifted = self.koopman.lift(batch.next_observation)
-        if self.config.uses_calql:
+        state = self._encode(batch.observation)
+        next_state = self._encode(batch.next_observation)
+        if self.config.uses_calql_in_phase(phase):
             sample_count = self.config.cql_actions
             current_actions, current_log_prob, _ = self.actor.sample(
-                lifted,
+                state,
                 samples=sample_count,
                 generator=self.training_generator,
             )
-            # Preserve the independent target-vs-CQL proposal semantics of
-            # separate actor calls while sharing the expensive KMPC plan.
-            # Sample zero is target-only; the remaining K samples are CQL-only.
+            # Preserve independent target-vs-CQL proposal samples while sharing
+            # the expensive KMPC plan.  The task-matched ExORL-DMC profile uses
+            # one target action; optional Cal-QL max backup would use K.
+            target_sample_count = (
+                sample_count
+                if self.config.uses_calql_max_target_backup_in_phase(phase)
+                else 1
+            )
             next_actions, next_log_prob, _ = self.actor.sample(
-                next_lifted,
-                samples=sample_count + 1,
+                next_state,
+                samples=target_sample_count + sample_count,
                 generator=self.training_generator,
             )
             # ``actor.sample(samples=1)`` intentionally returns the ordinary
@@ -290,49 +362,140 @@ class O2OLearner:
             if sample_count == 1:
                 current_actions = current_actions.unsqueeze(0)
                 current_log_prob = current_log_prob.unsqueeze(0)
+            target_next_actions = next_actions[:target_sample_count]
+            target_next_log_prob = next_log_prob[:target_sample_count]
+            if target_sample_count == 1:
+                target_next_actions = target_next_actions[0]
+                target_next_log_prob = target_next_log_prob[0]
             return CriticProposalCache(
-                lifted=lifted.detach(),
-                next_lifted=next_lifted.detach(),
-                target_next_action=next_actions[0].detach(),
-                target_next_log_prob=next_log_prob[0].detach(),
+                state=state.detach(),
+                next_state=next_state.detach(),
+                target_next_action=target_next_actions.detach(),
+                target_next_log_prob=target_next_log_prob.detach(),
                 cql_current_actions=current_actions.detach(),
                 cql_current_log_prob=current_log_prob.detach(),
-                cql_next_actions=next_actions[1:].detach(),
-                cql_next_log_prob=next_log_prob[1:].detach(),
+                cql_next_actions=next_actions[target_sample_count:].detach(),
+                cql_next_log_prob=next_log_prob[target_sample_count:].detach(),
             )
 
         next_action, next_log_prob, _ = self.actor.sample(
-            next_lifted,
+            next_state,
             generator=self.training_generator,
         )
         return CriticProposalCache(
-            lifted=lifted.detach(),
-            next_lifted=next_lifted.detach(),
+            state=state.detach(),
+            next_state=next_state.detach(),
             target_next_action=next_action.detach(),
             target_next_log_prob=next_log_prob.detach(),
         )
 
+    def _reduce_critic_objective(self, per_head_per_row: torch.Tensor) -> torch.Tensor:
+        """Apply the immutable method-specific reduction over Q heads.
+
+        Cal-QL/ExORL optimizes Q1 and Q2 losses separately and adds them.  The
+        vectorized equivalent is a row mean within each head followed by a head
+        sum.  RLPD instead averages its ensemble objective.
+        """
+
+        if (
+            per_head_per_row.ndim != 2
+            or per_head_per_row.shape[0] != self.config.critic_ensemble_size
+        ):
+            raise ValueError("Critic objective must have shape [Q_heads, batch]")
+        per_head = per_head_per_row.mean(dim=1)
+        if self.config.critic_head_reduction == "sum":
+            return per_head.sum()
+        if self.config.critic_head_reduction == "mean":
+            return per_head.mean()
+        raise RuntimeError("Unknown critic-head reduction")
+
+    def _reduce_actor_q(self, q_heads: torch.Tensor) -> torch.Tensor:
+        if q_heads.ndim != 2:
+            raise ValueError("Actor Q values must have shape [Q_heads, batch]")
+        if self.config.actor_q_reduction == "min":
+            return q_heads.amin(dim=0)
+        if self.config.actor_q_reduction == "mean":
+            return q_heads.mean(dim=0)
+        raise RuntimeError("Unknown actor-Q reduction")
+
+    def _temperature_loss(self, log_prob: torch.Tensor) -> torch.Tensor:
+        target_entropy = float(self.config.target_entropy)
+        if self.config.temperature_objective == "calql_log_alpha":
+            # Official Cal-QL/JaxCQL SAC objective.  Only log(alpha) receives
+            # this gradient; policy gradients come from the actor objective.
+            return -(
+                self.log_temperature
+                * (log_prob + target_entropy).detach()
+            ).mean()
+        if self.config.temperature_objective == "rlpd":
+            # Match RLPD's Temperature module: optimize alpha=exp(log_alpha)
+            # against entropy-target_entropy.  This differs from the log-alpha
+            # loss whenever alpha is not one.
+            entropy = (-log_prob).detach()
+            return (
+                self.temperature * (entropy - target_entropy)
+            ).mean()
+        raise RuntimeError("Unknown temperature objective")
+
     def _target_q(
-        self, batch: TensorBatch, cache: CriticProposalCache
+        self,
+        batch: TensorBatch,
+        cache: CriticProposalCache,
+        *,
+        phase: Literal["offline", "online"] = "offline",
     ) -> torch.Tensor:
         with torch.no_grad():
             # Target critic parameters evolve after every REDQ update, so only
             # the fixed actor proposal is reused here; Q is always recomputed.
-            next_q = self._minimum_target_q(
-                cache.next_lifted, cache.target_next_action
+            max_target_backup = (
+                self.config.uses_calql_max_target_backup_in_phase(phase)
             )
-            next_q = (
-                next_q
-                - self.temperature.detach() * cache.target_next_log_prob
-            )
+            if max_target_backup:
+                if (
+                    cache.target_next_action.ndim != 3
+                    or cache.target_next_log_prob.ndim != 2
+                ):
+                    raise RuntimeError("Cal-QL max target cache has invalid shapes")
+                samples, batch_size, action_dim = cache.target_next_action.shape
+                expanded_state = cache.next_state.unsqueeze(0).expand(
+                    samples, -1, -1
+                )
+                candidate_q = self._minimum_target_q(
+                    expanded_state.reshape(samples * batch_size, -1),
+                    cache.target_next_action.reshape(
+                        samples * batch_size, action_dim
+                    ),
+                ).reshape(samples, batch_size)
+                next_q, choice = candidate_q.max(dim=0)
+                if self.config.backup_entropy:
+                    chosen_log_prob = cache.target_next_log_prob.gather(
+                        0, choice.unsqueeze(0)
+                    ).squeeze(0)
+                    next_q = (
+                        next_q - self.temperature.detach() * chosen_log_prob
+                    )
+            else:
+                if (
+                    cache.target_next_action.ndim != 2
+                    or cache.target_next_log_prob.ndim != 1
+                ):
+                    raise RuntimeError("Single-action target cache has invalid shapes")
+                next_q = self._minimum_target_q(
+                    cache.next_state, cache.target_next_action
+                )
+                if self.config.backup_entropy:
+                    next_q = (
+                        next_q
+                        - self.temperature.detach() * cache.target_next_log_prob
+                    )
             return batch.reward + self.config.discount * batch.discount * next_q
 
     def _minimum_target_q(
-        self, lifted_state: torch.Tensor, action: torch.Tensor
+        self, state: torch.Tensor, action: torch.Tensor
     ) -> torch.Tensor:
         """REDQ target: minimum over one freshly sampled critic subset."""
 
-        target_heads = self.target_critic(lifted_state, action)
+        target_heads = self.target_critic(state, action)
         if self.config.target_critic_subset < target_heads.shape[0]:
             choice = torch.randperm(
                 target_heads.shape[0],
@@ -347,18 +510,30 @@ class O2OLearner:
         batch: TensorBatch,
         cache: CriticProposalCache,
         data_q: torch.Tensor,
+        *,
+        phase: Literal["offline", "online"] = "offline",
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        offline = batch.offline_mask > 0.5
-        if not self.config.uses_calql or not torch.any(offline):
+        # Cal-RLPD uses calibrated conservative regularization only for its
+        # offline pretraining.  Its online phase is pure RLPD, rather than the
+        # previous bespoke penalty on only the offline half of a mixed batch.
+        if not self.config.uses_calql_in_phase(phase):
             zero = data_q.sum() * 0.0
             return zero, {"cql_penalty": 0.0, "calibration_bound_rate": 0.0}
-        lifted_offline = cache.lifted[offline]
-        batch_size = lifted_offline.shape[0]
+        calibrated = (
+            torch.ones_like(batch.offline_mask, dtype=torch.bool)
+            if phase == "online"
+            else batch.offline_mask > 0.5
+        )
+        if not torch.any(calibrated):
+            zero = data_q.sum() * 0.0
+            return zero, {"cql_penalty": 0.0, "calibration_bound_rate": 0.0}
+        calibrated_state = cache.state[calibrated]
+        batch_size = calibrated_state.shape[0]
         sample_count = self.config.cql_actions
-        expanded_lifted = lifted_offline.unsqueeze(0).expand(sample_count, -1, -1)
+        expanded_state = calibrated_state.unsqueeze(0).expand(sample_count, -1, -1)
 
         random_actions = torch.empty(
-            sample_count, batch_size, self.koopman.action_dim, device=self.device
+            sample_count, batch_size, self.action_dim, device=self.device
         ).uniform_(-1.0, 1.0, generator=self.training_generator)
         proposals = (
             cache.cql_current_actions,
@@ -368,21 +543,21 @@ class O2OLearner:
         )
         if any(value is None for value in proposals):
             raise RuntimeError("Cal-QL critic cache is missing policy proposals")
-        current_actions = cache.cql_current_actions[:, offline]
-        current_log_prob = cache.cql_current_log_prob[:, offline]
-        next_actions = cache.cql_next_actions[:, offline]
-        next_log_prob = cache.cql_next_log_prob[:, offline]
+        current_actions = cache.cql_current_actions[:, calibrated]
+        current_log_prob = cache.cql_current_log_prob[:, calibrated]
+        next_actions = cache.cql_next_actions[:, calibrated]
+        next_log_prob = cache.cql_next_log_prob[:, calibrated]
 
         def evaluate(actions: torch.Tensor) -> torch.Tensor:
-            flat_lifted = expanded_lifted.reshape(-1, cache.lifted.shape[-1])
+            flat_state = expanded_state.reshape(-1, cache.state.shape[-1])
             flat_action = actions.reshape(-1, actions.shape[-1])
-            values = self.critic(flat_lifted, flat_action)
+            values = self.critic(flat_state, flat_action)
             return values.reshape(values.shape[0], sample_count, batch_size)
 
         q_random = evaluate(random_actions)
         q_current = evaluate(current_actions)
         q_next = evaluate(next_actions)
-        lower_bound = batch.mc_return[offline].view(1, 1, batch_size)
+        lower_bound = batch.mc_return[calibrated].view(1, 1, batch_size)
         bound_rate = 0.5 * (
             (q_current < lower_bound).float().mean()
             + (q_next < lower_bound).float().mean()
@@ -391,7 +566,7 @@ class O2OLearner:
         # and the Bellman target are never clamped.
         q_current = torch.maximum(q_current, lower_bound)
         q_next = torch.maximum(q_next, lower_bound)
-        random_density = -self.koopman.action_dim * math.log(2.0)
+        random_density = -self.action_dim * math.log(2.0)
         candidates = torch.cat(
             (
                 q_random - random_density,
@@ -403,7 +578,7 @@ class O2OLearner:
         ood = torch.logsumexp(
             candidates / self.config.cql_temperature, dim=1
         ) * self.config.cql_temperature
-        penalty = (ood - data_q[:, offline]).mean()
+        penalty = self._reduce_critic_objective(ood - data_q[:, calibrated])
         return penalty, {
             "cql_penalty": float(penalty.detach()),
             "calibration_bound_rate": float(bound_rate.detach()),
@@ -414,17 +589,19 @@ class O2OLearner:
         batch: TensorBatch,
         real_target: torch.Tensor,
         *,
-        next_lifted: torch.Tensor | None = None,
+        next_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Total H=10 target: one real transition followed by nine model steps."""
 
         if not self.config.uses_mpve:
             return real_target.detach()
+        if self.koopman is None:
+            raise RuntimeError("MPVE requires a Koopman model")
         with torch.no_grad():
             current = (
                 self.koopman.lift(batch.next_observation)
-                if next_lifted is None
-                else next_lifted
+                if next_state is None
+                else next_state
             )
             total = batch.reward.clone()
             continuation = self.config.discount * batch.discount
@@ -458,16 +635,21 @@ class O2OLearner:
         *,
         apply_mpve: bool,
         cache: CriticProposalCache | None = None,
+        phase: Literal["offline", "online"] = "offline",
     ) -> dict[str, float]:
         if apply_mpve and not self.config.uses_mpve:
             raise ValueError("MPVE auxiliary requested for a non-MPVE method")
         if cache is None:
-            cache = self._prepare_critic_cache(batch)
-        lifted = cache.lifted
-        target = self._target_q(batch, cache)
-        q = self.critic(lifted, batch.action)
-        bellman_loss = (q - target.unsqueeze(0)).square().mean()
-        cql_penalty, cql_metrics = self._cql_calibrated_penalty(batch, cache, q)
+            cache = self._prepare_critic_cache(batch, phase=phase)
+        state = cache.state
+        target = self._target_q(batch, cache, phase=phase)
+        q = self.critic(state, batch.action)
+        bellman_loss = self._reduce_critic_objective(
+            (q - target.unsqueeze(0)).square()
+        )
+        cql_penalty, cql_metrics = self._cql_calibrated_penalty(
+            batch, cache, q, phase=phase
+        )
         loss = bellman_loss + self.config.cql_weight * cql_penalty
         mpve_loss = q.sum() * 0.0
         mpve_target_mean = 0.0
@@ -475,11 +657,11 @@ class O2OLearner:
             model_target = self._mpve_target(
                 batch,
                 target,
-                next_lifted=cache.next_lifted,
+                next_state=cache.next_state,
             )
-            mpve_loss = (
-                q - model_target.unsqueeze(0)
-            ).square().mean()
+            mpve_loss = self._reduce_critic_objective(
+                (q - model_target.unsqueeze(0)).square()
+            )
             loss = loss + self.config.mpve_loss_weight * mpve_loss
             mpve_target_mean = float(model_target.mean())
         self.critic_optimizer.zero_grad(set_to_none=True)
@@ -508,15 +690,15 @@ class O2OLearner:
         self,
         batch: TensorBatch,
         *,
-        lifted: torch.Tensor | None = None,
+        state: torch.Tensor | None = None,
     ) -> dict[str, float]:
-        lifted = (
-            self.koopman.lift(batch.observation).detach()
-            if lifted is None
-            else lifted
+        state = (
+            self._encode(batch.observation).detach()
+            if state is None
+            else state
         )
         action, log_prob, _ = self.actor.sample(
-            lifted,
+            state,
             generator=self.training_generator,
         )
         # The SAC policy needs dQ/da, but the actor step must neither calculate
@@ -524,19 +706,13 @@ class O2OLearner:
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
         with _frozen_parameters(self.critic):
-            q = self.critic(lifted, action).mean(dim=0)
+            q = self._reduce_actor_q(self.critic(state, action))
             actor_loss = (self.temperature.detach() * log_prob - q).mean()
             actor_loss.backward()
         actor_grad_norm = _clip(self.actor.parameters(), self.actor_optimizer)
         self.actor_optimizer.step()
 
-        # Match RLPD's Temperature module exactly: optimize alpha=exp(log_alpha)
-        # against entropy-target_entropy, rather than optimizing log_alpha
-        # directly.  The two gradients agree only at alpha == 1.
-        entropy = (-log_prob).detach()
-        temperature_loss = (
-            self.temperature * (entropy - self.config.target_entropy)
-        ).mean()
+        temperature_loss = self._temperature_loss(log_prob)
         self.temperature_optimizer.zero_grad(set_to_none=True)
         temperature_loss.backward()
         self.temperature_optimizer.step()
@@ -561,7 +737,7 @@ class O2OLearner:
         if batch.reward.shape[0] % utd:
             raise ValueError("Fused batch must divide evenly by UTD")
         size = batch.reward.shape[0] // utd
-        cache = self._prepare_critic_cache(batch)
+        cache = self._prepare_critic_cache(batch, phase=phase)
         metrics: dict[str, float] = {}
         mini_batch = batch
         for index in range(utd):
@@ -580,11 +756,12 @@ class O2OLearner:
                 mini_batch,
                 apply_mpve=apply_mpve,
                 cache=mini_cache,
+                phase=phase,
             )
         metrics.update(
             self.update_actor_and_temperature(
                 mini_batch,
-                lifted=mini_cache.lifted,
+                state=mini_cache.state,
             )
         )
         return metrics
@@ -600,6 +777,7 @@ class O2OLearner:
             "temperature_optimizer": self.temperature_optimizer.state_dict(),
             "gradient_updates": self.gradient_updates,
             "actor_updates": self.actor_updates,
+            "representation": self.representation_identity(),
             # This is part of the scientific resume contract: initialization
             # seeds document cross-method pairing, while the private sampling
             # state makes the next stochastic update exactly reproducible.
@@ -639,6 +817,10 @@ class O2OLearner:
         if actual_identity != expected_identity:
             raise ValueError(
                 "Learner checkpoint RNG substreams do not match this configuration"
+            )
+        if state.get("representation") != self.representation_identity():
+            raise ValueError(
+                "Learner checkpoint representation/normalizer identity differs"
             )
         training_sampling_state = rng_state.get("training_sampling_state")
         if not isinstance(training_sampling_state, torch.Tensor):

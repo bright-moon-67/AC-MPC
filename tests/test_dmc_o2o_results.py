@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -10,15 +12,17 @@ import torch
 
 from experiments.dmc.o2o.aggregate import (
     AGGREGATE_KIND,
+    MATRIX_MANIFEST_KIND,
     aggregate_runs,
     curve_metrics,
+    formal_evaluation_grid,
 )
 from experiments.dmc.o2o.checkpoint import (
     CHECKPOINT_KIND,
     atomic_torch_save,
     load_checkpoint,
 )
-from experiments.dmc.o2o.config import O2OConfig
+from experiments.dmc.o2o.config import METHODS, O2OConfig
 from experiments.dmc.o2o.dataset import (
     DATASET_KIND,
     OfflineDataset,
@@ -33,6 +37,7 @@ from experiments.dmc.o2o.evaluate import (
 )
 from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner
+from experiments.dmc.o2o.networks import FrozenObservationNormalizer
 from experiments.dmc.o2o.plot import plot_aggregate
 
 
@@ -126,12 +131,12 @@ def _config(method: str, seed: int) -> O2OConfig:
         seed=seed,
         device="cpu",
         hidden_dim=12,
-        critic_hidden_layers=1,
+        critic_hidden_layers=2 if method == "Cal-QL-Raw" else 1,
         critic_ensemble_size=2,
         target_critic_subset=2,
         offline_updates=1,
         cql_actions=2,
-        online_steps=100_000,
+        online_steps=50_000,
         online_utd=1,
         online_warmup_steps=1,
         replay_capacity=8,
@@ -141,7 +146,7 @@ def _config(method: str, seed: int) -> O2OConfig:
         kmpc_solver_iterations=2,
         controller_hidden_dim=8,
         mpve_total_horizon=3,
-        eval_interval_online_steps=50_000,
+        eval_interval_online_steps=5_000,
         eval_episodes=10,
         checkpoint_interval_updates=1,
         log_interval_updates=1,
@@ -171,13 +176,23 @@ def _write_run(
     initialization: dict[str, Any] | None = None,
 ) -> Path:
     root.mkdir(parents=True)
-    koopman = FrozenKoopman(koopman_path)
-    learner_state: dict[str, Any]
-    if include_learner:
-        learner = O2OLearner(config, koopman, torch.device("cpu"))
-        learner_state = learner.state_dict()
-    else:
-        learner_state = {}
+    koopman = FrozenKoopman(koopman_path) if config.requires_koopman else None
+    normalizer = (
+        None
+        if config.requires_koopman
+        else FrozenObservationNormalizer.from_offline_observations(
+            dataset.arrays["observation"], dataset_sha256=dataset.sha256
+        )
+    )
+    learner = O2OLearner(
+        config,
+        koopman,
+        torch.device("cpu"),
+        observation_normalizer=normalizer,
+    )
+    learner_state: dict[str, Any] = learner.state_dict()
+    koopman_identity = koopman.identity() if koopman is not None else None
+    normalizer_identity = normalizer.identity() if normalizer is not None else None
     checkpoint = {
         "kind": CHECKPOINT_KIND,
         "config": config.to_dict(),
@@ -187,14 +202,15 @@ def _write_run(
             "sha256": dataset.sha256,
             "metadata": dataset.metadata,
         },
-        "koopman": koopman.identity(),
+        "koopman": koopman_identity,
+        "raw_observation_normalizer": normalizer_identity,
         "environment_protocol": PROTOCOL,
         "phase": "online",
         "offline_update": 1,
-        "online_step": 100_000,
-        "online_episode": 100,
+        "online_step": config.online_steps,
+        "online_episode": config.online_steps // 1_000,
         "best_return": eval_values[-1],
-        "best_online_step": 100_000,
+        "best_online_step": config.online_steps,
         "initialization": initialization,
         "learner": learner_state,
         "online_replay": OnlineReplay(8).state_dict(),
@@ -206,16 +222,17 @@ def _write_run(
         "config": config.to_dict(),
         "config_fingerprint": config.fingerprint,
         "dataset": {"path": str(dataset.path), "sha256": dataset.sha256},
-        "koopman": koopman.identity(),
+        "koopman": koopman_identity,
+        "raw_observation_normalizer": normalizer_identity,
         "environment_protocol": PROTOCOL,
         "initialization": initialization,
         "completed": True,
-        "online_steps_completed": 100_000,
+        "online_steps_completed": config.online_steps,
     }
     (root / "run.json").write_text(
         json.dumps(run_metadata, sort_keys=True), encoding="utf-8"
     )
-    rows = [
+    rows: list[dict[str, Any]] = [
         _row("initial", 0, 1.0),
         _row("offline_evaluation", 0, eval_values[0]),
         {
@@ -234,9 +251,23 @@ def _write_run(
             "episode_return": eval_values[1],
             "episode_length": 1_000,
         },
-        _row("online_evaluation", 50_000, eval_values[1]),
-        _row("online_evaluation", 100_000, eval_values[2]),
     ]
+    grid = (1_000, 2_500, *range(5_000, config.online_steps + 1, 5_000))
+    midpoint = config.online_steps // 2
+    for step in grid:
+        if step <= midpoint:
+            value = float(
+                np.interp(step, (0, midpoint), (eval_values[0], eval_values[1]))
+            )
+        else:
+            value = float(
+                np.interp(
+                    step,
+                    (midpoint, config.online_steps),
+                    (eval_values[1], eval_values[2]),
+                )
+            )
+        rows.append(_row("online_evaluation", step, value))
     (root / "metrics.jsonl").write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
@@ -339,6 +370,68 @@ def _write_formal_matrix(
     return run_dirs, initializations
 
 
+def _write_matrix_manifest(
+    path: Path,
+    *,
+    run_dirs: list[Path],
+    dataset: OfflineDataset,
+    koopman_path: Path,
+    seeds: tuple[int, ...],
+) -> Path:
+    """Write the minimal immutable runner manifest consumed by aggregation."""
+
+    repo_root = path.parent
+    source = repo_root / "frozen_source.py"
+    source.write_text("SOURCE_IDENTITY = 1\n", encoding="utf-8")
+    source_sha = file_sha256(source)
+    entries = [{"path": source.name, "sha256": source_sha}]
+    snapshot_sha = hashlib.sha256(
+        json.dumps(
+            {"files": entries}, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    snapshot = {"files": entries, "sha256": snapshot_sha}
+    configs: dict[str, dict[str, Any]] = {}
+    jobs: list[dict[str, Any]] = []
+    for run_dir in run_dirs:
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        config = metadata["config"]
+        method = config["method"]
+        configs.setdefault(method, config)
+        jobs.append(
+            {
+                "stage": "train",
+                "method": method,
+                "seed": config["seed"],
+                "cwd": str(repo_root),
+                "outputs": [str((run_dir / "latest.pt").resolve())],
+            }
+        )
+    payload = {
+        "kind": MATRIX_MANIFEST_KIND,
+        "matrix_fingerprint": "1" * 64,
+        "experiment": {
+            "methods": list(METHODS),
+            "seeds": list(seeds),
+            "online_steps": 50_000,
+            "extend_online_steps": None,
+            "evaluation_grid_online_steps": list(formal_evaluation_grid(50_000)),
+            "dataset": {"sha256": dataset.sha256},
+            "koopman": {"sha256": file_sha256(koopman_path)},
+            "resolved_method_configs": configs,
+        },
+        "source_identity": {
+            "training_source": snapshot,
+            "result_source": snapshot,
+            "runner": {"path": source.name, "sha256": source_sha},
+            "git": {"commit": "test"},
+        },
+        "jobs": jobs,
+    }
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return path
+
+
 class _FakeDMC:
     step_limit = 2
     action_low = np.asarray([-1.0], dtype=np.float32)
@@ -378,7 +471,7 @@ def test_evaluate_checkpoint_uses_fixed_ten_deterministic_episodes(
     koopman_path = _write_koopman(tmp_path / "koopman.npz")
     run_dir = _write_run(
         tmp_path / "run",
-        config=_config("RLPD-MLP", 11),
+        config=_config("RLPD-Raw", 11),
         dataset=dataset,
         koopman_path=koopman_path,
         eval_values=(100.0, 500.0, 900.0),
@@ -411,7 +504,7 @@ def test_run_identity_rejects_run_checkpoint_dataset_disagreement(
     koopman_path = _write_koopman(tmp_path / "koopman.npz")
     run_dir = _write_run(
         tmp_path / "run",
-        config=_config("RLPD-MLP", 11),
+        config=_config("RLPD-Raw", 11),
         dataset=dataset,
         koopman_path=koopman_path,
         eval_values=(100.0, 500.0, 900.0),
@@ -435,10 +528,31 @@ def test_curve_metrics_reports_auc_over_1000_and_cumulative_regret() -> None:
     assert metrics["auc_return_steps"] == pytest.approx(50_000_000.0)
     assert metrics["auc_over_1000"] == pytest.approx(50_000.0)
     assert metrics["normalized_auc"] == pytest.approx(0.5)
-    assert metrics["return_at_100k"] == pytest.approx(900.0)
+    assert metrics["return_at_budget"] == pytest.approx(900.0)
     assert metrics["final_return"] == pytest.approx(900.0)
     assert metrics["cumulative_regret_return_steps"] == pytest.approx(50_000_000.0)
     assert metrics["cumulative_regret_over_1000"] == pytest.approx(50_000.0)
+
+
+def test_formal_grid_includes_early_points_and_scales_with_common_budget() -> None:
+    assert formal_evaluation_grid(50_000) == (
+        0,
+        1_000,
+        2_500,
+        5_000,
+        10_000,
+        15_000,
+        20_000,
+        25_000,
+        30_000,
+        35_000,
+        40_000,
+        45_000,
+        50_000,
+    )
+    assert formal_evaluation_grid(60_000)[-1] == 60_000
+    with pytest.raises(ValueError, match="multiple of 5k"):
+        formal_evaluation_grid(52_500)
 
 
 def test_aggregate_uses_training_seeds_and_plot_writes_png_pdf(
@@ -448,8 +562,8 @@ def test_aggregate_uses_training_seeds_and_plot_writes_png_pdf(
     dataset = _write_dataset(tmp_path / "dataset.npz")
     koopman_path = _write_koopman(tmp_path / "koopman.npz")
     specifications = (
-        ("RLPD-MLP", 11, (100.0, 500.0, 900.0)),
-        ("RLPD-MLP", 12, (200.0, 600.0, 1000.0)),
+        ("RLPD-Raw", 11, (100.0, 500.0, 900.0)),
+        ("RLPD-Raw", 12, (200.0, 600.0, 1000.0)),
         ("Cal-RLPD-AC-KMPC", 11, (300.0, 700.0, 900.0)),
         ("Cal-RLPD-AC-KMPC", 12, (400.0, 800.0, 1000.0)),
     )
@@ -467,28 +581,91 @@ def test_aggregate_uses_training_seeds_and_plot_writes_png_pdf(
     result = aggregate_runs(run_dirs, require_complete=False)
 
     assert result["kind"] == AGGREGATE_KIND
-    rpld = result["methods"]["RLPD-MLP"]
+    assert result["formal_complete"] is False
+    assert result["authorization"]["source_verified"] is False
+    assert result["authorization"]["formal_complete"] is False
+    rpld = result["methods"]["RLPD-Raw"]
     assert rpld["training_seeds"] == [11, 12]
     assert rpld["metrics"]["step0_return"]["mean"] == pytest.approx(150.0)
-    assert rpld["metrics"]["auc_over_1000"]["mean"] == pytest.approx(55_000.0)
+    assert rpld["metrics"]["auc_over_1000"]["mean"] == pytest.approx(27_500.0)
     assert rpld["metrics"]["normalized_auc"]["mean"] == pytest.approx(0.55)
-    assert rpld["metrics"]["return_at_100k"]["mean"] == pytest.approx(950.0)
+    assert rpld["metrics"]["return_at_budget"]["mean"] == pytest.approx(950.0)
     assert rpld["metrics"]["final_return"]["mean"] == pytest.approx(950.0)
     assert rpld["metrics"]["cumulative_regret_over_1000"]["mean"] == pytest.approx(
-        45_000.0
+        22_500.0
     )
     assert rpld["metrics"]["final_return"]["inference_axis"] == "training_seed"
     assert rpld["metrics"]["final_return"]["ci95_distribution"] == "student_t_df_1"
     assert rpld["metrics"]["final_return"]["ci95_half_width"] == pytest.approx(
         12.7062047364 * 50.0
     )
-    assert len(rpld["evaluation_curve"]) == 3
+    assert len(rpld["evaluation_curve"]) == 13
 
     aggregate_path = tmp_path / "aggregate.json"
     aggregate_path.write_text(json.dumps(result), encoding="utf-8")
     png_path, pdf_path = plot_aggregate(aggregate_path, tmp_path / "curves")
     assert png_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert pdf_path.read_bytes().startswith(b"%PDF")
+
+
+def test_aggregate_rejects_method_specific_config_drift_across_seeds(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_dataset(tmp_path / "dataset.npz")
+    koopman_path = _write_koopman(tmp_path / "koopman.npz")
+    run_dirs = [
+        _write_run(
+            tmp_path / "RLPD-Raw" / "seed_11",
+            config=_config("RLPD-Raw", 11),
+            dataset=dataset,
+            koopman_path=koopman_path,
+            eval_values=(100.0, 500.0, 900.0),
+        ),
+        _write_run(
+            tmp_path / "RLPD-Raw" / "seed_12",
+            config=dataclasses.replace(
+                _config("RLPD-Raw", 12), actor_learning_rate=1e-4
+            ),
+            dataset=dataset,
+            koopman_path=koopman_path,
+            eval_values=(100.0, 500.0, 900.0),
+        ),
+    ]
+    with pytest.raises(ValueError, match="method-specific configs"):
+        aggregate_runs(run_dirs, require_complete=False)
+
+
+def test_formal_aggregate_records_and_verifies_matrix_source_identity(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_dataset(tmp_path / "dataset.npz")
+    koopman_path = _write_koopman(tmp_path / "koopman.npz")
+    run_dirs, _initializations = _write_formal_matrix(
+        tmp_path / "matrix_runs",
+        dataset=dataset,
+        koopman_path=koopman_path,
+    )
+    manifest = _write_matrix_manifest(
+        tmp_path / "matrix_manifest.json",
+        run_dirs=run_dirs,
+        dataset=dataset,
+        koopman_path=koopman_path,
+        seeds=(11, 12),
+    )
+
+    result = aggregate_runs(run_dirs, matrix_manifest=manifest)
+    assert result["formal_complete"] is True
+    assert result["authorization"]["source_verified"] is True
+    assert result["authorization"]["formal_complete"] is True
+    identity = result["shared_identity"]["matrix_source_identity"]
+    assert identity["matrix_fingerprint"] == "1" * 64
+    assert identity["training_source"]["files"][0]["path"] == "frozen_source.py"
+
+    (tmp_path / "frozen_source.py").write_text(
+        "SOURCE_IDENTITY = 2\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="training_source source file differs"):
+        aggregate_runs(run_dirs, matrix_manifest=manifest)
 
 
 def test_formal_aggregate_requires_full_matrix_and_identical_seed_sets(
@@ -499,7 +676,7 @@ def test_formal_aggregate_requires_full_matrix_and_identical_seed_sets(
     partial = [
         _write_run(
             tmp_path / "partial" / f"seed_{seed}",
-            config=_config("RLPD-MLP", seed),
+            config=_config("RLPD-Raw", seed),
             dataset=dataset,
             koopman_path=koopman_path,
             eval_values=(100.0, 500.0, 900.0),

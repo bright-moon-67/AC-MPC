@@ -8,6 +8,7 @@ import math
 import os
 import re
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,52 @@ def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def temporal_stratified_episode_indices(
+    *,
+    source_total_episodes: int = 10_000,
+    temporal_deciles: int = 10,
+    episodes_per_decile: int = 100,
+) -> tuple[int, ...]:
+    """Return deterministic, evenly spaced episode indices in every time block.
+
+    Each temporal block is divided into ``episodes_per_decile`` equal-width
+    micro-strata and the first episode of every micro-stratum is selected.
+    For the public ExORL Proto10M release this yields indices 0, 10, ..., 990
+    in the first decile and the analogous 100 indices in each later decile.
+    This avoids both the early-prefix bias and any RNG-dependent dataset
+    identity while retaining exactly one million complete transitions.
+    """
+
+    for name, value in (
+        ("source_total_episodes", source_total_episodes),
+        ("temporal_deciles", temporal_deciles),
+        ("episodes_per_decile", episodes_per_decile),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if source_total_episodes % temporal_deciles:
+        raise ValueError("source_total_episodes must divide evenly into temporal blocks")
+    episodes_per_block = source_total_episodes // temporal_deciles
+    if episodes_per_block % episodes_per_decile:
+        raise ValueError("Each temporal block must divide evenly into micro-strata")
+    micro_width = episodes_per_block // episodes_per_decile
+    if micro_width < 1:
+        raise ValueError("episodes_per_decile exceeds the temporal block size")
+    offset = 0
+    return tuple(
+        block * episodes_per_block + sample * micro_width + offset
+        for block in range(temporal_deciles)
+        for sample in range(episodes_per_decile)
+    )
+
+
+def _episode_index_identity(indices: Sequence[int]) -> str:
+    payload = json.dumps(
+        [int(index) for index in indices], separators=(",", ":"), allow_nan=False
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _cartpole_reward(next_observation: np.ndarray, action: np.ndarray) -> np.ndarray:
@@ -196,6 +243,9 @@ def convert_exorl_cartpole(
     *,
     max_transitions: int = 1_000_000,
     gamma: float = 0.99,
+    selected_episode_indices: Sequence[int] | None = None,
+    selection_metadata: dict[str, Any] | None = None,
+    source_archive: Path | None = None,
 ) -> dict[str, Any]:
     """Convert official ExORL episodes to one strict transition archive."""
 
@@ -209,10 +259,34 @@ def convert_exorl_cartpole(
     if not sources:
         raise FileNotFoundError(f"No ExORL episode files under {source_dir}")
 
+    selected_indices: tuple[int, ...] | None = None
+    if selected_episode_indices is not None:
+        selected_indices = tuple(int(index) for index in selected_episode_indices)
+        if (
+            not selected_indices
+            or any(index < 0 for index in selected_indices)
+            or tuple(sorted(set(selected_indices))) != selected_indices
+        ):
+            raise ValueError(
+                "selected_episode_indices must be non-empty, unique, non-negative, "
+                "and strictly increasing"
+            )
+        available_by_index = {source.index: source for source in sources}
+        missing_indices = [
+            index for index in selected_indices if index not in available_by_index
+        ]
+        unexpected_indices = sorted(set(available_by_index) - set(selected_indices))
+        if missing_indices or unexpected_indices:
+            raise ValueError(
+                "ExORL source files differ from the selected episode identity: "
+                f"missing={missing_indices[:10]}, unexpected={unexpected_indices[:10]}"
+            )
+        sources = [available_by_index[index] for index in selected_indices]
+
     release_sources = [source for source in sources if source.release_schema]
     if release_sources and len(release_sources) != len(sources):
         raise ValueError("Cannot mix release and legacy ExORL episode schemas")
-    if release_sources:
+    if release_sources and selected_indices is None:
         expected_indices = list(range(len(release_sources)))
         actual_indices = [source.index for source in release_sources]
         if actual_indices != expected_indices:
@@ -321,6 +395,23 @@ def convert_exorl_cartpole(
             float(value) for value in np.unique(arrays["discount"])
         ),
     }
+    if selected_indices is not None:
+        metadata.update(
+            source_episode_indices=list(selected_indices),
+            source_episode_indices_sha256=_episode_index_identity(selected_indices),
+            source_episode_index_first=selected_indices[0],
+            source_episode_index_last=selected_indices[-1],
+            selection=selection_metadata,
+        )
+    if source_archive is not None:
+        resolved_archive = source_archive.resolve()
+        if not resolved_archive.is_file():
+            raise FileNotFoundError(f"Source archive does not exist: {resolved_archive}")
+        metadata.update(
+            source_archive=str(resolved_archive),
+            source_archive_sha256=_sha256_file(resolved_archive),
+            source_archive_size_bytes=resolved_archive.stat().st_size,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False
@@ -503,17 +594,107 @@ class OnlineReplay:
         reward: float,
         discount: float,
         next_observation: np.ndarray,
+        *,
+        mc_return: float = 0.0,
     ) -> None:
+        observation = np.asarray(observation, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32)
+        next_observation = np.asarray(next_observation, dtype=np.float32)
+        expected_observation_shape = self.arrays["observation"].shape[1:]
+        expected_action_shape = self.arrays["action"].shape[1:]
+        if observation.shape != expected_observation_shape:
+            raise ValueError("Replay observation has the wrong shape")
+        if action.shape != expected_action_shape:
+            raise ValueError("Replay action has the wrong shape")
+        if next_observation.shape != expected_observation_shape:
+            raise ValueError("Replay next_observation has the wrong shape")
+        scalars = np.asarray((reward, discount, mc_return), dtype=np.float32)
+        if not all(np.isfinite(value).all() for value in (
+            observation, action, next_observation, scalars
+        )):
+            raise FloatingPointError("Replay transition contains NaN or Inf")
+        if not 0.0 <= float(discount) <= 1.0:
+            raise ValueError("Replay discount must lie in [0, 1]")
         index = self.cursor
         self.arrays["observation"][index] = observation
         self.arrays["action"][index] = action
         self.arrays["reward"][index] = reward
         self.arrays["discount"][index] = discount
         self.arrays["next_observation"][index] = next_observation
-        self.arrays["mc_return"][index] = 0.0
+        self.arrays["mc_return"][index] = mc_return
         self.arrays["offline_mask"][index] = 0.0
         self.cursor = (self.cursor + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+
+    def add_episode(
+        self,
+        observation: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        discount: np.ndarray,
+        next_observation: np.ndarray,
+        *,
+        gamma: float,
+    ) -> None:
+        """Atomically validate an episode, compute RTG, then append in order.
+
+        Validation and return computation finish before replay is mutated.  If
+        an episode exceeds replay capacity, ordinary ring-buffer semantics are
+        retained: after insertion replay contains the final ``capacity``
+        transitions in chronological order modulo ``cursor``.
+        """
+
+        observation = np.asarray(observation, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32)
+        reward = np.asarray(reward, dtype=np.float32)
+        discount = np.asarray(discount, dtype=np.float32)
+        next_observation = np.asarray(next_observation, dtype=np.float32)
+        if isinstance(gamma, bool) or not math.isfinite(gamma) or not 0 < gamma <= 1:
+            raise ValueError("gamma must lie in (0, 1]")
+        length = reward.shape[0] if reward.ndim == 1 else -1
+        expected_shapes = {
+            "observation": (length, self.arrays["observation"].shape[1]),
+            "action": (length, self.arrays["action"].shape[1]),
+            "reward": (length,),
+            "discount": (length,),
+            "next_observation": (length, self.arrays["next_observation"].shape[1]),
+        }
+        values = {
+            "observation": observation,
+            "action": action,
+            "reward": reward,
+            "discount": discount,
+            "next_observation": next_observation,
+        }
+        if length < 1:
+            raise ValueError("Replay episode must contain at least one transition")
+        for name, value in values.items():
+            if value.shape != expected_shapes[name]:
+                raise ValueError(
+                    f"Replay episode {name} has shape {value.shape}, "
+                    f"expected {expected_shapes[name]}"
+                )
+            if not np.isfinite(value).all():
+                raise FloatingPointError(f"Replay episode {name} contains NaN or Inf")
+        if np.any((discount < 0.0) | (discount > 1.0)):
+            raise ValueError("Replay episode discounts must lie in [0, 1]")
+        if length > 1 and not np.array_equal(
+            observation[1:], next_observation[:-1]
+        ):
+            raise ValueError("Replay episode transitions are not contiguous")
+        returns = _mc_returns(reward, discount, float(gamma))
+        if not np.isfinite(returns).all():
+            raise FloatingPointError("Replay episode produced non-finite MC returns")
+
+        for index in range(length):
+            self.add(
+                observation[index],
+                action[index],
+                float(reward[index]),
+                float(discount[index]),
+                next_observation[index],
+                mc_return=float(returns[index]),
+            )
 
     def sample(self, size: int, generator: np.random.Generator) -> dict[str, np.ndarray]:
         if self.size < 1:
@@ -547,6 +728,8 @@ class OnlineReplay:
             raise ValueError("Partially filled replay cursor must equal its size")
         if not isinstance(state.get("arrays"), dict):
             raise ValueError("Online replay checkpoint arrays are missing")
+        if set(state["arrays"]) != set(self.arrays):
+            raise ValueError("Online replay checkpoint array keys differ")
         for key in self.arrays:
             restored = np.asarray(state["arrays"][key])
             if restored.shape != self.arrays[key].shape:
@@ -631,16 +814,54 @@ def main() -> None:
     parser.add_argument("--max-transitions", type=int, default=1_000_000)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument(
+        "--temporal-stratified",
+        action="store_true",
+        help=(
+            "Select deterministic micro-stratum starts from every temporal block; "
+            "the source directory must contain exactly those episode files"
+        ),
+    )
+    parser.add_argument("--source-total-episodes", type=int, default=10_000)
+    parser.add_argument("--temporal-deciles", type=int, default=10)
+    parser.add_argument("--episodes-per-decile", type=int, default=100)
+    parser.add_argument(
+        "--source-archive",
+        type=Path,
+        help="Optional immutable release archive whose SHA256 is bound into metadata",
+    )
+    parser.add_argument(
         "--manifest",
         type=Path,
         help="Conversion manifest (default: <output stem>.manifest.json)",
     )
     args = parser.parse_args()
+    selected_indices = None
+    selection_metadata = None
+    if args.temporal_stratified:
+        selected_indices = temporal_stratified_episode_indices(
+            source_total_episodes=args.source_total_episodes,
+            temporal_deciles=args.temporal_deciles,
+            episodes_per_decile=args.episodes_per_decile,
+        )
+        episodes_per_block = args.source_total_episodes // args.temporal_deciles
+        micro_width = episodes_per_block // args.episodes_per_decile
+        selection_metadata = {
+            "kind": "temporal_block_microstratum_start_v1",
+            "source_total_episodes": args.source_total_episodes,
+            "temporal_blocks": args.temporal_deciles,
+            "episodes_per_block": episodes_per_block,
+            "selected_episodes_per_block": args.episodes_per_decile,
+            "microstratum_width_episodes": micro_width,
+            "microstratum_offset": 0,
+        }
     metadata = convert_exorl_cartpole(
         args.source_dir,
         args.output,
         max_transitions=args.max_transitions,
         gamma=args.gamma,
+        selected_episode_indices=selected_indices,
+        selection_metadata=selection_metadata,
+        source_archive=args.source_archive,
     )
     manifest_path = (
         args.manifest.resolve()
@@ -653,6 +874,13 @@ def main() -> None:
         "output": str(args.output.resolve()),
         "max_transitions": args.max_transitions,
         "gamma": args.gamma,
+        "temporal_stratified": args.temporal_stratified,
+        "source_total_episodes": args.source_total_episodes,
+        "temporal_deciles": args.temporal_deciles,
+        "episodes_per_decile": args.episodes_per_decile,
+        "source_archive": (
+            str(args.source_archive.resolve()) if args.source_archive is not None else None
+        ),
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")

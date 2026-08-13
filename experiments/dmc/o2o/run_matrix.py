@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -23,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, IO, Mapping, Sequence
 
-from experiments.dmc.o2o.config import METHODS, O2OConfig
+from experiments.dmc.o2o.config import METHODS, METHOD_SPECS, O2OConfig
 
 
 MANIFEST_KIND = "acmpc_dmc_o2o_matrix_manifest_v1"
@@ -32,6 +33,12 @@ RUN_KIND = "acmpc_dmc_o2o_run_v1"
 EVALUATION_KIND = "acmpc_dmc_o2o_checkpoint_evaluation_v1"
 AGGREGATE_KIND = "acmpc_dmc_o2o_aggregate_v1"
 MATRIX_METHODS = tuple(METHODS)
+RAW_METHODS = frozenset(
+    method for method, spec in METHOD_SPECS.items() if not spec.requires_koopman
+)
+STRUCTURED_METHODS = frozenset(
+    method for method, spec in METHOD_SPECS.items() if spec.requires_koopman
+)
 MPVE_METHOD = "Cal-RLPD-AC-KMPC-MPVE"
 MPVE_SOURCE_METHOD = "Cal-RLPD-AC-KMPC"
 DEFAULT_SEEDS = (20260821, 20260822, 20260823)
@@ -51,6 +58,7 @@ _TRAINING_SOURCE_FILES = (
     "experiments/dmc/o2o/koopman.py",
     "experiments/dmc/o2o/learner.py",
     "experiments/dmc/o2o/networks.py",
+    "experiments/dmc/o2o/runner.py",
     "experiments/dmc/o2o/train.py",
     "experiments/dmc/ppo/vector_env.py",
     "experiments/dmc/reward_oracle.py",
@@ -124,6 +132,12 @@ def parse_seeds(text: str) -> tuple[int, ...]:
     return seeds
 
 
+def _formal_evaluation_grid(online_steps: int) -> tuple[int, ...]:
+    if online_steps < 5_000 or online_steps % 5_000:
+        raise ValueError("Formal online budget must be a multiple of 5k")
+    return (0, 1_000, 2_500, *range(5_000, online_steps + 1, 5_000))
+
+
 @dataclass(frozen=True)
 class MatrixSpec:
     repo_root: Path
@@ -134,10 +148,13 @@ class MatrixSpec:
     device: str = "cuda"
     eval_device: str = "cpu"
     offline_updates: int = 500_000
-    online_steps: int = 100_000
-    online_utd: int = 20
-    num_envs: int = 5
-    env_workers: int = 5
+    online_steps: int = 50_000
+    extend_online_steps: int | None = None
+    # None preserves each MethodSpec's official/official-style defaults.
+    # Non-None values are explicit diagnostic overrides and are recorded.
+    online_utd: int | None = None
+    num_envs: int | None = None
+    env_workers: int | None = None
     cql_weight: float = 0.01
     eval_episodes: int = 10
     max_parallel: int = 1
@@ -182,6 +199,18 @@ class MatrixSpec:
             raise ValueError("eval_device must be cpu, cuda, or auto")
         if self.max_parallel < 1:
             raise ValueError("max_parallel must be positive")
+        if self.online_steps < 5_000 or self.online_steps % 5_000:
+            raise ValueError(
+                "Formal matrix online_steps must be a multiple of 5k and at least 5k"
+            )
+        if self.extend_online_steps is not None:
+            if (
+                self.extend_online_steps <= self.online_steps
+                or self.extend_online_steps % 5_000
+            ):
+                raise ValueError(
+                    "extend_online_steps must exceed online_steps and be a multiple of 5k"
+                )
         if self.eval_episodes != 10:
             raise ValueError("The formal result protocol requires exactly 10 episodes")
         for seed in self.seeds:
@@ -189,18 +218,27 @@ class MatrixSpec:
                 self.config(method, seed).validate()
 
     def config(self, method: str, seed: int) -> O2OConfig:
+        overrides: dict[str, Any] = {}
+        for name in ("online_utd", "num_envs", "env_workers"):
+            value = getattr(self, name)
+            if value is not None:
+                overrides[name] = value
         return O2OConfig(
             method=method,
             seed=seed,
             device=self.device,
             offline_updates=self.offline_updates,
             online_steps=self.online_steps,
-            online_utd=self.online_utd,
-            num_envs=self.num_envs,
-            env_workers=self.env_workers,
             cql_weight=self.cql_weight,
             eval_episodes=self.eval_episodes,
+            **overrides,
         )
+
+    def target_config(self, method: str, seed: int) -> O2OConfig:
+        base = self.config(method, seed)
+        if self.extend_online_steps is None:
+            return base
+        return replace(base, online_steps=self.extend_online_steps)
 
     def run_dir(self, seed: int, method: str) -> Path:
         return self.root / f"seed_{seed}" / method
@@ -405,13 +443,24 @@ def _expected_koopman(spec: MatrixSpec) -> dict[str, str]:
     return {"path": str(spec.koopman), "sha256": _sha256_file(spec.koopman)}
 
 
+def _method_koopman(
+    method: str, koopman: Mapping[str, str]
+) -> Mapping[str, str] | None:
+    if method in RAW_METHODS:
+        return None
+    if method in STRUCTURED_METHODS:
+        return koopman
+    raise ValueError(f"Unknown matrix method: {method}")
+
+
 def _check_run_identity(
     spec: MatrixSpec,
     *,
     seed: int,
     method: str,
     dataset: Mapping[str, str],
-    koopman: Mapping[str, str],
+    koopman: Mapping[str, str] | None,
+    expected_config: O2OConfig | None = None,
 ) -> str:
     """Return fresh/resume/completed or reject ambiguous/cross-protocol state."""
 
@@ -428,7 +477,7 @@ def _check_run_identity(
             raise RuntimeError(f"Run artifacts exist without run.json: {run_dir}")
         return "fresh"
     metadata = _read_json(metadata_path)
-    config = spec.config(method, seed)
+    config = expected_config or spec.config(method, seed)
     if metadata.get("kind") != RUN_KIND:
         raise ValueError(f"Unsupported run kind in {metadata_path}")
     if metadata.get("config") != config.to_dict():
@@ -441,9 +490,7 @@ def _check_run_identity(
     ):
         raise ValueError(f"Existing run dataset identity differs: {run_dir}")
     saved_koopman = metadata.get("koopman")
-    if not isinstance(saved_koopman, Mapping) or any(
-        saved_koopman.get(key) != value for key, value in koopman.items()
-    ):
+    if saved_koopman != koopman:
         raise ValueError(f"Existing run Koopman identity differs: {run_dir}")
     initialization = metadata.get("initialization")
     if method == MPVE_METHOD:
@@ -483,11 +530,128 @@ def _check_run_identity(
             )
         return "completed"
     if not latest.is_file():
+        initialization_residue = (
+            run_dir / "best.pt",
+            run_dir / "offline.pt",
+            run_dir / "metrics.jsonl",
+        )
+        if not any(path.exists() for path in initialization_residue):
+            # ``train.py`` writes identity-bound run metadata immediately
+            # before its atomic step-zero checkpoint.  A failure in that tiny
+            # window is safe to replay from the deterministic seed/fork.
+            return "restart_initialization"
         raise RuntimeError(
             f"Partial run has no resumable latest.pt; preserve it for audit and use "
             f"a fresh run directory: {run_dir}"
         )
     return "resume"
+
+
+def _extension_lineage_matches(
+    value: Any,
+    *,
+    base_config: O2OConfig,
+    target_config: O2OConfig,
+) -> bool:
+    """Validate the immutable portion of one online-extension lineage.
+
+    ``requested_unix_seconds`` is deliberately not recomputed by the matrix
+    runner.  It identifies the first trainer invocation that began the
+    migration and must remain unchanged across every retry.
+    """
+
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("kind") == "acmpc_o2o_online_extension_v1"
+        and value.get("previous_online_steps") == base_config.online_steps
+        and value.get("extended_online_steps") == target_config.online_steps
+        and value.get("previous_config_fingerprint") == base_config.fingerprint
+        and value.get("extended_config_fingerprint") == target_config.fingerprint
+        and isinstance(value.get("requested_unix_seconds"), (int, float))
+        and not isinstance(value.get("requested_unix_seconds"), bool)
+        and math.isfinite(float(value.get("requested_unix_seconds")))
+    )
+
+
+def _check_extension_run_identity(
+    spec: MatrixSpec,
+    *,
+    seed: int,
+    method: str,
+    dataset: Mapping[str, str],
+    koopman: Mapping[str, str] | None,
+) -> str:
+    """Return extend/resume_extension/completed for an extension invocation.
+
+    A process or host failure can leave different methods at different safe
+    points: an untouched completed base run, a target-config partial run, or a
+    completed target run.  All three are valid in one matrix retry; any other
+    identity remains fail-closed.
+    """
+
+    if spec.extend_online_steps is None:
+        raise ValueError("Extension identity validation requires a target budget")
+    run_dir = spec.run_dir(seed, method)
+    metadata_path = run_dir / "run.json"
+    if not metadata_path.is_file():
+        # Reuse the ordinary validator so an orphan artifact receives its
+        # precise error rather than being mistaken for an absent source run.
+        mode = _check_run_identity(
+            spec,
+            seed=seed,
+            method=method,
+            dataset=dataset,
+            koopman=koopman,
+        )
+        raise ValueError(
+            "Matrix-wide extension requires a complete five-method source "
+            f"matrix; {run_dir} is {mode}"
+        )
+
+    metadata = _read_json(metadata_path)
+    base_config = spec.config(method, seed)
+    target_config = spec.target_config(method, seed)
+    saved_config = metadata.get("config")
+    if saved_config == base_config.to_dict():
+        if metadata.get("online_extension") is not None:
+            raise ValueError(f"Base run unexpectedly has extension lineage: {run_dir}")
+        mode = _check_run_identity(
+            spec,
+            seed=seed,
+            method=method,
+            dataset=dataset,
+            koopman=koopman,
+            expected_config=base_config,
+        )
+        if mode != "completed":
+            raise ValueError(
+                "Matrix-wide extension requires every untouched source run to "
+                f"be completed; {run_dir} is {mode}"
+            )
+        return "extend"
+
+    if saved_config == target_config.to_dict():
+        if not _extension_lineage_matches(
+            metadata.get("online_extension"),
+            base_config=base_config,
+            target_config=target_config,
+        ):
+            raise ValueError(f"Extended run has invalid lineage: {run_dir}")
+        mode = _check_run_identity(
+            spec,
+            seed=seed,
+            method=method,
+            dataset=dataset,
+            koopman=koopman,
+            expected_config=target_config,
+        )
+        if mode == "completed":
+            return "completed"
+        if mode == "resume":
+            return "resume_extension"
+        raise AssertionError(f"Unexpected target extension mode {mode!r}")
+
+    raise ValueError(f"Existing run is neither base nor target extension: {run_dir}")
 
 
 def _evaluation_is_current(
@@ -496,7 +660,7 @@ def _evaluation_is_current(
     seed: int,
     method: str,
     dataset: Mapping[str, str],
-    koopman: Mapping[str, str],
+    koopman: Mapping[str, str] | None,
 ) -> bool:
     path = spec.run_dir(seed, method) / "evaluation_latest_10.json"
     if not path.is_file():
@@ -508,7 +672,7 @@ def _evaluation_is_current(
     latest = spec.run_dir(seed, method) / "latest.pt"
     if not latest.is_file():
         return False
-    config = spec.config(method, seed)
+    config = spec.target_config(method, seed)
     protocol = report.get("evaluation_protocol")
     saved_dataset = report.get("dataset")
     saved_koopman = report.get("koopman")
@@ -525,8 +689,7 @@ def _evaluation_is_current(
         and protocol.get("episodes") == 10
         and isinstance(saved_dataset, Mapping)
         and saved_dataset.get("sha256") == dataset["sha256"]
-        and isinstance(saved_koopman, Mapping)
-        and saved_koopman.get("sha256") == koopman["sha256"]
+        and saved_koopman == koopman
     )
 
 
@@ -541,8 +704,6 @@ def _train_argv(
         method,
         "--dataset",
         str(spec.dataset),
-        "--koopman",
-        str(spec.koopman),
         "--output-dir",
         str(spec.run_dir(seed, method)),
         "--seed",
@@ -553,18 +714,27 @@ def _train_argv(
         str(spec.offline_updates),
         "--online-steps",
         str(spec.online_steps),
-        "--online-utd",
-        str(spec.online_utd),
-        "--num-envs",
-        str(spec.num_envs),
-        "--env-workers",
-        str(spec.env_workers),
         "--cql-weight",
         str(spec.cql_weight),
         "--eval-episodes",
         str(spec.eval_episodes),
     )
-    if method == MPVE_METHOD and mode != "resume":
+    for option, value in (
+        ("--online-utd", spec.online_utd),
+        ("--num-envs", spec.num_envs),
+        ("--env-workers", spec.env_workers),
+    ):
+        if value is not None:
+            argv += (option, str(value))
+    if method in STRUCTURED_METHODS:
+        argv += ("--koopman", str(spec.koopman))
+    if spec.extend_online_steps is not None:
+        if mode not in {"extend", "resume_extension", "completed"}:
+            raise ValueError(
+                "Matrix-wide extension received an unsupported run state"
+            )
+        argv += ("--extend-online-steps", str(spec.extend_online_steps))
+    if method == MPVE_METHOD and mode in {"fresh", "restart_initialization"}:
         argv += ("--initialize-from-offline", str(spec.offline_source(seed)))
     return argv
 
@@ -582,13 +752,23 @@ def build_jobs(
         train_ids: dict[str, str] = {}
         for method in MATRIX_METHODS:
             job_id = f"train.seed_{seed}.{method}"
-            mode = _check_run_identity(
-                spec,
-                seed=seed,
-                method=method,
-                dataset=dataset,
-                koopman=koopman,
-            )
+            method_koopman = _method_koopman(method, koopman)
+            if spec.extend_online_steps is not None:
+                mode = _check_extension_run_identity(
+                    spec,
+                    seed=seed,
+                    method=method,
+                    dataset=dataset,
+                    koopman=method_koopman,
+                )
+            else:
+                mode = _check_run_identity(
+                    spec,
+                    seed=seed,
+                    method=method,
+                    dataset=dataset,
+                    koopman=method_koopman,
+                )
             train_ids[method] = job_id
             jobs.append(
                 Job(
@@ -609,30 +789,29 @@ def build_jobs(
         for method in MATRIX_METHODS:
             job_id = f"evaluate.seed_{seed}.{method}.latest"
             evaluation_ids.append(job_id)
+            evaluation_argv: tuple[str, ...] = (
+                spec.python,
+                "-m",
+                "experiments.dmc.o2o.evaluate",
+                "--run-dir",
+                str(spec.run_dir(seed, method)),
+                "--checkpoint",
+                "latest",
+                "--dataset",
+                str(spec.dataset),
+                "--device",
+                spec.eval_device,
+                "--output",
+                str(spec.run_dir(seed, method) / "evaluation_latest_10.json"),
+            )
+            method_koopman = _method_koopman(method, koopman)
+            if method_koopman is not None:
+                evaluation_argv += ("--koopman", str(spec.koopman))
             jobs.append(
                 Job(
                     job_id=job_id,
                     stage="evaluate",
-                    argv=(
-                        spec.python,
-                        "-m",
-                        "experiments.dmc.o2o.evaluate",
-                        "--run-dir",
-                        str(spec.run_dir(seed, method)),
-                        "--checkpoint",
-                        "latest",
-                        "--dataset",
-                        str(spec.dataset),
-                        "--koopman",
-                        str(spec.koopman),
-                        "--device",
-                        spec.eval_device,
-                        "--output",
-                        str(
-                            spec.run_dir(seed, method)
-                            / "evaluation_latest_10.json"
-                        ),
-                    ),
+                    argv=evaluation_argv,
                     log_path=logs / f"{job_id}.log",
                     output_paths=(
                         spec.run_dir(seed, method) / "evaluation_latest_10.json",
@@ -648,18 +827,20 @@ def build_jobs(
                             seed=seed,
                             method=method,
                             dataset=dataset,
-                            koopman=koopman,
+                            koopman=method_koopman,
                         )
                         else "run"
                     ),
                 )
             )
-    aggregate_path = spec.root / "results" / "cartpole_proto1m.json"
+    aggregate_path = spec.root / "results" / "cartpole_o2o.json"
     aggregate_id = "aggregate.latest"
     aggregate_argv: tuple[str, ...] = (
         spec.python,
         "-m",
         "experiments.dmc.o2o.aggregate",
+        "--matrix-manifest",
+        str(spec.root / "matrix_manifest.json"),
         "--output",
         str(aggregate_path),
     )
@@ -676,7 +857,7 @@ def build_jobs(
             depends_on=tuple(evaluation_ids),
         )
     )
-    plot_prefix = spec.root / "results" / "cartpole_proto1m"
+    plot_prefix = spec.root / "results" / "cartpole_o2o"
     jobs.append(
         Job(
             job_id="plot.latest",
@@ -715,14 +896,35 @@ def _manifest(
         "seeds": list(spec.seeds),
         "dataset": dict(dataset),
         "koopman": dict(koopman),
+        "method_observation_contract": {
+            method: {
+                "actor_critic_input": (
+                    "raw_normalized_observation"
+                    if method in RAW_METHODS
+                    else "frozen_koopman_lifted_state"
+                ),
+                "koopman": None if method in RAW_METHODS else dict(koopman),
+            }
+            for method in MATRIX_METHODS
+        },
         "root": str(spec.root),
         "device": spec.device,
         "eval_device": spec.eval_device,
         "offline_updates": spec.offline_updates,
         "online_steps": spec.online_steps,
+        "extend_online_steps": spec.extend_online_steps,
         "online_utd": spec.online_utd,
         "num_envs": spec.num_envs,
         "env_workers": spec.env_workers,
+        "resolved_method_configs": {
+            method: spec.target_config(method, spec.seeds[0]).to_dict()
+            for method in MATRIX_METHODS
+        },
+        "evaluation_grid_online_steps": list(
+            _formal_evaluation_grid(
+                spec.extend_online_steps or spec.online_steps
+            )
+        ),
         "cql_weight": spec.cql_weight,
         "eval_episodes": spec.eval_episodes,
         "max_parallel": spec.max_parallel,
@@ -768,13 +970,117 @@ def _compatible_existing_manifest(path: Path, manifest: dict[str, Any]) -> dict[
     if existing.get("kind") != MANIFEST_KIND:
         raise ValueError(f"Unsupported matrix manifest: {path}")
     if existing.get("matrix_fingerprint") != manifest["matrix_fingerprint"]:
-        raise RuntimeError(
-            "Existing matrix manifest has a different data/config/source identity; "
-            "use a new --root"
+        lineage = manifest.get("extension_lineage")
+        replacing_archived_base = bool(
+            isinstance(lineage, Mapping)
+            and lineage.get("kind") == "acmpc_dmc_o2o_matrix_extension_v1"
+            and lineage.get("source_matrix_fingerprint")
+            == existing.get("matrix_fingerprint")
         )
+        if not replacing_archived_base:
+            raise RuntimeError(
+                "Existing matrix manifest has a different data/config/source identity; "
+                "use a new --root"
+            )
+        manifest["last_invoked_utc"] = _utc_now()
+        return manifest
     manifest["created_utc"] = existing.get("created_utc", manifest["created_utc"])
     manifest["last_invoked_utc"] = _utc_now()
     return manifest
+
+
+def _archive_completed_source_matrix_for_extension(
+    spec: MatrixSpec,
+    *,
+    manifest_path: Path,
+    status_path: Path,
+    new_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve the complete base invocation before a matrix-wide extension."""
+
+    if spec.extend_online_steps is None or not manifest_path.exists():
+        return new_manifest
+    existing = _read_json(manifest_path)
+    if existing.get("matrix_fingerprint") == new_manifest["matrix_fingerprint"]:
+        lineage = existing.get("extension_lineage")
+        if not isinstance(lineage, Mapping) or lineage.get("kind") != (
+            "acmpc_dmc_o2o_matrix_extension_v1"
+        ):
+            raise RuntimeError("Active extension manifest is missing its lineage")
+        new_manifest["extension_lineage"] = dict(lineage)
+        return new_manifest
+    if existing.get("kind") != MANIFEST_KIND:
+        raise ValueError("Cannot extend an unsupported matrix manifest")
+    old_experiment = existing.get("experiment")
+    new_experiment = new_manifest.get("experiment")
+    if not isinstance(old_experiment, Mapping) or not isinstance(
+        new_experiment, Mapping
+    ):
+        raise ValueError("Extension matrix manifests lack experiment identity")
+    invariant_keys = (
+        "task",
+        "methods",
+        "seeds",
+        "dataset",
+        "koopman",
+        "method_observation_contract",
+        "root",
+        "device",
+        "eval_device",
+        "offline_updates",
+        "online_steps",
+        "online_utd",
+        "num_envs",
+        "env_workers",
+        "cql_weight",
+        "eval_episodes",
+    )
+    mismatches = {
+        key: (old_experiment.get(key), new_experiment.get(key))
+        for key in invariant_keys
+        if old_experiment.get(key) != new_experiment.get(key)
+    }
+    if mismatches or old_experiment.get("extend_online_steps") is not None:
+        raise RuntimeError(
+            "Online extension source matrix has a different scientific identity: "
+            f"{mismatches}"
+        )
+    status = _read_json(status_path)
+    if (
+        status.get("kind") != STATUS_KIND
+        or status.get("matrix_fingerprint") != existing.get("matrix_fingerprint")
+        or status.get("state") != "completed"
+    ):
+        raise RuntimeError("Online extension requires a completed base matrix status")
+
+    suffix = f"pre_extension_{spec.online_steps}"
+    archived_manifest = manifest_path.with_name(f"matrix_manifest.{suffix}.json")
+    archived_status = status_path.with_name(f"matrix_status.{suffix}.json")
+    # Copy both completed source records atomically instead of moving them.
+    # The active base pair therefore remains valid until the new extension
+    # manifest/status pair replaces it.  Retrying after either archive write is
+    # idempotent and validates the already-created copy.
+    for archive_path, value, kind in (
+        (archived_manifest, existing, MANIFEST_KIND),
+        (archived_status, status, STATUS_KIND),
+    ):
+        if archive_path.exists():
+            archived = _read_json(archive_path)
+            if archived != value or archived.get("kind") != kind:
+                raise RuntimeError(
+                    f"Extension audit archive identity differs: {archive_path}"
+                )
+        else:
+            _atomic_json(archive_path, value)
+    new_manifest["extension_lineage"] = {
+        "kind": "acmpc_dmc_o2o_matrix_extension_v1",
+        "source_matrix_fingerprint": existing["matrix_fingerprint"],
+        "source_online_steps": spec.online_steps,
+        "extended_online_steps": spec.extend_online_steps,
+        "archived_manifest": str(archived_manifest),
+        "archived_status": str(archived_status),
+    }
+    return new_manifest
 
 
 def _initial_status(
@@ -786,7 +1092,23 @@ def _initial_status(
         if previous.get("kind") != STATUS_KIND:
             raise ValueError(f"Unsupported matrix status: {status_path}")
         if previous.get("matrix_fingerprint") != manifest["matrix_fingerprint"]:
-            raise RuntimeError("Existing matrix status belongs to another manifest")
+            lineage = manifest.get("extension_lineage")
+            completed_archived_base = bool(
+                isinstance(lineage, Mapping)
+                and lineage.get("kind") == "acmpc_dmc_o2o_matrix_extension_v1"
+                and lineage.get("source_matrix_fingerprint")
+                == previous.get("matrix_fingerprint")
+                and previous.get("state") == "completed"
+            )
+            if completed_archived_base:
+                # Crash window: the extension manifest replaced the active
+                # base manifest, but its new status had not yet been written.
+                # The completed base status is already archived, so initialize
+                # a fresh extension status rather than rejecting the retry.
+                previous = None
+            else:
+                raise RuntimeError("Existing matrix status belongs to another manifest")
+    if previous is not None:
         if previous.get("state") in {"running", "fail_fast_waiting"} and _pid_alive(
             previous.get("runner_pid")
         ):
@@ -942,24 +1264,27 @@ def _validate_job_output(
 ) -> None:
     if job.stage == "train":
         assert job.seed is not None and job.method is not None
+        method_koopman = _method_koopman(job.method, koopman)
         mode = _check_run_identity(
             spec,
             seed=job.seed,
             method=job.method,
             dataset=dataset,
-            koopman=koopman,
+            koopman=method_koopman,
+            expected_config=spec.target_config(job.method, job.seed),
         )
         if mode != "completed":
             raise RuntimeError(f"Training child exited zero but run is {mode}: {job.job_id}")
         return
     if job.stage == "evaluate":
         assert job.seed is not None and job.method is not None
+        method_koopman = _method_koopman(job.method, koopman)
         if not _evaluation_is_current(
             spec,
             seed=job.seed,
             method=job.method,
             dataset=dataset,
-            koopman=koopman,
+            koopman=method_koopman,
         ):
             raise RuntimeError(
                 f"Evaluation child exited zero without a current report: {job.job_id}"
@@ -1129,12 +1454,13 @@ def _run_serial_result_jobs(
     for job in jobs:
         if job.stage == "evaluate":
             assert job.seed is not None and job.method is not None
+            method_koopman = _method_koopman(job.method, koopman)
             if _evaluation_is_current(
                 spec,
                 seed=job.seed,
                 method=job.method,
                 dataset=dataset,
-                koopman=koopman,
+                koopman=method_koopman,
             ):
                 _set_skipped(status, job, "strictly_current_latest_evaluation")
                 _write_status(status_path, status)
@@ -1226,6 +1552,12 @@ def _run_matrix_locked(
     spec.root.mkdir(parents=True, exist_ok=True)
     manifest_path = spec.root / "matrix_manifest.json"
     status_path = spec.root / "matrix_status.json"
+    manifest = _archive_completed_source_matrix_for_extension(
+        spec,
+        manifest_path=manifest_path,
+        status_path=status_path,
+        new_manifest=manifest,
+    )
     manifest = _compatible_existing_manifest(manifest_path, manifest)
     status = _initial_status(status_path, manifest, jobs)
     _atomic_json(manifest_path, manifest)
@@ -1324,10 +1656,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--eval-device", choices=("cpu", "cuda", "auto"), default="cpu"
     )
     parser.add_argument("--offline-updates", type=int, default=500_000)
-    parser.add_argument("--online-steps", type=int, default=100_000)
-    parser.add_argument("--online-utd", type=int, default=20)
-    parser.add_argument("--num-envs", type=int, default=5)
-    parser.add_argument("--env-workers", type=int, default=5)
+    parser.add_argument("--online-steps", type=int, default=50_000)
+    parser.add_argument("--extend-online-steps", type=int)
+    parser.add_argument("--online-utd", type=int)
+    parser.add_argument("--num-envs", type=int)
+    parser.add_argument("--env-workers", type=int)
     parser.add_argument("--cql-weight", type=float, default=0.01)
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument("--max-parallel", type=int, default=1)
@@ -1349,6 +1682,7 @@ def main() -> None:
         eval_device=args.eval_device,
         offline_updates=args.offline_updates,
         online_steps=args.online_steps,
+        extend_online_steps=args.extend_online_steps,
         online_utd=args.online_utd,
         num_envs=args.num_envs,
         env_workers=args.env_workers,

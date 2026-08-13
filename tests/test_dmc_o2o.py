@@ -26,10 +26,14 @@ from experiments.dmc.o2o.dataset import (
     _cartpole_reward,
     convert_exorl_cartpole,
     mixed_batch,
+    temporal_stratified_episode_indices,
 )
 from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner, TensorBatch
 from experiments.dmc.o2o.networks import (
+    ExORLCQLActor,
+    ExORLCQLQEnsemble,
+    FrozenObservationNormalizer,
     KMPCTanhGaussianActor,
     MLPActor,
     QEnsemble,
@@ -180,6 +184,17 @@ def test_exorl_conversion_rejects_recorded_reward_mismatch(tmp_path: Path) -> No
 
     with pytest.raises(AssertionError, match="reward parity"):
         convert_exorl_cartpole(source, tmp_path / "transitions.npz")
+
+
+def test_temporal_stratified_episode_indices_cover_every_decile() -> None:
+    indices = temporal_stratified_episode_indices()
+
+    assert len(indices) == 1000
+    assert indices[:100] == tuple(range(0, 1000, 10))
+    assert indices[-100:] == tuple(range(9000, 10_000, 10))
+    for decile in range(10):
+        block = indices[decile * 100 : (decile + 1) * 100]
+        assert block == tuple(range(decile * 1000, (decile + 1) * 1000, 10))
 
 
 def test_frozen_koopman_normalizes_lifts_steps_and_reconstructs(
@@ -403,6 +418,79 @@ def test_online_replay_checkpoint_zeroes_unwritten_capacity_and_round_trips() ->
     assert restored.cursor == replay.cursor == 2
     for key in replay.arrays:
         np.testing.assert_array_equal(restored.arrays[key], replay.arrays[key])
+    missing_mc_return = copy.deepcopy(state)
+    del missing_mc_return["arrays"]["mc_return"]
+    with pytest.raises(ValueError, match="array keys differ"):
+        OnlineReplay(capacity=4).load_state_dict(missing_mc_return)
+
+
+def test_online_replay_add_episode_is_atomic_and_stores_discounted_rtg() -> None:
+    replay = OnlineReplay(capacity=8)
+    states = np.arange(20, dtype=np.float32).reshape(4, 5)
+    observation = states[:3]
+    next_observation = states[1:]
+    action = np.asarray([[0.1], [0.2], [0.3]], dtype=np.float32)
+    reward = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    discount = np.asarray([1.0, 0.5, 1.0], dtype=np.float32)
+
+    replay.add_episode(
+        observation,
+        action,
+        reward,
+        discount,
+        next_observation,
+        gamma=0.9,
+    )
+
+    assert replay.size == replay.cursor == 3
+    np.testing.assert_allclose(
+        replay.arrays["mc_return"][:3],
+        [1.0 + 0.9 * (2.0 + 0.9 * 0.5 * 3.0), 2.0 + 0.9 * 0.5 * 3.0, 3.0],
+        rtol=1e-6,
+    )
+    state = replay.state_dict()
+    restored = OnlineReplay(capacity=8)
+    restored.load_state_dict(state)
+    np.testing.assert_array_equal(
+        restored.arrays["mc_return"], replay.arrays["mc_return"]
+    )
+
+    before = replay.state_dict()
+    broken_next = next_observation.copy()
+    broken_next[0] += 1.0
+    with pytest.raises(ValueError, match="not contiguous"):
+        replay.add_episode(
+            observation,
+            action,
+            reward,
+            discount,
+            broken_next,
+            gamma=0.9,
+        )
+    after = replay.state_dict()
+    assert after["size"] == before["size"]
+    assert after["cursor"] == before["cursor"]
+    for key in before["arrays"]:
+        np.testing.assert_array_equal(after["arrays"][key], before["arrays"][key])
+
+
+def test_online_replay_add_episode_longer_than_capacity_keeps_ring_semantics() -> None:
+    replay = OnlineReplay(capacity=2)
+    states = np.arange(20, dtype=np.float32).reshape(4, 5)
+    replay.add_episode(
+        states[:3],
+        np.zeros((3, 1), dtype=np.float32),
+        np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
+        np.ones(3, dtype=np.float32),
+        states[1:],
+        gamma=1.0,
+    )
+
+    assert replay.size == 2
+    assert replay.cursor == 1
+    # Slots follow normal ring order: transition 2 overwrites transition 0.
+    np.testing.assert_allclose(replay.arrays["reward"], [3.0, 2.0])
+    np.testing.assert_allclose(replay.arrays["mc_return"], [3.0, 5.0])
 
 
 def _small_config(method: str) -> O2OConfig:
@@ -448,43 +536,300 @@ def _tensor_batch(size: int = 4) -> TensorBatch:
     )
 
 
-def test_rng_substreams_pair_critic_initialization_across_actor_methods(
+def _normalizer(dataset_sha256: str = "0" * 64) -> FrozenObservationNormalizer:
+    return FrozenObservationNormalizer(
+        np.zeros(5, dtype=np.float32),
+        np.ones(5, dtype=np.float32),
+        dataset_sha256=dataset_sha256,
+    )
+
+
+def _raw_learner(config: O2OConfig) -> O2OLearner:
+    return O2OLearner(
+        config,
+        None,
+        torch.device("cpu"),
+        observation_normalizer=_normalizer(),
+    )
+
+
+def _small_calql_config() -> O2OConfig:
+    return dataclasses.replace(
+        _small_config("Cal-QL-Raw"), critic_hidden_layers=2
+    )
+
+
+def test_method_specs_freeze_raw_and_structured_algorithm_profiles() -> None:
+    calql = O2OConfig(method="Cal-QL-Raw")
+    assert not calql.requires_koopman
+    assert calql.uses_calql and calql.uses_offline_pretraining
+    assert calql.requires_completed_online_returns
+    assert (calql.critic_ensemble_size, calql.online_utd) == (2, 1)
+    assert (calql.hidden_dim, calql.batch_size) == (1024, 1024)
+    assert (calql.online_warmup_steps, calql.num_envs) == (0, 1)
+    assert calql.backup_entropy is False
+    assert calql.actor_q_reduction == "min"
+    assert calql.temperature_objective == "calql_log_alpha"
+    assert calql.target_entropy == -1.0
+    assert calql.critic_head_reduction == "sum"
+    assert calql.online_cql_mode == "all_valid_mc"
+    assert calql.method_spec.calql_max_target_backup is False
+    assert calql.network_profile == "exorl_cql"
+    assert calql.method_spec.profile == (
+        "exorl_cql_backbone_calql_standard_single_tanh_v1"
+    )
+    assert calql.uses_calql_in_phase("offline")
+    assert calql.uses_calql_in_phase("online")
+
+    rlpd = O2OConfig(method="RLPD-Raw")
+    assert not rlpd.requires_koopman
+    assert not rlpd.uses_calql and not rlpd.uses_offline_pretraining
+    assert (rlpd.critic_ensemble_size, rlpd.online_utd) == (10, 20)
+    assert rlpd.online_warmup_steps == 5_000
+    assert rlpd.backup_entropy is True
+    assert rlpd.actor_q_reduction == "mean"
+    assert rlpd.temperature_objective == "rlpd"
+    assert rlpd.target_entropy == -0.5
+    assert rlpd.critic_head_reduction == "mean"
+    assert rlpd.online_cql_mode == "off"
+    assert rlpd.network_profile == "rlpd"
+    assert not rlpd.uses_calql_in_phase("offline")
+    assert not rlpd.uses_calql_in_phase("online")
+
+    calibrated_raw = O2OConfig(method="Cal-RLPD-Raw")
+    assert not calibrated_raw.requires_koopman
+    assert calibrated_raw.uses_calql and calibrated_raw.online_warmup_steps == 0
+    assert calibrated_raw.uses_calql_in_phase("offline")
+    assert not calibrated_raw.uses_calql_in_phase("online")
+    assert calibrated_raw.backup_entropy is True
+    assert calibrated_raw.actor_q_reduction == "mean"
+    assert calibrated_raw.temperature_objective == "rlpd"
+    assert calibrated_raw.target_entropy == -0.5
+    assert calibrated_raw.critic_head_reduction == "mean"
+    assert calibrated_raw.online_cql_mode == "off"
+    assert calibrated_raw.method_spec.calql_max_target_backup is False
+    assert calibrated_raw.network_profile == "rlpd"
+    for method in ("Cal-RLPD-AC-KMPC", "Cal-RLPD-AC-KMPC-MPVE"):
+        structured = O2OConfig(method=method)
+        assert structured.requires_koopman and structured.uses_kmpc
+        assert structured.online_warmup_steps == 0
+        assert structured.uses_calql_in_phase("offline")
+        assert not structured.uses_calql_in_phase("online")
+
+
+def test_resolved_algorithm_semantics_are_fingerprinted_and_not_overridable() -> None:
+    config = O2OConfig(method="Cal-QL-Raw")
+    serialized = config.to_dict()
+    for name in (
+        "network_profile",
+        "backup_entropy",
+        "actor_q_reduction",
+        "temperature_objective",
+        "target_entropy",
+        "critic_head_reduction",
+        "online_cql_mode",
+        "calql_max_target_backup",
+    ):
+        assert serialized[name] == getattr(config.method_spec, name)
+
+    changed = dataclasses.replace(config, backup_entropy=True)
+    with pytest.raises(ValueError, match="fixed by the method identity"):
+        changed.validate()
+    with pytest.raises(ValueError, match="fixed by the method identity"):
+        _ = changed.fingerprint
+
+
+def test_calql_uses_exorl_network_layout_and_orthogonal_initialization() -> None:
+    learner = _raw_learner(_small_calql_config())
+    assert isinstance(learner.actor, ExORLCQLActor)
+    assert isinstance(learner.critic, ExORLCQLQEnsemble)
+    assert ExORLCQLActor.DISTRIBUTION_PROFILE == (
+        "standard_single_tanh_gaussian_exorl_compat_v1"
+    )
+    assert tuple(type(layer) for layer in learner.actor.policy) == (
+        torch.nn.Linear,
+        torch.nn.LayerNorm,
+        torch.nn.Tanh,
+        torch.nn.Linear,
+        torch.nn.ReLU,
+        torch.nn.Linear,
+    )
+    for network in learner.critic.q_nets:
+        assert tuple(type(layer) for layer in network) == (
+            torch.nn.Linear,
+            torch.nn.LayerNorm,
+            torch.nn.Tanh,
+            torch.nn.Linear,
+            torch.nn.ReLU,
+            torch.nn.Linear,
+        )
+    for module in (learner.actor, learner.critic):
+        for layer in module.modules():
+            if not isinstance(layer, torch.nn.Linear):
+                continue
+            torch.testing.assert_close(layer.bias, torch.zeros_like(layer.bias))
+            weight = layer.weight.detach()
+            if weight.shape[0] <= weight.shape[1]:
+                gram = weight @ weight.T
+                identity = torch.eye(weight.shape[0], dtype=weight.dtype)
+            else:
+                gram = weight.T @ weight
+                identity = torch.eye(weight.shape[1], dtype=weight.dtype)
+            torch.testing.assert_close(gram, identity, atol=2e-5, rtol=2e-5)
+
+    # The compatibility choice is one standard tanh transform: a raw location
+    # of two maps to tanh(2), not ExORL's historical tanh(tanh(2)).
+    with torch.no_grad():
+        for layer in learner.actor.policy:
+            if isinstance(layer, torch.nn.Linear):
+                layer.weight.zero_()
+                layer.bias.zero_()
+        learner.actor.policy[-1].bias[0] = 2.0
+        learner.actor.policy[-1].bias[1] = -20.0
+    _location, log_std = learner.actor.distribution(torch.zeros(1, 5))
+    torch.testing.assert_close(log_std, torch.tensor([[-10.0]]))
+    action, _log_prob, _ = learner.actor.sample(
+        torch.zeros(1, 5), deterministic=True
+    )
+    torch.testing.assert_close(action, torch.tanh(torch.tensor([[2.0]])))
+
+
+def test_method_specific_q_entropy_and_critic_reductions_match_formulas() -> None:
+    calql = _raw_learner(_small_calql_config())
+    rlpd = _raw_learner(_small_config("RLPD-Raw"))
+    q_heads = torch.tensor([[1.0, 4.0], [3.0, 2.0]])
+    per_head_per_row = torch.tensor([[1.0, 3.0], [5.0, 7.0]])
+
+    torch.testing.assert_close(calql._reduce_actor_q(q_heads), torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(rlpd._reduce_actor_q(q_heads), torch.tensor([2.0, 3.0]))
+    torch.testing.assert_close(
+        calql._reduce_critic_objective(per_head_per_row), torch.tensor(8.0)
+    )
+    torch.testing.assert_close(
+        rlpd._reduce_critic_objective(per_head_per_row), torch.tensor(4.0)
+    )
+
+    log_prob = torch.tensor([-0.2, -0.4])
+    with torch.no_grad():
+        calql.log_temperature.fill_(np.log(2.0))
+        rlpd.log_temperature.fill_(np.log(2.0))
+    calql_loss = calql._temperature_loss(log_prob)
+    rlpd_loss = rlpd._temperature_loss(log_prob)
+    calql_loss.backward()
+    rlpd_loss.backward()
+    # Cal-QL: d[-log(alpha)*(log_pi-1)]/dlog(alpha) = 1.3.
+    torch.testing.assert_close(calql.log_temperature.grad, torch.tensor(1.3))
+    # RLPD: d[alpha*(entropy+0.5)]/dlog(alpha) = 2*(0.3+0.5).
+    torch.testing.assert_close(rlpd.log_temperature.grad, torch.tensor(1.6))
+
+
+def test_calql_target_omits_entropy_while_rlpd_target_includes_it() -> None:
+    batch = _tensor_batch()
+    batch.reward.fill_(0.25)
+    batch.discount.fill_(1.0)
+
+    for method, expected_next_q in (("Cal-QL-Raw", 2.0), ("RLPD-Raw", 2.8)):
+        learner = _raw_learner(
+            _small_calql_config() if method == "Cal-QL-Raw" else _small_config(method)
+        )
+        with torch.no_grad():
+            learner.log_temperature.fill_(np.log(2.0))
+        cache = learner._prepare_critic_cache(batch, phase="offline")
+        cache = dataclasses.replace(
+            cache,
+            target_next_log_prob=torch.full_like(
+                cache.target_next_log_prob, -0.4
+            ),
+        )
+        learner._minimum_target_q = (  # type: ignore[method-assign]
+            lambda state, action: torch.full(
+                (state.shape[0],), 2.0, dtype=state.dtype, device=state.device
+            )
+        )
+
+        target = learner._target_q(batch, cache, phase="offline")
+
+        torch.testing.assert_close(
+            target,
+            torch.full_like(target, 0.25 + learner.config.discount * expected_next_q),
+        )
+        # The ExORL-DMC Cal-QL profile deliberately uses one next action rather
+        # than Cal-QL's repository-default max-over-K target backup.
+        assert cache.target_next_action.ndim == 2
+        assert cache.target_next_log_prob.ndim == 1
+
+
+def test_calrlpd_disables_calql_online_but_calql_raw_uses_all_valid_mc_rows() -> None:
+    batch = _tensor_batch()
+    batch.offline_mask.zero_()
+
+    hybrid = _raw_learner(_small_config("Cal-RLPD-Raw"))
+    offline_cache = hybrid._prepare_critic_cache(batch, phase="offline")
+    online_cache = hybrid._prepare_critic_cache(batch, phase="online")
+    assert offline_cache.cql_current_actions is not None
+    assert online_cache.cql_current_actions is None
+    online_q = hybrid.critic(online_cache.state, batch.action)
+    online_penalty, online_metrics = hybrid._cql_calibrated_penalty(
+        batch, online_cache, online_q, phase="online"
+    )
+    torch.testing.assert_close(online_penalty, torch.tensor(0.0))
+    assert online_metrics["cql_penalty"] == 0.0
+
+    calql = _raw_learner(_small_calql_config())
+    calql_cache = calql._prepare_critic_cache(batch, phase="online")
+    assert calql_cache.cql_current_actions is not None
+    calql_q = calql.critic(calql_cache.state, batch.action)
+    seen_batch_sizes: list[int] = []
+
+    def record_batch(_module, inputs) -> None:
+        seen_batch_sizes.append(int(inputs[0].shape[0]))
+
+    handle = calql.critic.register_forward_pre_hook(record_batch)
+    penalty, _metrics = calql._cql_calibrated_penalty(
+        batch, calql_cache, calql_q, phase="online"
+    )
+    handle.remove()
+    assert torch.isfinite(penalty)
+    assert seen_batch_sizes == [8, 8, 8]  # K=2 proposals * all four MC-valid rows.
+
+
+def test_raw_methods_fail_closed_against_koopman_and_record_normalizer(
     koopman_path: Path,
 ) -> None:
-    # Constructing either actor must not consume the caller's default stream.
     torch.manual_seed(123456)
     caller_rng = torch.get_rng_state().clone()
-    mlp = O2OLearner(
-        _small_config("Cal-RLPD-MLP"),
-        FrozenKoopman(koopman_path),
-        torch.device("cpu"),
-    )
+    raw = _raw_learner(_small_config("Cal-RLPD-Raw"))
     torch.testing.assert_close(torch.get_rng_state(), caller_rng, rtol=0.0, atol=0.0)
-    kmpc = O2OLearner(
-        _small_config("Cal-RLPD-AC-KMPC"),
-        FrozenKoopman(koopman_path),
-        torch.device("cpu"),
-    )
-    torch.testing.assert_close(torch.get_rng_state(), caller_rng, rtol=0.0, atol=0.0)
+    assert raw.koopman is None
+    assert raw.representation_identity()["kind"] == "normalized_raw_observation_v1"
+    assert raw.critic.layers[0].weight.shape[1] == 6
+    with pytest.raises(ValueError, match="raw-only and forbids Koopman"):
+        O2OLearner(
+            _small_config("Cal-RLPD-Raw"),
+            FrozenKoopman(koopman_path),
+            torch.device("cpu"),
+            observation_normalizer=_normalizer(),
+        )
+    with pytest.raises(ValueError, match="require an offline-dataset normalizer"):
+        O2OLearner(_small_config("Cal-RLPD-Raw"), None, torch.device("cpu"))
 
-    # Actor parameter shapes legitimately differ, but every shared critic and
-    # target tensor must be bit-identical under the paired seed.
-    for module_name in ("critic", "target_critic"):
-        left = getattr(mlp, module_name).state_dict()
-        right = getattr(kmpc, module_name).state_dict()
-        assert left.keys() == right.keys()
-        for key in left:
-            assert torch.equal(left[key], right[key]), key
+    legacy = copy.deepcopy(raw.state_dict())
+    legacy.pop("representation")
+    with pytest.raises(ValueError, match="representation/normalizer identity"):
+        _raw_learner(_small_config("Cal-RLPD-Raw")).load_state_dict(legacy)
 
-    mlp_rng = mlp.state_dict()["rng_substreams"]
-    kmpc_rng = kmpc.state_dict()["rng_substreams"]
-    assert mlp_rng["version"] == kmpc_rng["version"]
-    assert mlp_rng["base_seed"] == kmpc_rng["base_seed"]
-    assert mlp_rng["seeds"] == kmpc_rng["seeds"]
-    assert torch.equal(
-        mlp_rng["training_sampling_state"],
-        kmpc_rng["training_sampling_state"],
+    wrong_normalizer = FrozenObservationNormalizer(
+        np.ones(5, dtype=np.float32),
+        np.ones(5, dtype=np.float32),
+        dataset_sha256="0" * 64,
     )
+    with pytest.raises(ValueError, match="representation/normalizer identity"):
+        O2OLearner(
+            _small_config("Cal-RLPD-Raw"),
+            None,
+            torch.device("cpu"),
+            observation_normalizer=wrong_normalizer,
+        ).load_state_dict(raw.state_dict())
 
 
 def test_mpve_target_is_detached_and_zero_discount_stops_expansion(
@@ -511,9 +856,8 @@ def test_mpve_target_is_detached_and_zero_discount_stops_expansion(
 def test_calql_critic_and_sac_actor_updates_keep_gradients_separate(
     koopman: FrozenKoopman,
 ) -> None:
-    learner = O2OLearner(
-        _small_config("Cal-RLPD-MLP"), koopman, torch.device("cpu")
-    )
+    del koopman
+    learner = _raw_learner(_small_config("Cal-RLPD-Raw"))
     batch = _tensor_batch()
 
     learner.update_critic(batch, apply_mpve=False)
@@ -569,7 +913,7 @@ def test_fused_calql_proposal_cache_shapes_and_offline_mask(
     cache = learner._prepare_critic_cache(batch)
 
     assert plan_calls == 2  # one full current batch and one full next batch
-    assert cache.lifted.shape == cache.next_lifted.shape == (8, 7)
+    assert cache.state.shape == cache.next_state.shape == (8, 7)
     assert cache.target_next_action.shape == (8, 1)
     assert cache.target_next_log_prob.shape == (8,)
     assert cache.cql_current_actions is not None
@@ -595,7 +939,7 @@ def test_fused_calql_proposal_cache_shapes_and_offline_mask(
 
     slices = (cache.slice(slice(0, 3)), cache.slice(slice(3, 8)))
     torch.testing.assert_close(
-        torch.cat([part.lifted for part in slices], dim=0), cache.lifted
+        torch.cat([part.state for part in slices], dim=0), cache.state
     )
     torch.testing.assert_close(
         torch.cat([part.target_next_action for part in slices], dim=0),
@@ -617,7 +961,7 @@ def test_fused_calql_proposal_cache_shapes_and_offline_mask(
     def record_shapes(_module, inputs) -> None:
         seen_shapes.append((inputs[0].shape, inputs[1].shape))
 
-    data_q = learner.critic(cache.lifted, batch.action)
+    data_q = learner.critic(cache.state, batch.action)
     handle = learner.critic.register_forward_pre_hook(record_shapes)
     penalty, _metrics = learner._cql_calibrated_penalty(batch, cache, data_q)
     handle.remove()
@@ -630,9 +974,8 @@ def test_fused_calql_proposal_cache_shapes_and_offline_mask(
 def test_non_calql_cache_contains_only_one_target_policy_sample(
     koopman: FrozenKoopman,
 ) -> None:
-    learner = O2OLearner(
-        _small_config("RLPD-MLP"), koopman, torch.device("cpu")
-    )
+    del koopman
+    learner = _raw_learner(_small_config("RLPD-Raw"))
     cache = learner._prepare_critic_cache(_tensor_batch(size=6))
 
     assert cache.target_next_action.shape == (6, 1)
@@ -696,11 +1039,12 @@ def test_kmpc_fused_cache_reduces_plan_calls_but_recomputes_every_q(
     assert offline_learner.actor_updates == 1
 
     online_plan, online_target_q, online_current_q, online_learner = run("online")
-    # Online MPVE adds nine rollout plans and one terminal-action plan exactly
-    # once, while the final actor update remains a fresh eleventh plan.
-    assert online_plan == 2 + 10 + 1
+    # Pure-RLPD online uses one target proposal plan (no CQL proposals).  MPVE
+    # adds nine rollout plans and one terminal-action plan exactly once, while
+    # the final actor update remains a fresh plan.
+    assert online_plan == 1 + 10 + 1
     assert online_target_q == 20 + 1  # twenty REDQ targets + MPVE bootstrap
-    assert online_current_q == 20 * 4 + 1
+    assert online_current_q == 20 + 1  # data Q per UTD step + actor Q
     assert online_learner.gradient_updates == 20
     assert online_learner.actor_updates == 1
 
@@ -849,26 +1193,21 @@ def test_checkpoint_round_trip_restores_learner_replay_and_rng(
 def test_deterministic_evaluation_can_skip_device_specific_sampling_rng(
     koopman_path: Path,
 ) -> None:
-    config = _small_config("Cal-RLPD-MLP")
-    source = O2OLearner(
-        config, FrozenKoopman(koopman_path), torch.device("cpu")
-    )
+    del koopman_path
+    config = _small_config("Cal-RLPD-Raw")
+    source = _raw_learner(config)
     state = copy.deepcopy(source.state_dict())
     # Stand in for a CUDA Philox byte layout, which a CPU MT19937 generator
     # cannot restore.  Learned parameters are nevertheless portable.
     state["rng_substreams"]["training_sampling_state"] = torch.zeros(
         3, dtype=torch.uint8
     )
-    evaluated = O2OLearner(
-        config, FrozenKoopman(koopman_path), torch.device("cpu")
-    )
+    evaluated = _raw_learner(config)
     evaluated.load_state_dict(state, restore_sampling_rng=False)
     for key, value in source.actor.state_dict().items():
         assert torch.equal(evaluated.actor.state_dict()[key], value)
 
-    strict_resume = O2OLearner(
-        config, FrozenKoopman(koopman_path), torch.device("cpu")
-    )
+    strict_resume = _raw_learner(config)
     with pytest.raises(ValueError, match="incompatible with the restore device"):
         strict_resume.load_state_dict(state)
 
@@ -904,6 +1243,12 @@ def test_mpve_offline_fork_accepts_only_completed_paired_ac_kmpc_checkpoint(
         "offline_update": source_config.offline_updates,
         "online_step": 0,
         "online_episode": 0,
+        "raw_observation_normalizer": None,
+        "online_pending_trajectory": {
+            "kind": "calql_pending_trajectory_v1",
+            "count": 0,
+            "arrays": {},
+        },
     }
     path = tmp_path / "offline.pt"
 
@@ -1099,9 +1444,16 @@ class _FakeVectorEnvironment:
 class _FakeLearner:
     instances: list["_FakeLearner"] = []
 
-    def __init__(self, config: O2OConfig, koopman: FrozenKoopman, device: torch.device):
-        del koopman, device
+    def __init__(
+        self,
+        config: O2OConfig,
+        koopman: FrozenKoopman | None,
+        device: torch.device,
+        **_kwargs,
+    ):
+        del device
         self.config = config
+        self.action_dim = 1 if koopman is None else koopman.action_dim
         self.update_calls: list[tuple[int, str, int]] = []
         self.act_batch_shapes: list[tuple[int, ...]] = []
         self.__class__.instances.append(self)

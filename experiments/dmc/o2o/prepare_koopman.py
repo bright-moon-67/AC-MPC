@@ -14,11 +14,59 @@ import numpy as np
 from experiments.dmc.o2o.dataset import OfflineDataset
 
 
-STAGE_RANGES = {
+LEGACY_STAGE_RANGES = {
     "early": (0, 330),
     "mid": (330, 660),
     "late": (660, 1000),
 }
+
+
+def _adapter_stages(dataset: OfflineDataset) -> list[tuple[str, int, int, list[int]]]:
+    """Resolve deterministic adapter stages, preserving source-time strata."""
+
+    episode_count = int(dataset.metadata["episodes"])
+    selected = dataset.metadata.get("source_episode_indices")
+    selection = dataset.metadata.get("selection")
+    if selected is None:
+        return [
+            (name, left, right, list(range(left, right)))
+            for name, (left, right) in LEGACY_STAGE_RANGES.items()
+        ]
+    if not isinstance(selected, list) or len(selected) != episode_count:
+        raise ValueError("Stratified dataset has an invalid source episode ID list")
+    if not all(isinstance(index, int) and not isinstance(index, bool) for index in selected):
+        raise ValueError("Stratified source episode IDs must be integers")
+    if selected != sorted(set(selected)):
+        raise ValueError("Stratified source episode IDs must be strictly increasing")
+    if not isinstance(selection, dict) or selection.get("kind") != (
+        "temporal_block_microstratum_start_v1"
+    ):
+        raise ValueError("Stratified dataset selection contract is missing or unsupported")
+    source_total = int(selection.get("source_total_episodes", -1))
+    blocks = int(selection.get("temporal_blocks", -1))
+    per_block = int(selection.get("selected_episodes_per_block", -1))
+    episodes_per_block = int(selection.get("episodes_per_block", -1))
+    if (
+        source_total != 10_000
+        or blocks != 10
+        or per_block != 100
+        or episodes_per_block != 1000
+        or episode_count != blocks * per_block
+    ):
+        raise ValueError("Expected the canonical Proto10M 10x100 selection contract")
+
+    stages: list[tuple[str, int, int, list[int]]] = []
+    for block in range(blocks):
+        left = block * per_block
+        right = left + per_block
+        source_ids = selected[left:right]
+        expected_ids = list(range(block * episodes_per_block, (block + 1) * episodes_per_block, 10))
+        if source_ids != expected_ids:
+            raise ValueError(
+                f"Temporal decile {block} does not contain canonical 0,10,...,990 offsets"
+            )
+        stages.append((f"decile_{block:02d}", left, right, source_ids))
+    return stages
 
 
 def _sha256(path: Path) -> str:
@@ -85,11 +133,13 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
     if not np.array_equal(discounts, np.ones_like(discounts)):
         raise ValueError("Canonical ExORL Cartpole episodes must retain discount one")
 
+    stages = _adapter_stages(dataset)
+
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     stage_counts: dict[str, int] = {}
     stage_metadata: dict[str, dict] = {}
-    for name, (left, right) in STAGE_RANGES.items():
+    for name, left, right, source_episode_ids in stages:
         path = output_dir / f"{name}.npz"
         checksum = _write_stage(
             path,
@@ -107,6 +157,9 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
             "states_shape": list(states[left:right].shape),
             "actions_shape": list(actions[left:right].shape),
             "rewards_shape": list(rewards[left:right].shape),
+            "source_episode_indices": source_episode_ids,
+            "source_episode_index_first": source_episode_ids[0],
+            "source_episode_index_last": source_episode_ids[-1],
         }
     manifest = {
         "kind": "exorl_cartpole_koopman_adapter_v1",
@@ -119,6 +172,7 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
         "total_transitions": len(dataset),
         "episodes": episode_count,
         "stage_episode_counts": stage_counts,
+        "stage_order": [name for name, _left, _right, _source_ids in stages],
         "stages": stage_metadata,
         "episode_steps": 1000,
         "observation_dim": 5,
@@ -133,7 +187,25 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
         "source_episode_identity_sha256": dataset.metadata.get(
             "source_episode_identity_sha256"
         ),
-        "note": "early/mid/late are deterministic dataset partitions, not policy stages",
+        "source_episode_indices_sha256": dataset.metadata.get(
+            "source_episode_indices_sha256"
+        ),
+        "source_episode_indices": dataset.metadata.get("source_episode_indices"),
+        "selection": dataset.metadata.get("selection"),
+        "source_archive": dataset.metadata.get("source_archive"),
+        "source_archive_sha256": dataset.metadata.get("source_archive_sha256"),
+        "environment_discount_values": dataset.metadata.get(
+            "environment_discount_values"
+        ),
+        "recorded_reward_max_abs_error": dataset.metadata.get(
+            "recorded_reward_max_abs_error"
+        ),
+        "note": (
+            "Each decile stage is a deterministic source-time stratum; local "
+            "episode index modulo 10 gives an 80/10/10 train/validation/test split."
+            if dataset.metadata.get("source_episode_indices") is not None
+            else "early/mid/late are deterministic dataset partitions, not policy stages"
+        ),
     }
     manifest_path = output_dir / "manifest.json"
     temporary = manifest_path.with_suffix(".json.tmp")

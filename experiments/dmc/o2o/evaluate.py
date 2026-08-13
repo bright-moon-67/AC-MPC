@@ -18,6 +18,7 @@ from experiments.dmc.o2o.config import O2OConfig
 from experiments.dmc.o2o.dataset import OfflineDataset
 from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner
+from experiments.dmc.o2o.networks import FrozenObservationNormalizer
 from experiments.dmc.tasks.adapter import make_dmc_adapter
 
 
@@ -41,8 +42,9 @@ class ValidatedRun:
     dataset_path: Path
     dataset_sha256: str
     koopman: FrozenKoopman | None
-    koopman_path: Path
-    koopman_sha256: str
+    koopman_path: Path | None
+    koopman_sha256: str | None
+    observation_normalizer: FrozenObservationNormalizer | None
 
 
 def _read_mapping(path: Path) -> dict[str, Any]:
@@ -92,12 +94,32 @@ def _validate_counter(payload: Mapping[str, Any], key: str) -> int:
     return result
 
 
+def _restore_raw_normalizer(
+    identity: Any, *, dataset_sha256: str
+) -> FrozenObservationNormalizer:
+    if not isinstance(identity, Mapping):
+        raise ValueError("Raw checkpoint is missing observation normalizer identity")
+    if identity.get("dataset_sha256") != dataset_sha256:
+        raise ValueError("Raw normalizer is bound to another offline dataset")
+    try:
+        center = np.asarray(identity["center"], dtype=np.float32)
+        scale = np.asarray(identity["scale"], dtype=np.float32)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Raw normalizer center/scale is invalid") from exc
+    normalizer = FrozenObservationNormalizer(
+        center, scale, dataset_sha256=dataset_sha256
+    )
+    if normalizer.identity() != dict(identity):
+        raise ValueError("Raw normalizer identity/hash is not canonical")
+    return normalizer
+
+
 def _validate_initialization_lineage(
     *,
     config: O2OConfig,
     initialization: Any,
     dataset_sha256: str,
-    koopman_sha256: str,
+    koopman_sha256: str | None,
     environment_protocol: Mapping[str, Any],
 ) -> None:
     if not config.uses_mpve:
@@ -106,6 +128,8 @@ def _validate_initialization_lineage(
         return
     if not isinstance(initialization, Mapping):
         raise ValueError("MPVE checkpoint is missing offline-fork lineage")
+    if koopman_sha256 is None:
+        raise ValueError("MPVE checkpoint is missing its frozen Koopman identity")
     source_path_value = initialization.get("source_path")
     if not isinstance(source_path_value, str) or not source_path_value:
         raise ValueError("MPVE offline-fork source path is invalid")
@@ -119,8 +143,12 @@ def _validate_initialization_lineage(
         raise ValueError("MPVE source method is not Cal-RLPD-AC-KMPC")
     source_fields = source_config.to_dict()
     target_fields = config.to_dict()
-    source_fields.pop("method")
-    target_fields.pop("method")
+    # The immutable offline snapshot is independent of the later online
+    # interaction budget.  This permits a matrix-wide 50k -> N extension
+    # without pretending that the offline initialization was retrained.
+    for field in ("method", "online_steps"):
+        source_fields.pop(field)
+        target_fields.pop(field)
     if source_fields != target_fields:
         raise ValueError("MPVE source and target configs differ")
     if source.get("dataset", {}).get("sha256") != dataset_sha256:
@@ -189,16 +217,36 @@ def validate_run_identity(
         checkpoint_dataset.get("path"), dataset_override, field="dataset"
     )
 
-    checkpoint_koopman = _require_mapping(checkpoint, "koopman")
-    run_koopman = _require_mapping(run_metadata, "koopman")
+    checkpoint_koopman = checkpoint.get("koopman")
+    run_koopman = run_metadata.get("koopman")
     if checkpoint_koopman != run_koopman:
         raise ValueError("Run and checkpoint Koopman identities differ")
-    expected_koopman_sha = checkpoint_koopman.get("sha256")
-    if not isinstance(expected_koopman_sha, str) or len(expected_koopman_sha) != 64:
-        raise ValueError("Checkpoint Koopman SHA256 is invalid")
-    koopman_path = _resolve_saved_path(
-        checkpoint_koopman.get("path"), koopman_override, field="Koopman"
-    )
+    checkpoint_normalizer = checkpoint.get("raw_observation_normalizer")
+    run_normalizer = run_metadata.get("raw_observation_normalizer")
+    if checkpoint_normalizer != run_normalizer:
+        raise ValueError("Run and checkpoint raw normalizer identities differ")
+    observation_normalizer: FrozenObservationNormalizer | None = None
+    if config.uses_kmpc:
+        if not isinstance(checkpoint_koopman, Mapping):
+            raise ValueError("Structured checkpoint is missing Koopman identity")
+        expected_koopman_sha = checkpoint_koopman.get("sha256")
+        if not isinstance(expected_koopman_sha, str) or len(expected_koopman_sha) != 64:
+            raise ValueError("Checkpoint Koopman SHA256 is invalid")
+        koopman_path = _resolve_saved_path(
+            checkpoint_koopman.get("path"), koopman_override, field="Koopman"
+        )
+        if checkpoint_normalizer is not None:
+            raise ValueError("Structured checkpoint unexpectedly contains raw normalizer")
+    else:
+        if checkpoint_koopman is not None:
+            raise ValueError("Raw baseline checkpoint unexpectedly contains Koopman")
+        if koopman_override is not None:
+            raise ValueError("Raw baseline evaluation forbids --koopman")
+        expected_koopman_sha = None
+        koopman_path = None
+        observation_normalizer = _restore_raw_normalizer(
+            checkpoint_normalizer, dataset_sha256=expected_dataset_sha
+        )
 
     protocol = _require_mapping(checkpoint, "environment_protocol")
     if run_metadata.get("environment_protocol") != protocol:
@@ -217,8 +265,37 @@ def validate_run_identity(
     _validate_counter(checkpoint, "offline_update")
     _validate_counter(checkpoint, "online_step")
     _validate_counter(checkpoint, "online_episode")
-    if not isinstance(checkpoint.get("learner"), Mapping):
+    learner_state = checkpoint.get("learner")
+    if not isinstance(learner_state, Mapping):
         raise ValueError("Checkpoint is missing learner state")
+    representation = learner_state.get("representation")
+    if config.uses_kmpc:
+        if not isinstance(checkpoint_koopman, Mapping):
+            raise AssertionError("Structured identity validation drifted")
+        architecture = checkpoint_koopman.get("architecture")
+        if not isinstance(architecture, Mapping):
+            raise ValueError("Koopman architecture identity is missing")
+        expected_representation = {
+            "kind": "koopman_lifted_state_v1",
+            "state_dim": architecture.get("state_dim"),
+            "lift_dim": architecture.get("lift_dim"),
+            "input_dim": (
+                int(architecture.get("state_dim")) + int(architecture.get("lift_dim"))
+                if isinstance(architecture.get("state_dim"), int)
+                and isinstance(architecture.get("lift_dim"), int)
+                else None
+            ),
+            "koopman_sha256": expected_koopman_sha,
+        }
+    else:
+        assert observation_normalizer is not None
+        expected_representation = {
+            "kind": "normalized_raw_observation_v1",
+            "input_dim": observation_normalizer.observation_dim,
+            "normalizer": observation_normalizer.identity(),
+        }
+    if representation != expected_representation:
+        raise ValueError("Learner representation identity differs from run artifacts")
 
     dataset: OfflineDataset | None = None
     koopman: FrozenKoopman | None = None
@@ -228,23 +305,28 @@ def validate_run_identity(
             raise ValueError("Offline dataset SHA256 differs from checkpoint")
         if checkpoint_dataset.get("metadata") != dataset.metadata:
             raise ValueError("Offline dataset metadata differs from checkpoint")
-        koopman = FrozenKoopman(koopman_path)
-        if koopman.sha256 != expected_koopman_sha:
-            raise ValueError("Koopman SHA256 differs from checkpoint")
-        actual_koopman = koopman.identity()
-        for key in (
-            "sha256",
-            "architecture",
-            "best_validation_rollout_normalized_mse",
-        ):
-            if checkpoint_koopman.get(key) != actual_koopman.get(key):
-                raise ValueError(f"Koopman identity field {key!r} differs")
-        if (koopman.state_dim, koopman.action_dim) != (5, 1):
-            raise ValueError("Cartpole O2O evaluation requires Koopman dimensions 5/1")
+        if koopman_path is not None:
+            koopman = FrozenKoopman(koopman_path)
+            if koopman.sha256 != expected_koopman_sha:
+                raise ValueError("Koopman SHA256 differs from checkpoint")
+            actual_koopman = koopman.identity()
+            assert isinstance(checkpoint_koopman, Mapping)
+            for key in (
+                "sha256",
+                "architecture",
+                "best_validation_rollout_normalized_mse",
+            ):
+                if checkpoint_koopman.get(key) != actual_koopman.get(key):
+                    raise ValueError(f"Koopman identity field {key!r} differs")
+            if (koopman.state_dim, koopman.action_dim) != (5, 1):
+                raise ValueError("Cartpole O2O evaluation requires Koopman dimensions 5/1")
     else:
         if not dataset_path.is_file() or file_sha256(dataset_path) != expected_dataset_sha:
             raise ValueError("Offline dataset SHA256 differs from checkpoint")
-        if not koopman_path.is_file() or file_sha256(koopman_path) != expected_koopman_sha:
+        if koopman_path is not None and (
+            not koopman_path.is_file()
+            or file_sha256(koopman_path) != expected_koopman_sha
+        ):
             raise ValueError("Koopman SHA256 differs from checkpoint")
 
     return ValidatedRun(
@@ -261,6 +343,7 @@ def validate_run_identity(
         koopman=koopman,
         koopman_path=koopman_path,
         koopman_sha256=expected_koopman_sha,
+        observation_normalizer=observation_normalizer,
     )
 
 
@@ -290,9 +373,13 @@ def evaluate_checkpoint(
         koopman_override=koopman_override,
         load_artifacts=True,
     )
-    assert validated.koopman is not None
     device = _device(device_name)
-    learner = O2OLearner(validated.config, validated.koopman, device)
+    learner = O2OLearner(
+        validated.config,
+        validated.koopman,
+        device,
+        observation_normalizer=validated.observation_normalizer,
+    )
     # CUDA Philox and CPU MT19937 generator states are intentionally not
     # interchangeable.  Evaluation is deterministic and consumes no sampling
     # noise, so load all learned/optimizer state while skipping only that
@@ -352,10 +439,19 @@ def evaluate_checkpoint(
             "path": str(validated.dataset_path),
             "sha256": validated.dataset_sha256,
         },
-        "koopman": {
-            "path": str(validated.koopman_path),
-            "sha256": validated.koopman_sha256,
-        },
+        "koopman": (
+            {
+                "path": str(validated.koopman_path),
+                "sha256": validated.koopman_sha256,
+            }
+            if validated.koopman_path is not None
+            else None
+        ),
+        "raw_observation_normalizer": (
+            validated.observation_normalizer.identity()
+            if validated.observation_normalizer is not None
+            else None
+        ),
         "environment_protocol": expected_protocol,
         "initialization": validated.checkpoint.get("initialization"),
         "evaluation_protocol": {

@@ -14,9 +14,9 @@ from experiments.dmc.o2o.aggregate import AGGREGATE_KIND, MAX_EPISODE_RETURN
 
 
 COLORS = {
-    "REDQ-Online": "#4c78a8",
-    "RLPD-MLP": "#72b7b2",
-    "Cal-RLPD-MLP": "#54a24b",
+    "Cal-QL-Raw": "#4c78a8",
+    "RLPD-Raw": "#72b7b2",
+    "Cal-RLPD-Raw": "#54a24b",
     "Cal-RLPD-AC-KMPC": "#f58518",
     "Cal-RLPD-AC-KMPC-MPVE": "#e45756",
 }
@@ -70,6 +70,8 @@ def plot_aggregate(aggregate_path: Path, output_prefix: Path) -> tuple[Path, Pat
     import matplotlib.pyplot as plt
 
     aggregate = _read_aggregate(aggregate_path)
+    online_budget = int(aggregate["protocol"]["primary_online_budget"])
+    early_step = int(aggregate["protocol"]["early_auc_diagnostic_step"])
     figure, axes = plt.subplots(1, 2, figsize=(14, 5.4), constrained_layout=True)
     training_axis, evaluation_axis = axes
     for index, (method, summary) in enumerate(sorted(aggregate["methods"].items())):
@@ -106,11 +108,20 @@ def plot_aggregate(aggregate_path: Path, output_prefix: Path) -> tuple[Path, Pat
         axis.set_ylabel("Cartpole Swingup episode return (maximum 1000)")
         axis.set_ylim(0.0, MAX_EPISODE_RETURN * 1.02)
         axis.axhline(MAX_EPISODE_RETURN, color="black", linestyle=":", linewidth=1)
+        if early_step < online_budget:
+            axis.axvline(
+                early_step / 1000.0,
+                color="gray",
+                linestyle="--",
+                linewidth=1,
+                alpha=0.65,
+            )
         axis.grid(alpha=0.25)
         axis.legend(fontsize=8, loc="best")
     figure.suptitle(
         "DMC Cartpole offline-to-online learning\n"
-        "Lines are means across training seeds; shading is 95% Student-t CI over seeds",
+        f"common online budget={online_budget / 1000:g}k; lines are training-seed "
+        "means and shading is 95% Student-t CI",
         fontsize=13,
     )
 

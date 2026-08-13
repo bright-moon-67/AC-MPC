@@ -180,6 +180,15 @@ def test_common_scale_evaluation_uses_every_episode_safe_test_window(
     assert metrics["exact_reward_prediction"]["predictions"] == 12
     assert metrics["exact_reward_prediction"]["uses_learned_reward_model"] is False
     assert result["models"]["hold"]["training"]["source_is_evaluation_proto1m"]
+    assert set(result["models"]["hold"]["metrics_by_stage"]) == {
+        "early",
+        "mid",
+        "late",
+    }
+    assert all(
+        stage_metrics["windows"] == 2
+        for stage_metrics in result["models"]["hold"]["metrics_by_stage"].values()
+    )
 
 
 def test_stage_checksum_mismatch_fails_closed(tmp_path: Path) -> None:

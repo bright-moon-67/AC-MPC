@@ -30,6 +30,7 @@ from experiments.dmc.o2o.dataset import (
 )
 from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner, TensorBatch
+from experiments.dmc.o2o.networks import FrozenObservationNormalizer
 from experiments.dmc.tasks.adapter import make_dmc_adapter
 from experiments.dmc.ppo.vector_env import make_dmc_vector_env
 
@@ -49,6 +50,40 @@ def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+_PENDING_KEYS = (
+    "observation", "action", "reward", "discount", "next_observation"
+)
+
+
+def _pending_trajectory_state(
+    pending: dict[str, list[np.ndarray | float]] | None,
+) -> dict[str, Any]:
+    """Checkpoint a Cal-QL trajectory without inventing unfinished RTGs."""
+
+    if pending is None:
+        return {"kind": "calql_pending_trajectory_v1", "count": 0, "arrays": {}}
+    lengths = {key: len(pending[key]) for key in _PENDING_KEYS}
+    if len(set(lengths.values())) != 1:
+        raise ValueError("Pending Cal-QL trajectory field lengths disagree")
+    count = next(iter(lengths.values()))
+    arrays = {
+        "observation": np.asarray(pending["observation"], dtype=np.float32),
+        "action": np.asarray(pending["action"], dtype=np.float32),
+        "reward": np.asarray(pending["reward"], dtype=np.float32),
+        "discount": np.asarray(pending["discount"], dtype=np.float32),
+        "next_observation": np.asarray(
+            pending["next_observation"], dtype=np.float32
+        ),
+    }
+    if count and not all(np.isfinite(value).all() for value in arrays.values()):
+        raise FloatingPointError("Pending Cal-QL trajectory is non-finite")
+    return {
+        "kind": "calql_pending_trajectory_v1",
+        "count": count,
+        "arrays": arrays,
+    }
 
 
 def _has_metric_row(path: Path, *, phase: str, offline_update: int, online_step: int) -> bool:
@@ -227,7 +262,8 @@ def _checkpoint_payload(
     *,
     config: O2OConfig,
     dataset: OfflineDataset,
-    koopman: FrozenKoopman,
+    koopman: FrozenKoopman | None,
+    observation_normalizer: FrozenObservationNormalizer | None,
     learner: O2OLearner,
     replay: OnlineReplay,
     generator: np.random.Generator,
@@ -239,6 +275,8 @@ def _checkpoint_payload(
     best_return: float,
     best_online_step: int,
     initialization: dict[str, Any] | None,
+    pending_trajectory: dict[str, list[np.ndarray | float]] | None = None,
+    online_extension: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "kind": CHECKPOINT_KIND,
@@ -249,7 +287,12 @@ def _checkpoint_payload(
             "sha256": dataset.sha256,
             "metadata": dataset.metadata,
         },
-        "koopman": koopman.identity(),
+        "koopman": None if koopman is None else koopman.identity(),
+        "raw_observation_normalizer": (
+            None
+            if observation_normalizer is None
+            else observation_normalizer.identity()
+        ),
         "environment_protocol": environment_protocol,
         "phase": phase,
         "offline_update": offline_update,
@@ -258,6 +301,8 @@ def _checkpoint_payload(
         "best_return": best_return,
         "best_online_step": best_online_step,
         "initialization": initialization,
+        "online_pending_trajectory": _pending_trajectory_state(pending_trajectory),
+        "online_extension": online_extension,
         "learner": learner.state_dict(),
         "online_replay": replay.state_dict(),
         "rng": rng_state(generator),
@@ -269,22 +314,39 @@ def _validate_resume(
     payload: dict[str, Any],
     config: O2OConfig,
     dataset: OfflineDataset,
-    koopman: FrozenKoopman,
+    koopman: FrozenKoopman | None,
     environment_protocol: dict[str, Any],
     *,
+    observation_normalizer: FrozenObservationNormalizer | None = None,
     require_initialization: bool = True,
 ) -> None:
     if payload.get("config_fingerprint") != config.fingerprint:
         raise ValueError("Resume config fingerprint differs")
     if payload.get("dataset", {}).get("sha256") != dataset.sha256:
         raise ValueError("Resume offline dataset differs")
-    if payload.get("koopman", {}).get("sha256") != koopman.sha256:
-        raise ValueError("Resume Koopman model differs")
+    expected_koopman = None if koopman is None else koopman.identity()
+    if payload.get("koopman") != expected_koopman:
+        raise ValueError("Resume Koopman identity differs")
+    expected_normalizer = (
+        None
+        if observation_normalizer is None
+        else observation_normalizer.identity()
+    )
+    if payload.get("raw_observation_normalizer") != expected_normalizer:
+        raise ValueError("Resume raw observation normalizer differs")
     if payload.get("environment_protocol") != environment_protocol:
         raise ValueError("Resume DMC protocol differs")
     _checkpoint_counter(payload, "offline_update")
     _checkpoint_counter(payload, "online_step")
     _checkpoint_counter(payload, "online_episode")
+    pending = payload.get("online_pending_trajectory")
+    if not isinstance(pending, dict) or pending.get("kind") != "calql_pending_trajectory_v1":
+        raise ValueError("Resume checkpoint is missing pending-trajectory state")
+    # ``latest.pt`` is deliberately written only at synchronized reset
+    # boundaries.  Restoring a partial trajectory without simulator state
+    # would be invalid, so a resumable checkpoint must be empty here.
+    if pending.get("count") != 0 or pending.get("arrays") != {}:
+        raise ValueError("Resumable checkpoint contains an unfinished trajectory")
     initialization = payload.get("initialization")
     if config.uses_mpve and require_initialization:
         if not isinstance(initialization, dict):
@@ -297,6 +359,7 @@ def _validate_resume(
             target_config=config,
             dataset=dataset,
             koopman=koopman,
+            observation_normalizer=observation_normalizer,
             environment_protocol=environment_protocol,
         )
         if initialization != current_identity:
@@ -314,6 +377,7 @@ def _validated_offline_fork_source(
     dataset: OfflineDataset,
     koopman: FrozenKoopman,
     environment_protocol: dict[str, Any],
+    observation_normalizer: FrozenObservationNormalizer | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate and identify the exact pre-online AC-KMPC fork source."""
 
@@ -328,6 +392,12 @@ def _validated_offline_fork_source(
     target_fields = target_config.to_dict()
     source_fields.pop("method")
     target_fields.pop("method")
+    # MPVE may be uniformly extended after both branches completed their
+    # original budget.  Its immutable fork source remains the pre-online
+    # checkpoint from that original protocol; online_steps does not affect
+    # actor/critic/optimizer state at the fork boundary.
+    source_fields.pop("online_steps")
+    target_fields.pop("online_steps")
     if source_fields != target_fields:
         raise ValueError("MPVE fork config differs from the AC-KMPC source")
     if source.get("config_fingerprint") != source_config.fingerprint:
@@ -336,6 +406,8 @@ def _validated_offline_fork_source(
         raise ValueError("Offline fork dataset differs")
     if source.get("koopman", {}).get("sha256") != koopman.sha256:
         raise ValueError("Offline fork Koopman model differs")
+    if observation_normalizer is not None or source.get("raw_observation_normalizer") is not None:
+        raise ValueError("Structured offline fork unexpectedly has a raw normalizer")
     if source.get("environment_protocol") != environment_protocol:
         raise ValueError("Offline fork DMC protocol differs")
     if (
@@ -365,6 +437,7 @@ def _load_offline_fork(
     dataset: OfflineDataset,
     koopman: FrozenKoopman,
     environment_protocol: dict[str, Any],
+    observation_normalizer: FrozenObservationNormalizer | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load the exact pre-online AC-KMPC state for the MPVE ablation."""
 
@@ -373,6 +446,7 @@ def _load_offline_fork(
         target_config=target_config,
         dataset=dataset,
         koopman=koopman,
+        observation_normalizer=observation_normalizer,
         environment_protocol=environment_protocol,
     )
 
@@ -382,21 +456,32 @@ def _validate_offline_snapshot(
     *,
     config: O2OConfig,
     dataset: OfflineDataset,
-    koopman: FrozenKoopman,
+    koopman: FrozenKoopman | None,
+    observation_normalizer: FrozenObservationNormalizer | None,
     environment_protocol: dict[str, Any],
+    allow_online_steps_difference: bool = False,
 ) -> None:
     payload = load_checkpoint(path)
+    source_config = O2OConfig(**payload.get("config", {}))
+    source_fields = source_config.to_dict()
+    requested_fields = config.to_dict()
+    if allow_online_steps_difference:
+        source_fields.pop("online_steps")
+        requested_fields.pop("online_steps")
+    if source_fields != requested_fields:
+        raise ValueError("AC-KMPC offline snapshot config differs")
     _validate_resume(
         payload,
-        config,
+        source_config,
         dataset,
         koopman,
         environment_protocol,
+        observation_normalizer=observation_normalizer,
         require_initialization=False,
     )
     expected = {
         "phase": "offline",
-        "offline_update": config.offline_updates,
+        "offline_update": source_config.offline_updates,
         "online_step": 0,
         "online_episode": 0,
         "initialization": None,
@@ -410,13 +495,198 @@ def _validate_offline_snapshot(
         raise ValueError(f"AC-KMPC offline snapshot is not pre-online: {mismatches}")
 
 
+def _config_from_extension_artifact(
+    value: dict[str, Any], *, label: str
+) -> O2OConfig:
+    try:
+        config = O2OConfig(**value.get("config", {}))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} contains an invalid extension config") from exc
+    config.validate()
+    if value.get("config_fingerprint") != config.fingerprint:
+        raise ValueError(f"{label} config fingerprint is invalid")
+    return config
+
+
+def _extension_lineage_is_valid(
+    value: Any,
+    *,
+    base_config: O2OConfig,
+    target_config: O2OConfig,
+) -> bool:
+    timestamp = value.get("requested_unix_seconds") if isinstance(value, dict) else None
+    return bool(
+        isinstance(value, dict)
+        and value.get("kind") == "acmpc_o2o_online_extension_v1"
+        and value.get("previous_online_steps") == base_config.online_steps
+        and value.get("extended_online_steps") == target_config.online_steps
+        and value.get("previous_config_fingerprint") == base_config.fingerprint
+        and value.get("extended_config_fingerprint") == target_config.fingerprint
+        and isinstance(timestamp, (int, float))
+        and not isinstance(timestamp, bool)
+        and np.isfinite(float(timestamp))
+    )
+
+
+def _prepare_online_extension(
+    *,
+    base_config: O2OConfig,
+    extended_online_steps: int,
+    output: Path,
+    dataset: OfflineDataset,
+    koopman: FrozenKoopman | None,
+    observation_normalizer: FrozenObservationNormalizer | None,
+    environment_protocol: dict[str, Any],
+) -> tuple[O2OConfig, dict[str, Any]]:
+    """Idempotently migrate every run artifact to one larger online budget.
+
+    The authoritative checkpoint, optional best checkpoint, and ``run.json``
+    cannot be replaced in one filesystem transaction.  This routine accepts
+    every prefix of the deliberate write order (latest -> best -> run), derives
+    the original extension lineage from any already-migrated artifact, and
+    finishes the remaining replacements without changing that lineage.
+    """
+
+    if extended_online_steps <= base_config.online_steps:
+        raise ValueError("Extended online budget must exceed the completed budget")
+    target_config = dataclasses.replace(
+        base_config, online_steps=extended_online_steps
+    )
+    target_config.validate()
+    latest_path = output / "latest.pt"
+    run_path = output / "run.json"
+    if not latest_path.is_file():
+        raise ValueError("Online extension requires an existing completed run")
+    try:
+        run_metadata = json.loads(run_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError("Online extension requires valid run.json") from exc
+    if not isinstance(run_metadata, dict):
+        raise ValueError("Online extension run.json must contain an object")
+
+    checkpoint_paths = [latest_path]
+    best_path = output / "best.pt"
+    if best_path.is_file():
+        checkpoint_paths.append(best_path)
+    checkpoints = {path: load_checkpoint(path) for path in checkpoint_paths}
+
+    artifacts: list[tuple[str, dict[str, Any], O2OConfig]] = []
+    for path, payload in checkpoints.items():
+        artifacts.append(
+            (
+                path.name,
+                payload,
+                _config_from_extension_artifact(payload, label=path.name),
+            )
+        )
+    run_config = _config_from_extension_artifact(run_metadata, label="run.json")
+    artifacts.append(("run.json", run_metadata, run_config))
+
+    lineages: list[dict[str, Any]] = []
+    for label, value, artifact_config in artifacts:
+        if artifact_config.to_dict() == base_config.to_dict():
+            if value.get("online_extension") is not None:
+                raise ValueError(f"Base-config {label} unexpectedly has extension lineage")
+        elif artifact_config.to_dict() == target_config.to_dict():
+            lineage = value.get("online_extension")
+            if not _extension_lineage_is_valid(
+                lineage,
+                base_config=base_config,
+                target_config=target_config,
+            ):
+                raise ValueError(f"Target-config {label} has invalid extension lineage")
+            lineages.append(dict(lineage))
+        else:
+            raise ValueError(
+                f"{label} is neither the base nor requested extension config"
+            )
+    if lineages and any(value != lineages[0] for value in lineages[1:]):
+        raise ValueError("Online extension artifacts contain different lineages")
+    extension = (
+        lineages[0]
+        if lineages
+        else {
+            "kind": "acmpc_o2o_online_extension_v1",
+            "previous_online_steps": base_config.online_steps,
+            "extended_online_steps": target_config.online_steps,
+            "previous_config_fingerprint": base_config.fingerprint,
+            "extended_config_fingerprint": target_config.fingerprint,
+            "requested_unix_seconds": time.time(),
+        }
+    )
+
+    latest = checkpoints[latest_path]
+    latest_config = _config_from_extension_artifact(latest, label="latest.pt")
+    _validate_resume(
+        latest,
+        latest_config,
+        dataset,
+        koopman,
+        environment_protocol,
+        observation_normalizer=observation_normalizer,
+    )
+    latest_step = _checkpoint_counter(latest, "online_step")
+    if latest_config.to_dict() == base_config.to_dict():
+        if latest_step != base_config.online_steps:
+            raise ValueError("Base extension checkpoint is not at its final online step")
+    elif not base_config.online_steps <= latest_step <= target_config.online_steps:
+        raise ValueError("Extended checkpoint online step lies outside its lineage")
+
+    if run_config.to_dict() == base_config.to_dict():
+        if (
+            run_metadata.get("completed") is not True
+            or run_metadata.get("offline_updates_completed")
+            != (base_config.offline_updates if base_config.uses_calql else 0)
+            or run_metadata.get("online_steps_completed")
+            != base_config.online_steps
+        ):
+            raise ValueError("Online extension source run is not completed")
+    elif run_metadata.get("completed") is True and (
+        run_metadata.get("online_steps_completed") != target_config.online_steps
+        or latest_step != target_config.online_steps
+    ):
+        raise ValueError("Completed target extension has inconsistent counters")
+
+    # Complete any interrupted identity migration.  Existing target artifacts
+    # are left byte-for-byte unchanged; base artifacts are replaced atomically.
+    for checkpoint_path, payload in checkpoints.items():
+        artifact_config = _config_from_extension_artifact(
+            payload, label=checkpoint_path.name
+        )
+        if artifact_config.to_dict() == target_config.to_dict():
+            continue
+        migrated = dict(payload)
+        migrated["config"] = target_config.to_dict()
+        migrated["config_fingerprint"] = target_config.fingerprint
+        migrated["online_extension"] = extension
+        atomic_torch_save(checkpoint_path, migrated)
+
+    if run_config.to_dict() == base_config.to_dict():
+        run_metadata.update(
+            config=target_config.to_dict(),
+            config_fingerprint=target_config.fingerprint,
+            completed=False,
+            online_extension=extension,
+        )
+        for stale in (
+            "offline_updates_completed",
+            "online_steps_completed",
+            "wall_time_seconds",
+        ):
+            run_metadata.pop(stale, None)
+        _atomic_json(run_path, run_metadata)
+
+    return target_config, extension
+
+
 def run(
     config: O2OConfig,
     dataset_path: Path,
-    koopman_path: Path,
+    koopman_path: Path | None,
     output: Path,
     *,
     initialize_from_offline: Path | None = None,
+    extend_online_steps: int | None = None,
 ) -> None:
     config.validate()
     output = output.resolve()
@@ -427,21 +697,58 @@ def run(
         raise RuntimeError("CUDA was requested but no CUDA device is available")
     device = torch.device(config.device)
     generator = _seed_everything(config.seed)
-    koopman = FrozenKoopman(koopman_path)
-    if (koopman.state_dim, koopman.action_dim) != (5, 1):
-        raise ValueError("Cartpole O2O requires Koopman state/action dimensions 5/1")
-    learner = O2OLearner(config, koopman, device)
-    replay = OnlineReplay(config.replay_capacity)
+    if config.requires_koopman:
+        if koopman_path is None:
+            raise ValueError(f"{config.method} requires --koopman")
+        koopman: FrozenKoopman | None = FrozenKoopman(koopman_path)
+        if (koopman.state_dim, koopman.action_dim) != (5, 1):
+            raise ValueError("Cartpole O2O requires Koopman state/action dimensions 5/1")
+        observation_normalizer: FrozenObservationNormalizer | None = None
+    else:
+        if koopman_path is not None:
+            raise ValueError(f"{config.method} forbids --koopman")
+        koopman = None
+        observation_normalizer = FrozenObservationNormalizer.from_offline_observations(
+            dataset.arrays["observation"], dataset_sha256=dataset.sha256
+        )
     protocol_env = make_dmc_adapter(config.task, seed=config.seed)
     environment_protocol = protocol_env.protocol_metadata()
     protocol_env.close()
+
+    latest_path = output / "latest.pt"
+    extension_metadata: dict[str, Any] | None = None
+    if extend_online_steps is not None:
+        if isinstance(extend_online_steps, bool) or not isinstance(
+            extend_online_steps, int
+        ):
+            raise ValueError("Extended online budget must be an integer")
+        if extend_online_steps % 5_000:
+            raise ValueError("Extended online budget must be a multiple of 5000")
+        if initialize_from_offline is not None:
+            raise ValueError("Cannot initialize an offline fork while extending")
+        config, extension_metadata = _prepare_online_extension(
+            base_config=config,
+            extended_online_steps=extend_online_steps,
+            output=output,
+            dataset=dataset,
+            koopman=koopman,
+            observation_normalizer=observation_normalizer,
+            environment_protocol=environment_protocol,
+        )
+
+    learner = O2OLearner(
+        config,
+        koopman,
+        device,
+        observation_normalizer=observation_normalizer,
+    )
+    replay = OnlineReplay(config.replay_capacity)
 
     offline_update = 0
     online_step = 0
     online_episode = 0
     best_return = float("-inf")
     best_online_step = -1
-    latest_path = output / "latest.pt"
     resumed = latest_path.is_file()
     if resumed and initialize_from_offline is not None:
         raise ValueError("Cannot combine --initialize-from-offline with resume")
@@ -455,7 +762,14 @@ def run(
     initialization: dict[str, Any] | None = None
     if resumed:
         payload = load_checkpoint(latest_path)
-        _validate_resume(payload, config, dataset, koopman, environment_protocol)
+        _validate_resume(
+            payload,
+            config,
+            dataset,
+            koopman,
+            environment_protocol,
+            observation_normalizer=observation_normalizer,
+        )
         learner.load_state_dict(payload["learner"])
         replay.load_state_dict(payload["online_replay"])
         restore_rng(payload["rng"], generator)
@@ -465,13 +779,27 @@ def run(
         best_return = float(payload["best_return"])
         best_online_step = int(payload["best_online_step"])
         initialization = payload.get("initialization")
+        saved_extension = payload.get("online_extension")
+        if saved_extension is not None:
+            if (
+                not isinstance(saved_extension, dict)
+                or saved_extension.get("kind")
+                != "acmpc_o2o_online_extension_v1"
+                or saved_extension.get("extended_config_fingerprint")
+                != config.fingerprint
+            ):
+                raise ValueError("Resume checkpoint has invalid extension lineage")
+            extension_metadata = saved_extension
         _truncate_metrics_to_checkpoint(metrics_path, payload)
     elif initialize_from_offline is not None:
+        if koopman is None:
+            raise ValueError("Offline fork initialization requires Koopman")
         payload, initialization = _load_offline_fork(
             initialize_from_offline,
             target_config=config,
             dataset=dataset,
             koopman=koopman,
+            observation_normalizer=observation_normalizer,
             environment_protocol=environment_protocol,
         )
         learner.load_state_dict(payload["learner"])
@@ -483,12 +811,17 @@ def run(
         "config": config.to_dict(),
         "config_fingerprint": config.fingerprint,
         "dataset": {"path": str(dataset.path), "sha256": dataset.sha256},
-        "koopman": koopman.identity(),
+        "koopman": None if koopman is None else koopman.identity(),
+        "raw_observation_normalizer": (
+            None
+            if observation_normalizer is None
+            else observation_normalizer.identity()
+        ),
         "environment_protocol": environment_protocol,
         "device": str(device),
         "started_unix_seconds": time.time(),
         "resumed": resumed,
-        "algorithm_label": "Cal-QL/RLPD-style core; not an official implementation",
+        "algorithm_label": config.method_spec.profile,
         "calibration_reference": "finite_horizon_discounted_episode_return_v1",
         "online_collection": {
             "runner": "ProcessDMCVectorEnv",
@@ -496,10 +829,20 @@ def run(
             "env_workers": config.env_workers,
             "online_step_counter": "total_real_environment_transitions",
             "interaction_order": "batched_actor_then_batched_env_step",
-            "learner_updates": "one_fused_UTD_update_per_real_transition",
+            "learner_updates": (
+                "one_UTD1_update_per_real_transition_deferred_to_completed_episode"
+                if config.requires_completed_online_returns
+                else "one_fused_UTD_update_per_real_transition"
+            ),
+            "online_mc_return": (
+                "complete_episode_discounted_return_to_go"
+                if config.requires_completed_online_returns
+                else "not_used_for_online_calibration"
+            ),
             "latest_checkpoint": "synchronized_all_env_reset_boundary_only",
         },
         "initialization": initialization,
+        "online_extension": extension_metadata,
         "mpve": {
             "enabled": config.uses_mpve,
             "scope": "online_only",
@@ -510,34 +853,24 @@ def run(
     }
     _atomic_json(output / "run.json", run_metadata)
 
-    # A checkpoint is always written after a metrics flush.  Avoid duplicating
-    # the same step-zero evaluation when a detached run resumes.
+    initial_evaluation_phase = (
+        "offline_evaluation" if initialization is not None else "initial"
+    )
+    initial_evaluation_offline_update = (
+        config.offline_updates if initialization is not None else 0
+    )
+    # Establish the recovery boundary before the relatively long fixed-seed
+    # step-zero evaluation.  If the process dies during or immediately after
+    # evaluation, the same checkpoint can safely reproduce a missing metric;
+    # an already-flushed metric is detected and never duplicated.
     if not resumed:
-        initial_eval = evaluate(
-            learner, episodes=config.eval_episodes, seed_base=9_100_000
-        )
-        _append_jsonl(
-            metrics_path,
-            {
-                "phase": (
-                    "offline_evaluation"
-                    if initialization is not None
-                    else "initial"
-                ),
-                "offline_update": offline_update,
-                "online_step": online_step,
-                **initial_eval,
-            },
-        )
-        # Establish a recoverable zero-step boundary before the first expensive
-        # update.  A host/SSH failure during the first checkpoint interval can
-        # then restart without leaving an ambiguous run.json-only directory.
         atomic_torch_save(
             latest_path,
             _checkpoint_payload(
                 config=config,
                 dataset=dataset,
                 koopman=koopman,
+                observation_normalizer=observation_normalizer,
                 learner=learner,
                 replay=replay,
                 generator=generator,
@@ -549,7 +882,34 @@ def run(
                 best_return=best_return,
                 best_online_step=best_online_step,
                 initialization=initialization,
+                online_extension=extension_metadata,
             ),
+        )
+    has_initial_evaluation = _has_metric_row(
+        metrics_path,
+        phase=initial_evaluation_phase,
+        offline_update=initial_evaluation_offline_update,
+        online_step=0,
+    )
+    if not has_initial_evaluation:
+        if (
+            online_step != 0
+            or offline_update != initial_evaluation_offline_update
+        ):
+            raise ValueError(
+                "Cannot reconstruct a missing step-zero evaluation after training"
+            )
+        initial_eval = evaluate(
+            learner, episodes=config.eval_episodes, seed_base=9_100_000
+        )
+        _append_jsonl(
+            metrics_path,
+            {
+                "phase": initial_evaluation_phase,
+                "offline_update": offline_update,
+                "online_step": online_step,
+                **initial_eval,
+            },
         )
 
     started = time.time()
@@ -583,6 +943,7 @@ def run(
                         config=config,
                         dataset=dataset,
                         koopman=koopman,
+                        observation_normalizer=observation_normalizer,
                         learner=learner,
                         replay=replay,
                         generator=generator,
@@ -594,6 +955,7 @@ def run(
                         best_return=best_return,
                         best_online_step=best_online_step,
                         initialization=initialization,
+                        online_extension=extension_metadata,
                     ),
                 )
         # The configured budget need not be a multiple of the periodic
@@ -606,6 +968,7 @@ def run(
                     config=config,
                     dataset=dataset,
                     koopman=koopman,
+                    observation_normalizer=observation_normalizer,
                     learner=learner,
                     replay=replay,
                     generator=generator,
@@ -617,6 +980,7 @@ def run(
                     best_return=best_return,
                     best_online_step=best_online_step,
                     initialization=initialization,
+                    online_extension=extension_metadata,
                 ),
             )
         has_offline_evaluation = _has_metric_row(
@@ -654,7 +1018,9 @@ def run(
                     config=config,
                     dataset=dataset,
                     koopman=koopman,
+                    observation_normalizer=observation_normalizer,
                     environment_protocol=environment_protocol,
+                    allow_online_steps_difference=extension_metadata is not None,
                 )
             elif online_step == 0:
                 atomic_torch_save(
@@ -663,6 +1029,7 @@ def run(
                         config=config,
                         dataset=dataset,
                         koopman=koopman,
+                        observation_normalizer=observation_normalizer,
                         learner=learner,
                         replay=replay,
                         generator=generator,
@@ -674,6 +1041,7 @@ def run(
                         best_return=best_return,
                         best_online_step=best_online_step,
                         initialization=initialization,
+                        online_extension=extension_metadata,
                     ),
                 )
             else:
@@ -712,7 +1080,33 @@ def run(
     observations = env.reset()
     episode_returns = np.zeros(config.num_envs, dtype=np.float64)
     episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
+    pending_trajectory: dict[str, list[np.ndarray | float]] | None = (
+        {key: [] for key in _PENDING_KEYS}
+        if config.requires_completed_online_returns
+        else None
+    )
     latest_checkpoint_online_step = online_step
+
+    def online_update() -> dict[str, float]:
+        ratio = (
+            config.offline_replay_ratio
+            if config.uses_offline_replay_online
+            else 0.0
+        )
+        batch_np = mixed_batch(
+            dataset,
+            replay,
+            batch_size=config.batch_size,
+            utd=config.online_utd,
+            offline_ratio=ratio,
+            generator=generator,
+        )
+        return learner.update(
+            TensorBatch.from_numpy(batch_np, device),
+            utd=config.online_utd,
+            phase="online",
+        )
+
     try:
         while online_step < config.online_steps:
             if config.online_steps - online_step < config.num_envs:
@@ -725,12 +1119,12 @@ def run(
                 actions = generator.uniform(
                     -1.0,
                     1.0,
-                    size=(config.num_envs, koopman.action_dim),
+                    size=(config.num_envs, learner.action_dim),
                 ).astype(np.float32)
             else:
                 actions = learner.act(observations, deterministic=False)
             actions = np.asarray(actions, dtype=np.float32)
-            if actions.shape != (config.num_envs, koopman.action_dim):
+            if actions.shape != (config.num_envs, learner.action_dim):
                 raise RuntimeError("Batched policy emitted an invalid action shape")
             vector_step = env.step(actions)
             episode_returns += np.asarray(vector_step.reward, dtype=np.float64)
@@ -742,40 +1136,53 @@ def run(
                 )
             completed_rows: list[dict[str, Any]] = []
             for environment_index in range(config.num_envs):
-                replay.add(
-                    observations[environment_index],
-                    vector_step.applied_action[environment_index],
-                    float(vector_step.reward[environment_index]),
-                    float(vector_step.discount[environment_index]),
-                    vector_step.transition_observation[environment_index],
-                )
+                transition = {
+                    "observation": observations[environment_index].copy(),
+                    "action": vector_step.applied_action[environment_index].copy(),
+                    "reward": float(vector_step.reward[environment_index]),
+                    "discount": float(vector_step.discount[environment_index]),
+                    "next_observation": vector_step.transition_observation[
+                        environment_index
+                    ].copy(),
+                }
+                if pending_trajectory is None:
+                    replay.add(
+                        transition["observation"],
+                        transition["action"],
+                        transition["reward"],
+                        transition["discount"],
+                        transition["next_observation"],
+                    )
+                else:
+                    for key in _PENDING_KEYS:
+                        pending_trajectory[key].append(transition[key])
                 online_step += 1
                 ready = (
                     config.uses_offline_pretraining
                     or online_step >= config.online_warmup_steps
                 )
-                if ready:
-                    ratio = (
-                        config.offline_replay_ratio
-                        if config.uses_offline_replay_online
-                        else 0.0
-                    )
-                    batch_np = mixed_batch(
-                        dataset,
-                        replay,
-                        batch_size=config.batch_size,
-                        utd=config.online_utd,
-                        offline_ratio=ratio,
-                        generator=generator,
-                    )
-                    metrics = learner.update(
-                        TensorBatch.from_numpy(batch_np, device),
-                        utd=config.online_utd,
-                        phase="online",
-                    )
+                if ready and pending_trajectory is None:
+                    metrics = online_update()
                 else:
                     metrics = {}
                 if reset_boundary[environment_index]:
+                    if pending_trajectory is not None:
+                        transition_count = len(pending_trajectory["reward"])
+                        replay.add_episode(
+                            np.asarray(pending_trajectory["observation"]),
+                            np.asarray(pending_trajectory["action"]),
+                            np.asarray(pending_trajectory["reward"]),
+                            np.asarray(pending_trajectory["discount"]),
+                            np.asarray(pending_trajectory["next_observation"]),
+                            gamma=config.discount,
+                        )
+                        # Preserve one learner update per real transition while
+                        # ensuring every online Cal-QL calibration target came
+                        # from a completed trajectory.
+                        for _ in range(transition_count):
+                            metrics = online_update()
+                        for key in _PENDING_KEYS:
+                            pending_trajectory[key].clear()
                     completed_rows.append(
                         {
                             "phase": "online_episode",
@@ -806,7 +1213,7 @@ def run(
                 episode_lengths.fill(0)
 
             should_evaluate = (
-                online_step == 1_000
+                online_step in {1_000, 2_500, 5_000}
                 or online_step % config.eval_interval_online_steps == 0
                 or online_step == config.online_steps
             )
@@ -831,6 +1238,7 @@ def run(
                             config=config,
                             dataset=dataset,
                             koopman=koopman,
+                            observation_normalizer=observation_normalizer,
                             learner=learner,
                             replay=replay,
                             generator=generator,
@@ -842,6 +1250,8 @@ def run(
                             best_return=best_return,
                             best_online_step=best_online_step,
                             initialization=initialization,
+                            pending_trajectory=pending_trajectory,
+                            online_extension=extension_metadata,
                         ),
                     )
                 print(
@@ -859,6 +1269,7 @@ def run(
                         config=config,
                         dataset=dataset,
                         koopman=koopman,
+                        observation_normalizer=observation_normalizer,
                         learner=learner,
                         replay=replay,
                         generator=generator,
@@ -870,6 +1281,8 @@ def run(
                         best_return=best_return,
                         best_online_step=best_online_step,
                         initialization=initialization,
+                        pending_trajectory=pending_trajectory,
+                        online_extension=extension_metadata,
                     ),
                 )
                 latest_checkpoint_online_step = online_step
@@ -896,18 +1309,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--method", choices=METHODS, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--koopman", type=Path, required=True)
+    parser.add_argument("--koopman", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260821)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--offline-updates", type=int, default=500_000)
-    parser.add_argument("--online-steps", type=int, default=100_000)
-    parser.add_argument("--online-utd", type=int, default=20)
-    parser.add_argument("--num-envs", type=int, default=5)
-    parser.add_argument("--env-workers", type=int, default=5)
+    parser.add_argument("--online-steps", type=int, default=50_000)
+    parser.add_argument("--online-utd", type=int)
+    parser.add_argument("--num-envs", type=int)
+    parser.add_argument("--env-workers", type=int)
     parser.add_argument("--cql-weight", type=float, default=0.01)
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument("--initialize-from-offline", type=Path)
+    parser.add_argument("--extend-online-steps", type=int)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     return args
@@ -915,21 +1329,44 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    spec = O2OConfig(method=args.method).method_spec
+    if not args.smoke:
+        requested_contract = {
+            "--online-utd": (args.online_utd, spec.online_utd),
+            "--num-envs": (args.num_envs, spec.num_envs),
+            "--env-workers": (args.env_workers, spec.env_workers),
+        }
+        mismatches = {
+            option: {"requested": requested, "method_default": expected}
+            for option, (requested, expected) in requested_contract.items()
+            if requested is not None and requested != expected
+        }
+        if mismatches:
+            raise ValueError(
+                f"Formal method execution contract cannot be overridden: {mismatches}"
+            )
+    num_envs = spec.num_envs if args.num_envs is None else args.num_envs
+    env_workers = spec.env_workers if args.env_workers is None else args.env_workers
+    online_utd = spec.online_utd if args.online_utd is None else args.online_utd
     # Cartpole only exposes a recoverable simulator boundary after its full
     # 1000-step time limit.  A smoke run therefore uses exactly one episode
     # per vector member rather than ending after an unrecoverable partial 10
     # transitions.
-    smoke_online_steps = 1_000 * args.num_envs
+    smoke_online_steps = 1_000 * num_envs
     config = O2OConfig(
         method=args.method,
         seed=args.seed,
         device=args.device,
         offline_updates=20 if args.smoke else args.offline_updates,
         online_steps=smoke_online_steps if args.smoke else args.online_steps,
-        online_utd=2 if args.smoke else args.online_utd,
-        online_warmup_steps=smoke_online_steps if args.smoke else 5_000,
-        num_envs=args.num_envs,
-        env_workers=args.env_workers,
+        online_utd=2 if args.smoke else online_utd,
+        online_warmup_steps=(
+            smoke_online_steps
+            if args.smoke and not spec.offline_pretraining
+            else spec.online_warmup_steps
+        ),
+        num_envs=num_envs,
+        env_workers=env_workers,
         cql_weight=args.cql_weight,
         eval_interval_online_steps=smoke_online_steps if args.smoke else 5_000,
         eval_episodes=2 if args.smoke else args.eval_episodes,
@@ -942,6 +1379,7 @@ def main() -> None:
         args.koopman,
         args.output_dir,
         initialize_from_offline=args.initialize_from_offline,
+        extend_online_steps=args.extend_online_steps,
     )
 
 
