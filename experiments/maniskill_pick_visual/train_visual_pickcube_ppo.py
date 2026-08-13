@@ -193,6 +193,7 @@ class PPORoute(nn.Module):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class PPOConfig:
+    env_id: str = "ACMPC-VisualPickCube-v1"
     total_timesteps: int = 50_000_000
     num_envs: int = 128
     rollout_steps: int = 16
@@ -238,6 +239,8 @@ class PPOConfig:
         return max(1, self.batch_size // 32)
 
     def validate(self) -> None:
+        if not self.env_id:
+            raise ValueError("env_id must be non-empty")
         if self.total_timesteps <= 0:
             raise ValueError("total_timesteps must be positive")
         if self.num_envs <= 0 or self.rollout_steps <= 0 or self.collection_chunks <= 0:
@@ -280,7 +283,7 @@ def _make_env(
 
     count = config.num_envs if num_envs is None else int(num_envs)
     base = gym.make(
-        "ACMPC-VisualPickCube-v1",
+        config.env_id,
         num_envs=count,
         sim_backend="gpu" if torch.cuda.is_available() else "cpu",
         obs_mode="rgb",
@@ -656,6 +659,7 @@ def train(
     config_used = config
     if smoke:
         config_used = PPOConfig(
+            env_id=config.env_id,
             total_timesteps=16,
             num_envs=4,
             rollout_steps=4,
@@ -1342,6 +1346,7 @@ def main() -> None:
     )
     parser.add_argument("--koopman", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--env-id", default=None)
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--num-envs", type=int, default=None)
     # Expose the official ManiSkill PPO RGB knobs so the PPO route can be run
@@ -1377,6 +1382,7 @@ def main() -> None:
     args = parser.parse_args()
     base = PPOConfig()
     overrides = {
+        "env_id": args.env_id,
         "total_timesteps": args.total_timesteps,
         "num_envs": args.num_envs,
         "rollout_steps": args.rollout_steps,
