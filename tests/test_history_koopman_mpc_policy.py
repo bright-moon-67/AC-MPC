@@ -85,6 +85,32 @@ def test_history_wrapper_exposes_all_waypoints_and_active_stage():
     np.testing.assert_allclose(following[-3:], [0.0, 1.0, 0.0])
 
 
+def test_history_wrapper_maps_normalized_delta_without_changing_observation():
+    wrapped = HistoryContextTrackingWrapper(
+        _HistoryEnv(),
+        history_steps=3,
+        state_mean=np.zeros(5),
+        state_std=np.ones(5),
+        tip_indices=(0, 1, 2),
+        max_delta=0.001,
+    )
+    observation, _ = wrapped.reset(seed=4)
+    assert observation.shape == (5 + 3 * (5 + 2) + 3,)
+    following, _, _, _, info = wrapped.step(
+        np.asarray([1.0, -0.5], dtype=np.float32)
+    )
+    np.testing.assert_allclose(info["applied_action"], [0.001, -0.0005])
+    np.testing.assert_allclose(
+        info["applied_delta_action"], [0.001, -0.0005]
+    )
+    np.testing.assert_allclose(
+        info["applied_normalized_delta_action"], [1.0, -0.5]
+    )
+    context = following[5:-3]
+    action_context = context[3 * 5 :].reshape(3, 2)
+    np.testing.assert_allclose(action_context[-1], [0.001, -0.0005])
+
+
 def test_history_mpc_policy_reconstructs_actor_and_critic_gradients():
     torch.manual_seed(17)
     koopman = HistoryDeepKoopman(

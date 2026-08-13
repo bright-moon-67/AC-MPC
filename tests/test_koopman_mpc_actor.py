@@ -196,3 +196,66 @@ def test_physical_reference_initializes_a_tracking_cost():
         linear[..., 2:],
         torch.full((1, 2, 1), -0.6, dtype=dtype),
     )
+
+
+def test_normalized_delta_qp_matches_absolute_cost_and_rate_limits():
+    dtype = torch.float64
+    actor = KoopmanMPCActor(
+        torch.tensor([[0.9]], dtype=dtype),
+        torch.tensor([[0.2]], dtype=dtype),
+        torch.eye(1, dtype=dtype),
+        horizon=3,
+        hidden_dims=(),
+        action_low=-0.3,
+        action_high=0.3,
+        max_delta=0.001,
+        solver_iterations=20,
+    )
+    state = torch.tensor([[0.2]], dtype=dtype)
+    quadratic = torch.tensor(
+        [[[1.2, 0.7], [0.8, 0.6], [1.1, 0.9]]], dtype=dtype
+    )
+    linear_terms = torch.tensor(
+        [[[0.1, -0.2], [-0.1, 0.3], [0.2, -0.4]]], dtype=dtype
+    )
+    previous = torch.tensor([[0.2995]], dtype=dtype)
+    absolute_hessian, absolute_linear = actor.condensed_quadratic(
+        state, quadratic, linear_terms
+    )
+    delta_hessian, delta_linear = actor.normalized_delta_quadratic(
+        absolute_hessian, absolute_linear, previous
+    )
+    normalized = torch.tensor([[[0.5], [-1.0], [0.25]]], dtype=dtype)
+    flat_delta = normalized.flatten(start_dim=-2)
+    _, absolute = actor._integrate_normalized_delta(flat_delta, previous)
+    flat_absolute = absolute.flatten(start_dim=-2)
+    offset = previous.unsqueeze(-2).expand_as(absolute).flatten(start_dim=-2)
+
+    absolute_difference = (
+        0.5
+        * (
+            flat_absolute.unsqueeze(-2)
+            @ absolute_hessian
+            @ flat_absolute.unsqueeze(-1)
+        ).squeeze()
+        + (absolute_linear * flat_absolute).sum()
+        - 0.5
+        * (offset.unsqueeze(-2) @ absolute_hessian @ offset.unsqueeze(-1)).squeeze()
+        - (absolute_linear * offset).sum()
+    )
+    delta_cost = (
+        0.5
+        * (flat_delta.unsqueeze(-2) @ delta_hessian @ flat_delta.unsqueeze(-1)).squeeze()
+        + (delta_linear * flat_delta).sum()
+    )
+    torch.testing.assert_close(delta_cost, absolute_difference)
+
+    output = actor(state, previous_action=previous)
+    assert output.normalized_delta_sequence is not None
+    assert bool((output.normalized_delta_sequence.abs() <= 1.0 + 1e-12).all())
+    assert bool((output.action_sequence <= 0.3 + 1e-12).all())
+    physical_delta = torch.diff(
+        torch.cat((previous.unsqueeze(-2), output.action_sequence), dim=-2),
+        dim=-2,
+    )
+    assert bool((physical_delta.abs() <= 0.001 + 1e-12).all())

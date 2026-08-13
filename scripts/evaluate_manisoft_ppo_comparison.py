@@ -118,9 +118,16 @@ def main() -> None:
             state_mean=state_stats["mean"],
             state_std=state_stats["std"],
             tip_indices=TIP_INDICES,
+            max_delta=(
+                None
+                if payload["actor_name"] != "ppo_kmpc"
+                or runtime.get("max_delta") is None
+                else float(runtime["max_delta"])
+            ),
         )
         observations: list[np.ndarray] = []
         requested_actions: list[np.ndarray] = []
+        policy_actions: list[np.ndarray] = []
         applied_actions: list[np.ndarray] = []
         rewards: list[float] = []
         distances: list[float] = []
@@ -158,7 +165,12 @@ def main() -> None:
                     requested
                 )
                 observations.append(observation.copy())
-                requested_actions.append(requested.copy())
+                policy_actions.append(requested.copy())
+                requested_actions.append(
+                    np.asarray(
+                        info["requested_absolute_action"], dtype=np.float32
+                    )
+                )
                 applied_actions.append(
                     np.asarray(info["applied_action"], dtype=np.float32)
                 )
@@ -204,6 +216,15 @@ def main() -> None:
             "applied_delta_action_l2_mean": float(
                 np.linalg.norm(delta_array, axis=1).mean()
             ),
+            "applied_delta_action_abs_max": float(
+                np.max(np.abs(delta_array))
+            ),
+            "normalized_delta_abs_mean": (
+                None
+                if payload["actor_name"] != "ppo_kmpc"
+                or runtime.get("max_delta") is None
+                else float(np.mean(np.abs(np.asarray(policy_actions))))
+            ),
             "action_bound_rate": float(
                 np.mean(
                     np.abs(action_array)
@@ -218,6 +239,7 @@ def main() -> None:
         np.savez_compressed(
             output / f"trajectory_{episode:04d}.npz",
             observation=np.asarray(observations, dtype=np.float32),
+            policy_action=np.asarray(policy_actions, dtype=np.float32),
             requested_action=np.asarray(requested_actions, dtype=np.float32),
             applied_action=action_array,
             reward=np.asarray(rewards, dtype=np.float32),
@@ -253,6 +275,19 @@ def main() -> None:
         ),
         "applied_delta_action_l2_mean": float(
             np.mean([row["applied_delta_action_l2_mean"] for row in summaries])
+        ),
+        "applied_delta_action_abs_max": float(
+            np.max([row["applied_delta_action_abs_max"] for row in summaries])
+        ),
+        "normalized_delta_abs_mean": (
+            None
+            if payload["actor_name"] != "ppo_kmpc"
+            or runtime.get("max_delta") is None
+            else float(
+                np.mean(
+                    [row["normalized_delta_abs_mean"] for row in summaries]
+                )
+            )
         ),
         "action_bound_rate": float(
             np.mean([row["action_bound_rate"] for row in summaries])

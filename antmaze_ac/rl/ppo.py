@@ -22,6 +22,7 @@ class Rollout:
     action_bound: np.ndarray
     applied_action_abs_mean: np.ndarray
     applied_delta_action_l2: np.ndarray
+    applied_delta_action_abs_max: np.ndarray
     dare_retry: np.ndarray
     dare_fallback: np.ndarray
     episode_returns: np.ndarray
@@ -40,6 +41,7 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
     observations, actions, log_probs, values = [], [], [], []
     rewards, dones, saturation, action_bound = [], [], [], []
     applied_action_abs_mean, applied_delta_action_l2 = [], []
+    applied_delta_action_abs_max = []
     dare_retry, dare_fallback = [], []
     completed_returns, completed_lengths, completed_successes = [], [], []
     completed_waypoints = []
@@ -82,6 +84,7 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
         )
         applied_action_abs_mean.append(float(np.mean(np.abs(applied))))
         applied_delta_action_l2.append(float(np.linalg.norm(delta)))
+        applied_delta_action_abs_max.append(float(np.max(np.abs(delta))))
         dare_retry.append(solver_retry)
         dare_fallback.append(solver_fallback)
         if done:
@@ -120,6 +123,7 @@ def collect_rollout(env, policy: KoopmanLQRPolicy, steps: int, gamma: float, gae
         action_bound=np.asarray(action_bound),
         applied_action_abs_mean=np.asarray(applied_action_abs_mean),
         applied_delta_action_l2=np.asarray(applied_delta_action_l2),
+        applied_delta_action_abs_max=np.asarray(applied_delta_action_abs_max),
         dare_retry=np.asarray(dare_retry),
         dare_fallback=np.asarray(dare_fallback),
         episode_returns=np.asarray(completed_returns),
@@ -171,6 +175,7 @@ def collect_vector_rollout(
     observations, actions, log_probs, values = [], [], [], []
     rewards, dones, saturation, action_bound = [], [], [], []
     applied_action_abs_mean, applied_delta_action_l2 = [], []
+    applied_delta_action_abs_max = []
     dare_retry, dare_fallback = [], []
     completed_returns, completed_lengths, completed_successes = [], [], []
     completed_waypoints = []
@@ -200,6 +205,7 @@ def collect_vector_rollout(
         next_observations = []
         step_rewards, step_dones, step_saturation, step_action_bound = [], [], [], []
         step_action_abs_mean, step_delta_action_l2 = [], []
+        step_delta_action_abs_max = []
         step_distances = []
         for index, env in enumerate(envs):
             next_observation, reward, terminated, truncated, info = env.step(
@@ -241,6 +247,7 @@ def collect_vector_rollout(
             )
             step_action_abs_mean.append(float(np.mean(np.abs(applied))))
             step_delta_action_l2.append(float(np.linalg.norm(delta)))
+            step_delta_action_abs_max.append(float(np.max(np.abs(delta))))
             step_distances.append(float(info.get("distance", np.nan)))
         observations.append(observation_tensor)
         actions.append(action)
@@ -252,6 +259,7 @@ def collect_vector_rollout(
         action_bound.append(step_action_bound)
         applied_action_abs_mean.append(step_action_abs_mean)
         applied_delta_action_l2.append(step_delta_action_l2)
+        applied_delta_action_abs_max.append(step_delta_action_abs_max)
         distances.append(step_distances)
         dare_retry.append(solver_retry)
         dare_fallback.append(solver_fallback)
@@ -313,6 +321,9 @@ def collect_vector_rollout(
         action_bound=np.asarray(action_bound).reshape(steps),
         applied_action_abs_mean=np.asarray(applied_action_abs_mean).reshape(steps),
         applied_delta_action_l2=np.asarray(applied_delta_action_l2).reshape(steps),
+        applied_delta_action_abs_max=np.asarray(
+            applied_delta_action_abs_max
+        ).reshape(steps),
         dare_retry=np.asarray(dare_retry).reshape(steps),
         dare_fallback=np.asarray(dare_fallback).reshape(steps),
         episode_returns=np.asarray(completed_returns),

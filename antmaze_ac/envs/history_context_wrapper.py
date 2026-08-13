@@ -14,10 +14,10 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
 
     ``[s_t, context_t, task_context]``
 
-    where ``context_t=[normalized s[t-H+1:t+1], u[t-H:t]]``.  The current
-    absolute action is deliberately absent.  Past actions remain part of the
-    history Koopman input needed to model the soft robot; BC-KMPC does not use
-    them as an action-rate constraint.  For a single goal
+    where ``context_t=[normalized s[t-H+1:t+1], u[t-H:t]]``.  The latest
+    history action is the previous applied action.  Legacy/BC use accepts an
+    absolute action; optional ``max_delta`` use accepts a normalized increment
+    and reconstructs the absolute action from that history state.  For a single goal
     ``task_context=target_tip``.  For an ordered waypoint task it is
     ``[G1,G2,G3,one_hot(active_index)]``.
     """
@@ -30,6 +30,7 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         state_mean: Sequence[float] | np.ndarray,
         state_std: Sequence[float] | np.ndarray,
         tip_indices: Sequence[int] = (30, 31, 32),
+        max_delta: float | None = None,
     ) -> None:
         super().__init__(env)
         if not isinstance(env.observation_space, gym.spaces.Box):
@@ -40,10 +41,13 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
             raise ValueError("Only flat observations and actions are supported")
         if history_steps < 1:
             raise ValueError("history_steps must be positive")
+        if max_delta is not None and max_delta <= 0:
+            raise ValueError("max_delta must be positive when configured")
 
         self.history_steps = int(history_steps)
         self.state_dim = int(env.observation_space.shape[0])
         self.action_dim = int(env.action_space.shape[0])
+        self.max_delta = None if max_delta is None else float(max_delta)
         self.context_dim = self.history_steps * (
             self.state_dim + self.action_dim
         )
@@ -83,13 +87,23 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
             high=np.full(observation_dim, np.inf, dtype=np.float32),
             dtype=np.float32,
         )
-        # The wrapper accepts requested absolute actions and applies only the
-        # environment's absolute bounds.
-        self.action_space = gym.spaces.Box(
-            low=np.full(self.action_dim, -np.inf, dtype=np.float32),
-            high=np.full(self.action_dim, np.inf, dtype=np.float32),
-            dtype=np.float32,
-        )
+        if self.max_delta is None:
+            # Legacy/BC mode: accept requested absolute actions and apply only
+            # the environment's physical bounds.
+            self.action_space = gym.spaces.Box(
+                low=np.full(self.action_dim, -np.inf, dtype=np.float32),
+                high=np.full(self.action_dim, np.inf, dtype=np.float32),
+                dtype=np.float32,
+            )
+        else:
+            # PPO-KMPC mode: the policy variable is a dimensionless normalized
+            # increment.  Mapping it here keeps the action saved by PPO exactly
+            # equal to the action whose log-probability is optimized.
+            self.action_space = gym.spaces.Box(
+                low=np.full(self.action_dim, -1.0, dtype=np.float32),
+                high=np.full(self.action_dim, 1.0, dtype=np.float32),
+                dtype=np.float32,
+            )
 
     @property
     def target_tip(self) -> np.ndarray:
@@ -156,8 +170,8 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         info["history_steps"] = self.history_steps
         return self._observation(state), info
 
-    def step(self, absolute_action: np.ndarray):
-        requested = np.asarray(absolute_action, dtype=np.float32).reshape(-1)
+    def step(self, action: np.ndarray):
+        requested = np.asarray(action, dtype=np.float32).reshape(-1)
         if requested.shape != (self.action_dim,):
             raise ValueError(
                 f"Expected action shape {(self.action_dim,)}, got {requested.shape}"
@@ -167,16 +181,33 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
 
         base_low = np.asarray(self.env.action_space.low, dtype=np.float32)
         base_high = np.asarray(self.env.action_space.high, dtype=np.float32)
-        applied = np.clip(requested, base_low, base_high).astype(np.float32)
+        previous = self.previous_action.copy()
+        if self.max_delta is None:
+            requested_absolute = requested
+            requested_normalized_delta = None
+        else:
+            requested_normalized_delta = requested
+            if np.any(requested < -1.0 - 1e-6) or np.any(
+                requested > 1.0 + 1e-6
+            ):
+                raise ValueError(
+                    "Normalized delta action must lie in [-1, 1]"
+                )
+            requested_absolute = (
+                previous
+                + self.max_delta * np.clip(requested, -1.0, 1.0)
+            )
+        applied = np.clip(
+            requested_absolute, base_low, base_high
+        ).astype(np.float32)
         state, reward, terminated, truncated, info = self.env.step(applied)
         state = np.asarray(state, dtype=np.float32).reshape(-1)
-        previous = self.previous_action.copy()
         self.previous_action[:] = applied
         self.state_history.append(state.copy())
         self.action_history.append(applied.copy())
 
         tolerance = np.finfo(np.float32).eps * 8
-        saturated = np.abs(applied - requested) > tolerance
+        saturated = np.abs(applied - requested_absolute) > tolerance
         bound = np.logical_or(
             applied <= base_low + tolerance,
             applied >= base_high - tolerance,
@@ -184,13 +215,36 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         info = dict(info)
         info.update(
             {
-                "requested_absolute_action": requested.copy(),
+                "requested_absolute_action": np.asarray(
+                    requested_absolute, dtype=np.float32
+                ).copy(),
                 "applied_action": applied.copy(),
                 "applied_delta_action": (applied - previous).copy(),
                 "action_saturation_ratio": float(np.mean(saturated)),
                 "action_bound_ratio": float(np.mean(bound)),
+                "max_delta": self.max_delta,
             }
         )
+        if requested_normalized_delta is not None:
+            applied_normalized_delta = (
+                (applied - previous) / self.max_delta
+            ).astype(np.float32)
+            info.update(
+                {
+                    "requested_normalized_delta_action": (
+                        requested_normalized_delta.copy()
+                    ),
+                    "applied_normalized_delta_action": (
+                        applied_normalized_delta.copy()
+                    ),
+                    "normalized_delta_bound_ratio": float(
+                        np.mean(
+                            np.abs(applied_normalized_delta)
+                            >= 1.0 - 1e-6
+                        )
+                    ),
+                }
+            )
         return (
             self._observation(state),
             reward,

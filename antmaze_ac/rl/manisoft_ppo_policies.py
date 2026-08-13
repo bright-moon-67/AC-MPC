@@ -302,6 +302,7 @@ def make_manisoft_ppo_policy(
     linear_scale: float = 10.0,
     action_quadratic_scale: float = 1.0,
     tip_weight: float = 1.0,
+    max_delta: float | None = 0.001,
 ) -> tuple[StandardHistoryPPOPolicy | HistoryKoopmanMPCPolicy, dict]:
     """Build one of the two from-scratch PPO comparison policies."""
 
@@ -313,6 +314,8 @@ def make_manisoft_ppo_policy(
         or tip_weight <= 0
     ):
         raise ValueError("Action limit and initial standard deviation must be positive")
+    if max_delta is not None and max_delta <= 0:
+        raise ValueError("max_delta must be positive when configured")
     checkpoint = Path(koopman_checkpoint).expanduser().resolve()
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     architecture = payload.get("architecture", {})
@@ -388,6 +391,7 @@ def make_manisoft_ppo_policy(
         quadratic_log_scale=quadratic_log_scale,
         linear_scale=linear_scale,
         action_quadratic_scale=action_quadratic_scale,
+        max_delta=max_delta,
         solver_iterations=solver_iterations,
     )
     critic = Critic(
@@ -438,6 +442,12 @@ def load_manisoft_ppo_checkpoint(
         linear_scale=float(runtime["linear_scale"]),
         action_quadratic_scale=float(runtime["action_quadratic_scale"]),
         tip_weight=float(runtime.get("tip_weight", 1.0)),
+        max_delta=(
+            None
+            if payload["actor_name"] != "ppo_kmpc"
+            or runtime.get("max_delta") is None
+            else float(runtime["max_delta"])
+        ),
     )
     policy.load_state_dict(payload["policy"])
     return policy, payload, koopman_payload

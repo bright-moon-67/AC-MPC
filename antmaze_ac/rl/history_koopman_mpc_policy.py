@@ -13,6 +13,79 @@ from .critic import Critic
 from .koopman_mpc_actor import KoopmanMPCActor, KoopmanMPCActorOutput
 
 
+class _TruncatedNormal:
+    """State-dependent truncated Normal with exact density and entropy."""
+
+    def __init__(
+        self,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        low: torch.Tensor,
+        high: torch.Tensor,
+    ) -> None:
+        if not (mean.shape == std.shape == low.shape == high.shape):
+            raise ValueError("Bounded distribution tensors must share a shape")
+        self.low = low
+        self.high = high
+        if bool((high <= low).any()):
+            raise ValueError("Every bounded action interval must be non-empty")
+        self.location = torch.clamp(mean, min=low, max=high)
+        self.scale = std
+        self.base = Normal(self.location, std)
+        self.standard = Normal(
+            torch.zeros_like(mean), torch.ones_like(mean)
+        )
+        self.alpha = (low - self.location) / std
+        self.beta = (high - self.location) / std
+        self.cdf_low = self.standard.cdf(self.alpha)
+        self.cdf_high = self.standard.cdf(self.beta)
+        self.normalizer = (self.cdf_high - self.cdf_low).clamp_min(
+            torch.finfo(mean.dtype).tiny
+        )
+        self._epsilon = torch.finfo(mean.dtype).eps * 8
+
+    def _sample(self) -> torch.Tensor:
+        uniform = torch.rand_like(self.location)
+        probability = self.cdf_low + uniform * self.normalizer
+        probability = torch.clamp(
+            probability,
+            min=self._epsilon,
+            max=1.0 - self._epsilon,
+        )
+        return torch.clamp(
+            self.location + self.scale * self.standard.icdf(probability),
+            min=self.low,
+            max=self.high,
+        )
+
+    def sample(self) -> torch.Tensor:
+        with torch.no_grad():
+            return self._sample()
+
+    def rsample(self) -> torch.Tensor:
+        return self._sample()
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        return self.base.log_prob(value) - torch.log(self.normalizer)
+
+    def entropy(self) -> torch.Tensor:
+        inverse_sqrt_two_pi = 1.0 / (2.0 * torch.pi) ** 0.5
+        alpha_density = inverse_sqrt_two_pi * torch.exp(
+            -0.5 * self.alpha.square()
+        )
+        beta_density = inverse_sqrt_two_pi * torch.exp(
+            -0.5 * self.beta.square()
+        )
+        correction = (
+            self.alpha * alpha_density - self.beta * beta_density
+        ) / (2.0 * self.normalizer)
+        return (
+            0.5 * torch.log(2.0 * torch.pi * torch.e * self.scale.square())
+            + torch.log(self.normalizer)
+            + correction
+        )
+
+
 class HistoryMPCObservation(NamedTuple):
     physical_state: torch.Tensor
     history_context: torch.Tensor
@@ -21,7 +94,7 @@ class HistoryMPCObservation(NamedTuple):
 
 @dataclass
 class HistoryKoopmanMPCPolicyOutput:
-    distribution: Normal
+    distribution: Normal | _TruncatedNormal
     mean: torch.Tensor
     value: torch.Tensor
     lifted_state: torch.Tensor
@@ -106,6 +179,10 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         self.koopman = koopman.freeze_dynamics()
         self.actor = actor
         self.critic = critic
+        if self.actor.max_delta is not None:
+            self.ACTION_DISTRIBUTION = (
+                "state_dependent_truncated_normalized_delta_v1"
+            )
         self.log_std = nn.Parameter(
             torch.full((koopman.action_dim,), float(log_std_init))
         )
@@ -218,13 +295,32 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         )
 
     def actor_mean(self, observation: torch.Tensor) -> KoopmanMPCActorOutput:
-        _, lifted, actor_context, physical_reference, action_reference = self.features(observation)
+        split, lifted, actor_context, physical_reference, action_reference = (
+            self.features(observation)
+        )
         return self.actor(
             lifted,
             actor_context,
             physical_reference,
             action_reference,
+            previous_action=self.previous_action(split),
         )
+
+    def previous_action(
+        self,
+        split: HistoryMPCObservation | torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract the latest applied absolute action from history context."""
+
+        if isinstance(split, torch.Tensor):
+            split = self.split_observation(split)
+        action_history_start = self.history_steps * self.state_dim
+        actions = split.history_context[..., action_history_start:].reshape(
+            *split.history_context.shape[:-1],
+            self.history_steps,
+            self.action_dim,
+        )
+        return actions[..., -1, :]
 
     def forward(
         self,
@@ -232,14 +328,16 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     ) -> HistoryKoopmanMPCPolicyOutput:
         single = observation.ndim == 1
         observation_batch = observation.unsqueeze(0) if single else observation
-        _, lifted, actor_context, physical_reference, action_reference = self.features(
-            observation_batch
+        split, lifted, actor_context, physical_reference, action_reference = (
+            self.features(observation_batch)
         )
+        previous_action = self.previous_action(split)
         mpc = self.actor(
             lifted,
             actor_context,
             physical_reference,
             action_reference,
+            previous_action=previous_action,
         )
         if not (
             torch.isfinite(mpc.action).all()
@@ -247,11 +345,23 @@ class HistoryKoopmanMPCPolicy(nn.Module):
             and torch.isfinite(mpc.linear_term).all()
         ):
             raise FloatingPointError("BC-KMPC actor produced NaN or Inf")
-        mean_batch = mpc.action
-        distribution = Normal(
-            mean_batch,
-            self.log_std.exp().expand_as(mean_batch),
-        )
+        if self.actor.max_delta is None:
+            mean_batch = mpc.action
+            distribution: Normal | _TruncatedNormal = Normal(
+                mean_batch,
+                self.log_std.exp().expand_as(mean_batch),
+            )
+        else:
+            if mpc.normalized_delta is None:
+                raise RuntimeError("Normalized-delta MPC returned no delta action")
+            mean_batch = mpc.normalized_delta
+            lower, upper = self.actor.normalized_delta_bounds(previous_action)
+            distribution = _TruncatedNormal(
+                mean_batch,
+                self.log_std.exp().expand_as(mean_batch),
+                lower,
+                upper,
+            )
         value_batch = self.critic(torch.cat((lifted, actor_context), dim=-1))
         mean = mean_batch[0] if single else mean_batch
         value = value_batch[0] if single else value_batch

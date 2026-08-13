@@ -47,6 +47,9 @@ class KoopmanMPCActorOutput:
     qp_hessian: torch.Tensor
     qp_linear: torch.Tensor
     projected_gradient_residual: torch.Tensor
+    normalized_delta: torch.Tensor | None = None
+    normalized_delta_sequence: torch.Tensor | None = None
+    previous_action: torch.Tensor | None = None
 
 
 class KoopmanMPCActor(nn.Module):
@@ -59,9 +62,16 @@ class KoopmanMPCActor(nn.Module):
 
     ``sum_k 0.5*w[k]' diag(q[k]) w[k] + p[k]' w[k]``.
 
-    The dynamics are condensed directly into a dense QP in absolute actions.
-    Fixed unrolled projected FISTA applies the same elementwise absolute-action
-    box projection as the reference BC-KMPC implementation.
+    By default the dynamics are condensed directly into a dense QP in absolute
+    actions.  When ``max_delta`` is configured, the exact affine substitution
+
+    ``U = 1*u_previous + max_delta*L*D``
+
+    changes the decision variable to normalized action increments ``D``.  The
+    lower-triangular integration matrix ``L`` makes every planned absolute
+    action depend on the previous applied action and all preceding increments.
+    Projected FISTA then keeps ``D`` in ``[-1, 1]`` and the reconstructed
+    absolute sequence inside the physical action box.
     """
 
     def __init__(
@@ -80,6 +90,7 @@ class KoopmanMPCActor(nn.Module):
         quadratic_log_scale: float = 1.5,
         linear_scale: float = 10.0,
         action_quadratic_scale: float = 1.0,
+        max_delta: float | None = None,
         solver_iterations: int = 20,
         step_fraction: float = 0.95,
         solver_epsilon: float = 1e-6,
@@ -108,6 +119,8 @@ class KoopmanMPCActor(nn.Module):
             raise ValueError("step_fraction must lie in (0, 1]")
         if solver_epsilon <= 0:
             raise ValueError("solver_epsilon must be positive")
+        if max_delta is not None and max_delta <= 0:
+            raise ValueError("max_delta must be positive when configured")
 
         self.lifted_dim = lifted_dim
         self.physical_dim = physical_dim
@@ -118,6 +131,7 @@ class KoopmanMPCActor(nn.Module):
         self.quadratic_log_scale = float(quadratic_log_scale)
         self.linear_scale = float(linear_scale)
         self.action_quadratic_scale = float(action_quadratic_scale)
+        self.max_delta = None if max_delta is None else float(max_delta)
         self.solver_iterations = int(solver_iterations)
         self.step_fraction = float(step_fraction)
         self.solver_epsilon = float(solver_epsilon)
@@ -134,6 +148,22 @@ class KoopmanMPCActor(nn.Module):
             raise ValueError("Every action lower bound must be below its upper bound")
         self.register_buffer("action_low", low)
         self.register_buffer("action_high", high)
+        integration = torch.tril(
+            torch.ones(self.horizon, self.horizon, dtype=A.dtype, device=A.device)
+        )
+        delta_to_action = torch.kron(
+            integration,
+            torch.eye(action_dim, dtype=A.dtype, device=A.device),
+        )
+        if self.max_delta is not None:
+            delta_to_action = self.max_delta * delta_to_action
+        # This is a deterministic runtime transform, not learned state.  Keep
+        # old absolute-action checkpoints loadable without missing buffers.
+        self.register_buffer(
+            "delta_to_action",
+            delta_to_action,
+            persistent=False,
+        )
         physical_scale = torch.as_tensor(
             physical_quadratic_scale,
             dtype=A.dtype,
@@ -334,14 +364,118 @@ class KoopmanMPCActor(nn.Module):
         ).squeeze(-2) + p_action
         return hessian, qp_linear
 
+    def normalized_delta_quadratic(
+        self,
+        hessian: torch.Tensor,
+        linear: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Substitute normalized increments into an absolute-action QP."""
+
+        if self.max_delta is None:
+            raise RuntimeError("normalized_delta_quadratic requires max_delta")
+        expected_previous = (*linear.shape[:-1], self.action_dim)
+        if previous_action.shape != expected_previous:
+            raise ValueError(
+                "previous_action must have shape "
+                f"{expected_previous}, got {tuple(previous_action.shape)}"
+            )
+        offset = previous_action.unsqueeze(-2).expand(
+            *previous_action.shape[:-1],
+            self.horizon,
+            self.action_dim,
+        ).reshape(*previous_action.shape[:-1], -1)
+        transform = self.delta_to_action
+        transformed_hessian = transform.mT @ hessian @ transform
+        absolute_gradient_at_offset = (
+            hessian @ offset.unsqueeze(-1)
+        ).squeeze(-1) + linear
+        transformed_linear = (
+            absolute_gradient_at_offset.unsqueeze(-2) @ transform
+        ).squeeze(-2)
+        return transformed_hessian, transformed_linear
+
+    def normalized_delta_bounds(
+        self,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return feasible first-step normalized bounds at ``previous_action``."""
+
+        if self.max_delta is None:
+            raise RuntimeError("normalized_delta_bounds requires max_delta")
+        previous = torch.clamp(
+            previous_action,
+            min=self.action_low,
+            max=self.action_high,
+        )
+        lower = torch.maximum(
+            previous.new_full(previous.shape, -1.0),
+            (self.action_low - previous) / self.max_delta,
+        )
+        upper = torch.minimum(
+            previous.new_full(previous.shape, 1.0),
+            (self.action_high - previous) / self.max_delta,
+        )
+        return lower, upper
+
+    def _integrate_normalized_delta(
+        self,
+        flat_delta: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project and integrate a normalized increment plan."""
+
+        if self.max_delta is None:
+            raise RuntimeError("Normalized delta integration requires max_delta")
+        sequence = flat_delta.reshape(
+            *flat_delta.shape[:-1], self.horizon, self.action_dim
+        )
+        previous = torch.clamp(
+            previous_action,
+            min=self.action_low,
+            max=self.action_high,
+        )
+        applied_deltas: list[torch.Tensor] = []
+        absolute_actions: list[torch.Tensor] = []
+        for step in range(self.horizon):
+            requested_delta = torch.clamp(sequence[..., step, :], -1.0, 1.0)
+            following = torch.clamp(
+                previous + self.max_delta * requested_delta,
+                min=self.action_low,
+                max=self.action_high,
+            )
+            applied_deltas.append((following - previous) / self.max_delta)
+            absolute_actions.append(following)
+            previous = following
+        return torch.stack(applied_deltas, dim=-2), torch.stack(
+            absolute_actions, dim=-2
+        )
+
+    def _project_decision(
+        self,
+        candidate: torch.Tensor,
+        previous_action: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.max_delta is None:
+            flat_low = self.action_low.repeat(self.horizon)
+            flat_high = self.action_high.repeat(self.horizon)
+            return torch.clamp(candidate, min=flat_low, max=flat_high)
+        if previous_action is None:
+            raise ValueError("previous_action is required for normalized delta MPC")
+        normalized_delta, _ = self._integrate_normalized_delta(
+            candidate, previous_action
+        )
+        return normalized_delta.flatten(start_dim=-2)
+
     def _solve_box_qp(
         self,
         hessian: torch.Tensor,
         linear: torch.Tensor,
         *,
         iterations: int | None = None,
+        previous_action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Approximately solve the absolute-action QP with box FISTA."""
+        """Approximately solve the configured decision-space QP with FISTA."""
 
         iteration_count = self.solver_iterations if iterations is None else int(
             iterations
@@ -349,8 +483,6 @@ class KoopmanMPCActor(nn.Module):
         if iteration_count < 1:
             raise ValueError("iterations must be positive")
 
-        flat_low = self.action_low.repeat(self.horizon)
-        flat_high = self.action_high.repeat(self.horizon)
         lipschitz = hessian.abs().sum(dim=-1).amax(dim=-1)
         step = self.step_fraction / (lipschitz + self.solver_epsilon)
         current = torch.zeros_like(linear)
@@ -360,10 +492,9 @@ class KoopmanMPCActor(nn.Module):
             gradient = (
                 hessian @ extrapolated.unsqueeze(-1)
             ).squeeze(-1) + linear
-            following = torch.clamp(
+            following = self._project_decision(
                 extrapolated - step.unsqueeze(-1) * gradient,
-                min=flat_low,
-                max=flat_high,
+                previous_action,
             )
             next_momentum = 0.5 * (
                 1.0 + math.sqrt(1.0 + 4.0 * momentum * momentum)
@@ -377,11 +508,7 @@ class KoopmanMPCActor(nn.Module):
         gradient = (
             hessian @ current.unsqueeze(-1)
         ).squeeze(-1) + linear
-        projected = torch.clamp(
-            current - gradient,
-            min=flat_low,
-            max=flat_high,
-        )
+        projected = self._project_decision(current - gradient, previous_action)
         residual = torch.linalg.vector_norm(current - projected, dim=-1)
         return current, residual
 
@@ -391,6 +518,7 @@ class KoopmanMPCActor(nn.Module):
         linear: torch.Tensor,
         *,
         iterations: int | None = None,
+        previous_action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Solve already-condensed learned costs with an explicit budget.
 
@@ -402,6 +530,7 @@ class KoopmanMPCActor(nn.Module):
             hessian,
             linear,
             iterations=iterations,
+            previous_action=previous_action,
         )
 
     def projected_kkt_mapping(
@@ -409,6 +538,7 @@ class KoopmanMPCActor(nn.Module):
         hessian: torch.Tensor,
         linear: torch.Tensor,
         flat_action: torch.Tensor,
+        previous_action: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the box-QP projected first-order optimality mapping.
 
@@ -423,8 +553,6 @@ class KoopmanMPCActor(nn.Module):
             raise ValueError(
                 f"flat_action must have shape {expected}, got {flat_action.shape}"
             )
-        flat_low = self.action_low.repeat(self.horizon)
-        flat_high = self.action_high.repeat(self.horizon)
         gradient = (
             hessian @ flat_action.unsqueeze(-1)
         ).squeeze(-1) + linear
@@ -433,10 +561,9 @@ class KoopmanMPCActor(nn.Module):
         # conditioned QPs, producing an uninformative saturated BC loss.
         lipschitz = hessian.abs().sum(dim=-1).amax(dim=-1)
         step = self.step_fraction / (lipschitz + self.solver_epsilon)
-        projected = torch.clamp(
+        projected = self._project_decision(
             flat_action - step.unsqueeze(-1) * gradient,
-            min=flat_low,
-            max=flat_high,
+            previous_action,
         )
         return flat_action - projected
 
@@ -446,6 +573,7 @@ class KoopmanMPCActor(nn.Module):
         context: torch.Tensor | None = None,
         physical_reference: torch.Tensor | None = None,
         action_reference: torch.Tensor | None = None,
+        previous_action: torch.Tensor | None = None,
     ) -> KoopmanMPCActorOutput:
         quadratic, linear = self.cost_terms(
             lifted_state,
@@ -453,17 +581,40 @@ class KoopmanMPCActor(nn.Module):
             physical_reference,
             action_reference,
         )
-        hessian, qp_linear = self.condensed_quadratic(
+        absolute_hessian, absolute_linear = self.condensed_quadratic(
             lifted_state,
             quadratic,
             linear,
         )
-        flat_action, residual = self._solve_box_qp(hessian, qp_linear)
-        sequence = flat_action.reshape(
-            *lifted_state.shape[:-1],
-            self.horizon,
-            self.action_dim,
-        )
+        normalized_delta_sequence = None
+        previous_output = None
+        if self.max_delta is None:
+            hessian, qp_linear = absolute_hessian, absolute_linear
+            flat_action, residual = self._solve_box_qp(hessian, qp_linear)
+            sequence = flat_action.reshape(
+                *lifted_state.shape[:-1],
+                self.horizon,
+                self.action_dim,
+            )
+        else:
+            if previous_action is None:
+                raise ValueError(
+                    "previous_action is required when max_delta is configured"
+                )
+            previous_output = previous_action
+            hessian, qp_linear = self.normalized_delta_quadratic(
+                absolute_hessian,
+                absolute_linear,
+                previous_action,
+            )
+            flat_delta, residual = self._solve_box_qp(
+                hessian,
+                qp_linear,
+                previous_action=previous_action,
+            )
+            normalized_delta_sequence, sequence = (
+                self._integrate_normalized_delta(flat_delta, previous_action)
+            )
         return KoopmanMPCActorOutput(
             action=sequence[..., 0, :],
             action_sequence=sequence,
@@ -472,4 +623,11 @@ class KoopmanMPCActor(nn.Module):
             qp_hessian=hessian,
             qp_linear=qp_linear,
             projected_gradient_residual=residual,
+            normalized_delta=(
+                None
+                if normalized_delta_sequence is None
+                else normalized_delta_sequence[..., 0, :]
+            ),
+            normalized_delta_sequence=normalized_delta_sequence,
+            previous_action=previous_output,
         )

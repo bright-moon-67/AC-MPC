@@ -39,7 +39,9 @@ from antmaze_ac.rl.ppo import collect_rollout, collect_vector_rollout, ppo_updat
 TIP_INDICES = (30, 31, 32)
 METHOD = "manisoft_ppo_from_scratch"
 FORMAT_VERSION = 1
-TRAINING_SPEC_VERSION = "manisoft_three_waypoint_reward_5mm_immediate_v2"
+TRAINING_SPEC_VERSION = (
+    "manisoft_three_waypoint_reward_5mm_normalized_delta_kmpc_v3"
+)
 
 
 def _device(specification: str) -> torch.device:
@@ -75,6 +77,7 @@ def _make_env(
     history_steps: int,
     state_mean: np.ndarray,
     state_std: np.ndarray,
+    max_delta: float | None,
 ) -> HistoryContextTrackingWrapper:
     base = ManiSoftThreeWaypointTrackingEnv(
         scenario,
@@ -89,6 +92,7 @@ def _make_env(
         state_mean=state_mean,
         state_std=state_std,
         tip_indices=TIP_INDICES,
+        max_delta=max_delta,
     )
 
 
@@ -101,13 +105,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--episode-steps", type=int, default=300)
     parser.add_argument("--absolute-action-limit", type=float, default=0.30)
+    parser.add_argument(
+        "--max-delta",
+        type=float,
+        default=0.001,
+        help=(
+            "PPO-KMPC per-component physical action-rate limit. The policy "
+            "and PPO distribution operate on normalized increments in [-1,1]."
+        ),
+    )
     parser.add_argument("--progress-reward-scale", type=float, default=1.0)
 
     parser.add_argument("--mlp-hidden-dims", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--kmpc-hidden-dims", type=int, nargs="+", default=[128])
     parser.add_argument("--horizon", type=int, default=10)
-    parser.add_argument("--solver-iterations", type=int, default=20)
-    parser.add_argument("--solver-diagnostic-iterations", type=int, default=100)
+    parser.add_argument("--solver-iterations", type=int, default=80)
+    parser.add_argument("--solver-diagnostic-iterations", type=int, default=320)
     parser.add_argument("--quadratic-log-scale", type=float, default=1.5)
     parser.add_argument("--linear-scale", type=float, default=10.0)
     parser.add_argument("--action-quadratic-scale", type=float, default=1.0)
@@ -203,6 +216,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--actor-learning-rate must be positive")
     if args.max_wall_time_hours is not None and args.max_wall_time_hours <= 0:
         raise ValueError("--max-wall-time-hours must be positive")
+    if args.actor == "ppo_kmpc" and args.max_delta <= 0:
+        raise ValueError("PPO-KMPC requires --max-delta > 0")
+    if args.actor == "ppo_kmpc" and args.solver_iterations < 80:
+        raise ValueError(
+            "Normalized-delta PPO-KMPC requires --solver-iterations >= 80"
+        )
+    if (
+        args.actor == "ppo_kmpc"
+        and args.solver_diagnostic_iterations < args.solver_iterations
+    ):
+        raise ValueError(
+            "--solver-diagnostic-iterations must be >= --solver-iterations"
+        )
 
 
 def main() -> None:
@@ -251,6 +277,7 @@ def main() -> None:
         linear_scale=args.linear_scale,
         action_quadratic_scale=args.action_quadratic_scale,
         tip_weight=args.tip_weight,
+        max_delta=(args.max_delta if args.actor == "ppo_kmpc" else None),
     )
     actor_parameters = [p for p in policy.actor.parameters() if p.requires_grad]
     auxiliary_parameters = [*policy.critic.parameters(), policy.log_std]
@@ -284,10 +311,24 @@ def main() -> None:
         "action_quadratic_scale": args.action_quadratic_scale,
         "tip_weight": args.tip_weight,
         "solver": (
-            None if args.actor == "ppo_mlp" else "absolute_box_fista_v1"
+            None
+            if args.actor == "ppo_mlp"
+            else "normalized_delta_box_fista_v1"
         ),
         "fixed_smoothness": False,
-        "max_delta": None,
+        "max_delta": (
+            None if args.actor == "ppo_mlp" else args.max_delta
+        ),
+        "policy_action_semantics": (
+            "absolute_action"
+            if args.actor == "ppo_mlp"
+            else "normalized_delta_action"
+        ),
+        "action_std_units": (
+            "physical_action"
+            if args.actor == "ppo_mlp"
+            else "normalized_delta"
+        ),
         "action_distribution": policy.ACTION_DISTRIBUTION,
         "cost_initialization": (
             None
@@ -416,6 +457,9 @@ def main() -> None:
             history_steps=policy.history_steps,
             state_mean=np.asarray(state_stats["mean"], dtype=np.float32),
             state_std=np.asarray(state_stats["std"], dtype=np.float32),
+            max_delta=(
+                args.max_delta if args.actor == "ppo_kmpc" else None
+            ),
         )
         for _ in range(args.num_envs)
     ]
@@ -567,6 +611,9 @@ def main() -> None:
                 "applied_delta_action_l2_mean": float(
                     rollout.applied_delta_action_l2.mean()
                 ),
+                "applied_delta_action_abs_max": float(
+                    rollout.applied_delta_action_abs_max.max()
+                ),
                 "policy_mean_abs_mean": float(diagnostic.mean.abs().mean()),
                 "log_std": policy.log_std.detach().cpu().tolist(),
                 "action_std_mean": float(policy.log_std.exp().mean()),
@@ -576,13 +623,18 @@ def main() -> None:
                     diagnostic.mpc.qp_hessian,
                     diagnostic.mpc.qp_linear,
                     iterations=args.solver_diagnostic_iterations,
+                    previous_action=diagnostic.mpc.previous_action,
                 )
                 high_first = high_solution.reshape(
                     -1,
                     policy.actor.horizon,
                     policy.actor.action_dim,
                 )[:, 0]
-                deployed_first = diagnostic.mpc.action.reshape(
+                if diagnostic.mpc.normalized_delta is None:
+                    raise RuntimeError(
+                        "PPO-KMPC diagnostic is missing normalized delta"
+                    )
+                deployed_first = diagnostic.mpc.normalized_delta.reshape(
                     -1,
                     policy.actor.action_dim,
                 )
@@ -607,6 +659,15 @@ def main() -> None:
                         "diagnostic_first_action_abs_difference_max": float(
                             difference.abs().max()
                         ),
+                        "normalized_delta_abs_mean": float(
+                            rollout.actions.abs().mean()
+                        ),
+                        "normalized_delta_bound_rate": float(
+                            (rollout.actions.abs() >= 1.0 - 1e-6)
+                            .float()
+                            .mean()
+                        ),
+                        "physical_delta_limit": args.max_delta,
                     }
                 )
 

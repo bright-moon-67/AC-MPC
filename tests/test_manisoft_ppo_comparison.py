@@ -185,6 +185,38 @@ def test_from_scratch_ppo_update_and_std_bounds(tmp_path):
     env.close()
 
 
+def test_kmpc_rollout_uses_same_bounded_normalized_delta_for_ppo_and_env(
+    tmp_path,
+):
+    checkpoint = _checkpoint(tmp_path)
+    policy = _make("ppo_kmpc", checkpoint)
+    env = HistoryContextTrackingWrapper(
+        _ThreeWaypointEnv(),
+        history_steps=2,
+        state_mean=np.zeros(45, dtype=np.float32),
+        state_std=np.ones(45, dtype=np.float32),
+        max_delta=0.001,
+    )
+    observation, _ = env.reset(seed=11)
+    env._ppo_observation = observation
+    rollout = collect_rollout(
+        env,
+        policy,
+        steps=8,
+        gamma=0.99,
+        gae_lambda=0.95,
+        device=torch.device("cpu"),
+    )
+    assert bool((rollout.actions.abs() <= 1.0 + 1e-6).all())
+    assert float(rollout.applied_delta_action_abs_max.max()) <= 0.001 + 1e-7
+    with torch.no_grad():
+        recomputed = policy.evaluate_actions(
+            rollout.observations, rollout.actions
+        )[0]
+    torch.testing.assert_close(recomputed, rollout.old_log_probs)
+    env.close()
+
+
 def test_comparison_checkpoint_round_trip(tmp_path):
     koopman_path = _checkpoint(tmp_path)
     for actor_name in ("ppo_mlp", "ppo_kmpc"):
@@ -205,6 +237,7 @@ def test_comparison_checkpoint_round_trip(tmp_path):
             "linear_scale": 10.0,
             "action_quadratic_scale": 1.0,
             "tip_weight": 1.0,
+            "max_delta": 0.001 if actor_name == "ppo_kmpc" else None,
         }
         path = tmp_path / f"{actor_name}.pt"
         torch.save(
