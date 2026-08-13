@@ -33,6 +33,12 @@ MANISOFT_WAYPOINT_ACTION_FILES = (
     "actions/u_scale_0p75.json",
 )
 
+# A waypoint is passed on the first simulation step whose tip enters this
+# ball.  There is deliberately no dwell/streak requirement: reaching 5 mm
+# immediately advances to the next waypoint (or terminates at waypoint 3).
+MANISOFT_WAYPOINT_SUCCESS_THRESHOLD = 0.005
+MANISOFT_WAYPOINT_SUCCESS_STREAK = 1
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -192,6 +198,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
         success_threshold: float = 0.0015,
         success_streak: int = 5,
         absolute_action_limit: float = 0.30,
+        progress_reward_scale: float = 1.0,
     ):
         super().__init__()
 
@@ -214,6 +221,9 @@ class ManiSoftTipTrackingEnv(gym.Env):
         self.success_threshold = float(success_threshold)
         self.required_success_streak = int(success_streak)
         self.absolute_action_limit = float(absolute_action_limit)
+        self.progress_reward_scale = float(progress_reward_scale)
+        if self.progress_reward_scale <= 0:
+            raise ValueError("progress_reward_scale必须为正")
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
@@ -361,7 +371,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
         normalized_action = action / self.absolute_action_limit
 
         reward = (
-            float(progress)
+            self.progress_reward_scale * float(progress)
             - 0.01
             - 0.001 * float(np.mean(normalized_action ** 2))
         )
@@ -410,10 +420,11 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
         scenario_path: str | Path,
         waypoint_tips: Sequence[Sequence[float]] | np.ndarray,
         episode_steps: int = 300,
-        success_threshold: float = 0.0015,
-        success_streak: int = 5,
+        success_threshold: float = MANISOFT_WAYPOINT_SUCCESS_THRESHOLD,
+        success_streak: int = MANISOFT_WAYPOINT_SUCCESS_STREAK,
         waypoint_event_reward: float = 3.0,
         absolute_action_limit: float = 0.30,
+        progress_reward_scale: float = 1.0,
     ) -> None:
         waypoint_bank = np.asarray(waypoint_tips, dtype=np.float32)
         if waypoint_bank.shape == (self.waypoint_count, 3):
@@ -435,6 +446,7 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
             success_threshold=success_threshold,
             success_streak=success_streak,
             absolute_action_limit=absolute_action_limit,
+            progress_reward_scale=progress_reward_scale,
         )
         self.waypoint_tip_bank = waypoint_bank.copy()
         self.fixed_waypoints = self.waypoint_tip_bank[0].copy()
@@ -487,9 +499,8 @@ class ManiSoftThreeWaypointTrackingEnv(ManiSoftTipTrackingEnv):
         reached_distance = float(info["distance"])
         waypoint_passed = False
 
-        # Intermediate goals use the same consecutive-hit condition as the
-        # original single-goal task, but reaching them advances the stage
-        # instead of terminating the episode.
+        # Entering the 5 mm target ball immediately advances the stage; the
+        # final target terminates the episode on that same simulation step.
         if terminated and self.active_waypoint_index < self.waypoint_count - 1:
             terminated = False
             waypoint_passed = True

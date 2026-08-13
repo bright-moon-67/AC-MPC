@@ -1,10 +1,13 @@
 import json
 import hashlib
+import inspect
 
 import numpy as np
 import pytest
 
 from antmaze_ac.envs.manisoft_tracking_env import (
+    MANISOFT_WAYPOINT_SUCCESS_STREAK,
+    MANISOFT_WAYPOINT_SUCCESS_THRESHOLD,
     MANISOFT_WAYPOINT_ACTION_FILES,
     MANISOFT_WAYPOINT_REFERENCE_FILES,
     ManiSoftThreeWaypointTrackingEnv,
@@ -12,6 +15,16 @@ from antmaze_ac.envs.manisoft_tracking_env import (
     load_manisoft_waypoint_reference_bank,
     load_manisoft_waypoint_references,
 )
+
+
+def test_waypoint_defaults_are_5mm_and_immediate():
+    parameters = inspect.signature(
+        ManiSoftThreeWaypointTrackingEnv.__init__
+    ).parameters
+    assert parameters["success_threshold"].default == pytest.approx(0.005)
+    assert parameters["success_streak"].default == 1
+    assert MANISOFT_WAYPOINT_SUCCESS_THRESHOLD == pytest.approx(0.005)
+    assert MANISOFT_WAYPOINT_SUCCESS_STREAK == 1
 
 
 def _sha256(path):

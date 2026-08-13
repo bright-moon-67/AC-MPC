@@ -171,6 +171,9 @@ def make_history_mpc_policy(
     horizon: int | None = None,
     absolute_action_limit: float | None = None,
     solver_iterations: int | None = None,
+    quadratic_log_scale: float | None = None,
+    linear_scale: float | None = None,
+    action_quadratic_scale: float | None = None,
     waypoint_count: int = 1,
 ) -> tuple[HistoryKoopmanMPCPolicy, dict]:
     """Build the soft-robot BC-KMPC policy from a history checkpoint."""
@@ -189,6 +192,7 @@ def make_history_mpc_policy(
         "activation": "gelu",
         "quadratic_log_scale": 1.5,
         "linear_scale": 10.0,
+        "action_quadratic_scale": 1.0,
         "solver_iterations": 20,
         "step_fraction": 0.95,
         "solver_epsilon": 1e-6,
@@ -209,6 +213,12 @@ def make_history_mpc_policy(
         settings["absolute_action_limit"] = float(absolute_action_limit)
     if solver_iterations is not None:
         settings["solver_iterations"] = int(solver_iterations)
+    if quadratic_log_scale is not None:
+        settings["quadratic_log_scale"] = float(quadratic_log_scale)
+    if linear_scale is not None:
+        settings["linear_scale"] = float(linear_scale)
+    if action_quadratic_scale is not None:
+        settings["action_quadratic_scale"] = float(action_quadratic_scale)
 
     if waypoint_count < 1:
         raise ValueError("waypoint_count must be positive")
@@ -230,6 +240,7 @@ def make_history_mpc_policy(
         action_high=limit,
         quadratic_log_scale=float(settings["quadratic_log_scale"]),
         linear_scale=float(settings["linear_scale"]),
+        action_quadratic_scale=float(settings["action_quadratic_scale"]),
         solver_iterations=int(settings["solver_iterations"]),
         step_fraction=float(settings["step_fraction"]),
         solver_epsilon=float(settings["solver_epsilon"]),
@@ -281,6 +292,9 @@ def load_history_mpc_checkpoint(
         horizon=runtime.get("horizon"),
         absolute_action_limit=runtime.get("absolute_action_limit"),
         solver_iterations=runtime.get("solver_iterations"),
+        quadratic_log_scale=runtime.get("quadratic_log_scale"),
+        linear_scale=runtime.get("linear_scale"),
+        action_quadratic_scale=runtime.get("action_quadratic_scale"),
         waypoint_count=int(runtime.get("waypoint_count", 1)),
     )
     if method == "bc_kmpc_bc":

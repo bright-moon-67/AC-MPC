@@ -19,6 +19,8 @@ class KoopmanLoss:
     controllability_svd: torch.Tensor
     augmentation: torch.Tensor
     reconstruction: torch.Tensor
+    tip_position: torch.Tensor
+    tip_position_h1: torch.Tensor
     spectral_radius: torch.Tensor
     latent_std_min: torch.Tensor
     latent_std_mean: torch.Tensor
@@ -29,6 +31,12 @@ class KoopmanLoss:
         # pred_loss, while the prompt calls it rollout loss.
         values["pred_loss"] = values["rollout"]
         values["linear_loss"] = values["linear"]
+        values["tip_position_rmse_mm"] = (
+            max(values["tip_position"], 0.0) ** 0.5 * 1000.0
+        )
+        values["tip_position_h1_rmse_mm"] = (
+            max(values["tip_position_h1"], 0.0) ** 0.5 * 1000.0
+        )
         return values
 
 
@@ -140,6 +148,8 @@ def koopman_loss(
         controllability_svd=controllability_svd,
         augmentation=augmentation,
         reconstruction=reconstruction,
+        tip_position=states.new_zeros(()),
+        tip_position_h1=states.new_zeros(()),
         spectral_radius=spectral_radius,
         latent_std_min=phi_std.min(),
         latent_std_mean=phi_std.mean(),

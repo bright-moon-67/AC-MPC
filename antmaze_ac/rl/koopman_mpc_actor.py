@@ -76,8 +76,10 @@ class KoopmanMPCActor(nn.Module):
         activation: str = "gelu",
         action_low: float | torch.Tensor = -0.3,
         action_high: float | torch.Tensor = 0.3,
+        physical_quadratic_scale: float | torch.Tensor = 1.0,
         quadratic_log_scale: float = 1.5,
         linear_scale: float = 10.0,
+        action_quadratic_scale: float = 1.0,
         solver_iterations: int = 20,
         step_fraction: float = 0.95,
         solver_epsilon: float = 1e-6,
@@ -96,7 +98,11 @@ class KoopmanMPCActor(nn.Module):
             raise ValueError("horizon and solver_iterations must be positive")
         if context_dim < 0:
             raise ValueError("context_dim must be non-negative")
-        if quadratic_log_scale <= 0 or linear_scale <= 0:
+        if (
+            quadratic_log_scale <= 0
+            or linear_scale <= 0
+            or action_quadratic_scale <= 0
+        ):
             raise ValueError("Cost-map scales must be positive")
         if not 0 < step_fraction <= 1:
             raise ValueError("step_fraction must lie in (0, 1]")
@@ -111,6 +117,7 @@ class KoopmanMPCActor(nn.Module):
         self.context_dim = int(context_dim)
         self.quadratic_log_scale = float(quadratic_log_scale)
         self.linear_scale = float(linear_scale)
+        self.action_quadratic_scale = float(action_quadratic_scale)
         self.solver_iterations = int(solver_iterations)
         self.step_fraction = float(step_fraction)
         self.solver_epsilon = float(solver_epsilon)
@@ -127,6 +134,27 @@ class KoopmanMPCActor(nn.Module):
             raise ValueError("Every action lower bound must be below its upper bound")
         self.register_buffer("action_low", low)
         self.register_buffer("action_high", high)
+        physical_scale = torch.as_tensor(
+            physical_quadratic_scale,
+            dtype=A.dtype,
+            device=A.device,
+        )
+        physical_scale = torch.broadcast_to(
+            physical_scale,
+            (physical_dim,),
+        ).clone()
+        if not torch.isfinite(physical_scale).all() or bool(
+            (physical_scale <= 0).any()
+        ):
+            raise ValueError("Physical quadratic scales must be finite and positive")
+        # This scale is reconstructed from the runtime configuration and state
+        # normalizer.  Keeping it non-persistent preserves compatibility with
+        # actor checkpoints written before reference-cost initialization.
+        self.register_buffer(
+            "physical_quadratic_scale",
+            physical_scale,
+            persistent=False,
+        )
 
         state_map, action_map = self._condense_physical_dynamics()
         self.register_buffer("state_map", state_map)
@@ -183,6 +211,8 @@ class KoopmanMPCActor(nn.Module):
         self,
         lifted_state: torch.Tensor,
         context: torch.Tensor | None = None,
+        physical_reference: torch.Tensor | None = None,
+        action_reference: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if lifted_state.shape[-1] != self.lifted_dim:
             raise ValueError("Wrong lifted-state dimension")
@@ -211,7 +241,56 @@ class KoopmanMPCActor(nn.Module):
         quadratic = torch.exp(
             self.quadratic_log_scale * centered_log_weights
         )
+        quadratic = torch.cat(
+            (
+                self.physical_quadratic_scale
+                * quadratic[..., : self.physical_dim],
+                self.action_quadratic_scale
+                * quadratic[..., self.physical_dim :],
+            ),
+            dim=-1,
+        )
         linear = self.linear_scale * torch.tanh(raw[..., 1, :, :])
+        if physical_reference is not None:
+            expected_reference = (*batch_shape, self.physical_dim)
+            if physical_reference.shape != expected_reference:
+                raise ValueError(
+                    "physical_reference must have shape "
+                    f"{expected_reference}, got {tuple(physical_reference.shape)}"
+                )
+            # Give from-scratch PPO a valid tracking controller before the
+            # residual cost map has learned anything.  For
+            #   .5 * q * (x - x_ref)^2
+            # the decision-dependent linear term is -q*x_ref.  The omitted
+            # .5*q*x_ref^2 constant cannot affect the MPC solution.  The
+            # network still learns both q and an additive signed linear
+            # residual, so this changes the initialization/inductive bias,
+            # not the differentiable KMPC structure.
+            state_quadratic = quadratic[..., : self.physical_dim]
+            tracking_linear = -state_quadratic * physical_reference.unsqueeze(-2)
+            linear = torch.cat(
+                (
+                    linear[..., : self.physical_dim] + tracking_linear,
+                    linear[..., self.physical_dim :],
+                ),
+                dim=-1,
+            )
+        if action_reference is not None:
+            expected_action_reference = (*batch_shape, self.action_dim)
+            if action_reference.shape != expected_action_reference:
+                raise ValueError(
+                    "action_reference must have shape "
+                    f"{expected_action_reference}, got {tuple(action_reference.shape)}"
+                )
+            action_quadratic = quadratic[..., self.physical_dim :]
+            linear = torch.cat(
+                (
+                    linear[..., : self.physical_dim],
+                    linear[..., self.physical_dim :]
+                    - action_quadratic * action_reference.unsqueeze(-2),
+                ),
+                dim=-1,
+            )
         return quadratic, linear
 
     def condensed_quadratic(
@@ -259,8 +338,16 @@ class KoopmanMPCActor(nn.Module):
         self,
         hessian: torch.Tensor,
         linear: torch.Tensor,
+        *,
+        iterations: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Approximately solve the absolute-action QP with box FISTA."""
+
+        iteration_count = self.solver_iterations if iterations is None else int(
+            iterations
+        )
+        if iteration_count < 1:
+            raise ValueError("iterations must be positive")
 
         flat_low = self.action_low.repeat(self.horizon)
         flat_high = self.action_high.repeat(self.horizon)
@@ -269,7 +356,7 @@ class KoopmanMPCActor(nn.Module):
         current = torch.zeros_like(linear)
         extrapolated = current
         momentum = 1.0
-        for _ in range(self.solver_iterations):
+        for _ in range(iteration_count):
             gradient = (
                 hessian @ extrapolated.unsqueeze(-1)
             ).squeeze(-1) + linear
@@ -298,12 +385,74 @@ class KoopmanMPCActor(nn.Module):
         residual = torch.linalg.vector_norm(current - projected, dim=-1)
         return current, residual
 
+    def solve_condensed_qp(
+        self,
+        hessian: torch.Tensor,
+        linear: torch.Tensor,
+        *,
+        iterations: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Solve already-condensed learned costs with an explicit budget.
+
+        BC uses this entry point to verify that expert-like actions do not
+        depend on stopping FISTA at one particular unroll depth.
+        """
+
+        return self._solve_box_qp(
+            hessian,
+            linear,
+            iterations=iterations,
+        )
+
+    def projected_kkt_mapping(
+        self,
+        hessian: torch.Tensor,
+        linear: torch.Tensor,
+        flat_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the box-QP projected first-order optimality mapping.
+
+        This mapping is zero exactly at a KKT point of the convex box QP.
+        Keeping the vector (instead of only its norm) lets BC penalize every
+        expert action component without rewarding a cost map merely for a
+        lucky fixed number of FISTA iterations.
+        """
+
+        expected = (*linear.shape[:-1], self.horizon * self.action_dim)
+        if flat_action.shape != expected:
+            raise ValueError(
+                f"flat_action must have shape {expected}, got {flat_action.shape}"
+            )
+        flat_low = self.action_low.repeat(self.horizon)
+        flat_high = self.action_high.repeat(self.horizon)
+        gradient = (
+            hessian @ flat_action.unsqueeze(-1)
+        ).squeeze(-1) + linear
+        # Use the same stable scale as the projected solver.  A unit-step
+        # mapping often clips every component for these condensed, poorly
+        # conditioned QPs, producing an uninformative saturated BC loss.
+        lipschitz = hessian.abs().sum(dim=-1).amax(dim=-1)
+        step = self.step_fraction / (lipschitz + self.solver_epsilon)
+        projected = torch.clamp(
+            flat_action - step.unsqueeze(-1) * gradient,
+            min=flat_low,
+            max=flat_high,
+        )
+        return flat_action - projected
+
     def forward(
         self,
         lifted_state: torch.Tensor,
         context: torch.Tensor | None = None,
+        physical_reference: torch.Tensor | None = None,
+        action_reference: torch.Tensor | None = None,
     ) -> KoopmanMPCActorOutput:
-        quadratic, linear = self.cost_terms(lifted_state, context)
+        quadratic, linear = self.cost_terms(
+            lifted_state,
+            context,
+            physical_reference,
+            action_reference,
+        )
         hessian, qp_linear = self.condensed_quadratic(
             lifted_state,
             quadratic,

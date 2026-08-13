@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from antmaze_ac.koopman.checkpoint import sha256
 from antmaze_ac.rl.serialization import make_history_mpc_policy
@@ -52,10 +52,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--sequence-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--converged-action-weight",
+        type=float,
+        default=0.0,
+        help="Weight for matching the current expert action after a larger "
+        "FISTA iteration budget.",
+    )
+    parser.add_argument("--solver-consistency-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--converged-solver-iterations",
+        type=int,
+        default=100,
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--stage-balanced-sampling",
+        action="store_true",
+        help="Sample stages 0/1/2 equally during training.",
+    )
     parser.add_argument("--checkpoint-interval", type=int, default=10)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--solver-iterations", type=int, default=20)
+    parser.add_argument("--quadratic-log-scale", type=float, default=None)
+    parser.add_argument("--linear-scale", type=float, default=None)
+    parser.add_argument("--action-quadratic-scale", type=float, default=None)
     parser.add_argument("--absolute-action-limit", type=float, default=0.30)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-validation-samples", type=int, default=None)
@@ -69,12 +90,27 @@ def parse_args() -> argparse.Namespace:
         args.checkpoint_interval,
         args.horizon,
         args.solver_iterations,
+        args.converged_solver_iterations,
     ) < 1:
         parser.error("Epoch, batch, horizon and solver counts must be positive")
     if not 0 < args.validation_fraction < 1:
         parser.error("validation-fraction must lie in (0,1)")
-    if args.sequence_weight < 0:
-        parser.error("sequence-weight must be non-negative")
+    if min(
+        args.sequence_weight,
+        args.converged_action_weight,
+        args.solver_consistency_weight,
+    ) < 0:
+        parser.error("BC loss weights must be non-negative")
+    if args.converged_solver_iterations < args.solver_iterations:
+        parser.error(
+            "converged-solver-iterations must be at least solver-iterations"
+        )
+    if args.quadratic_log_scale is not None and args.quadratic_log_scale <= 0:
+        parser.error("quadratic-log-scale must be positive")
+    if args.linear_scale is not None and args.linear_scale <= 0:
+        parser.error("linear-scale must be positive")
+    if args.action_quadratic_scale is not None and args.action_quadratic_scale <= 0:
+        parser.error("action-quadratic-scale must be positive")
     return args
 
 
@@ -125,8 +161,34 @@ def _future_targets(
     return future, mask
 
 
+def _converged_sequence(
+    actor,
+    output,
+    iterations: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    flat, residual = actor.solve_condensed_qp(
+        output.qp_hessian,
+        output.qp_linear,
+        iterations=iterations,
+    )
+    return flat.reshape(
+        *flat.shape[:-1],
+        actor.horizon,
+        actor.action_dim,
+    ), residual
+
+
 @torch.no_grad()
-def _evaluate(policy, loader, device: torch.device) -> dict:
+def _evaluate(
+    policy,
+    loader,
+    device: torch.device,
+    *,
+    sequence_weight: float,
+    converged_action_weight: float,
+    solver_consistency_weight: float,
+    converged_solver_iterations: int,
+) -> dict:
     policy.eval()
     squared_error_sum = 0.0
     residual_sum = 0.0
@@ -134,17 +196,33 @@ def _evaluate(policy, loader, device: torch.device) -> dict:
     samples = 0
     sequence_squared_error_sum = 0.0
     sequence_elements = 0.0
-    for observations, targets, future, future_mask in loader:
+    converged_squared_error_sum = 0.0
+    converged_elements = 0.0
+    converged_residual_sum = 0.0
+    solver_consistency_squared_sum = 0.0
+    stage_squared_error_sum = np.zeros(3, dtype=np.float64)
+    stage_elements = np.zeros(3, dtype=np.float64)
+    stage_converged_error_sum = np.zeros(3, dtype=np.float64)
+    stage_consistency_error_sum = np.zeros(3, dtype=np.float64)
+    for observations, targets, future, future_mask, stages in loader:
         observations = observations.to(device)
         targets = targets.to(device)
         future = future.to(device)
         future_mask = future_mask.to(device)
+        stages = stages.to(device)
         output = policy.actor_mean(observations)
         squared_error = (output.action - targets).square()
         squared_error_sum += float(squared_error.sum())
         residual_sum += float(output.projected_gradient_residual.sum())
         elements += squared_error.numel()
         samples += len(observations)
+        for stage in range(3):
+            selected = stages == stage
+            if bool(selected.any()):
+                stage_squared_error_sum[stage] += float(
+                    squared_error[selected].sum()
+                )
+                stage_elements[stage] += int(selected.sum()) * squared_error.shape[-1]
         if output.action_sequence.shape[-2] > 1:
             future_error = (
                 output.action_sequence[:, 1:] - future[:, 1:]
@@ -152,16 +230,92 @@ def _evaluate(policy, loader, device: torch.device) -> dict:
             valid = future_mask[:, 1:]
             sequence_squared_error_sum += float((future_error * valid).sum())
             sequence_elements += float(valid.sum())
-    return {
-        "mse": squared_error_sum / elements,
-        "rmse": (squared_error_sum / elements) ** 0.5,
+        if converged_action_weight > 0 or solver_consistency_weight > 0:
+            converged, converged_residual = _converged_sequence(
+                policy.actor,
+                output,
+                converged_solver_iterations,
+            )
+            converged_error = (converged[:, 0] - targets).square()
+            converged_squared_error_sum += float(converged_error.sum())
+            converged_elements += converged_error.numel()
+            solver_consistency_squared_sum += float(
+                (converged[:, 0] - output.action).square().sum()
+            )
+            for stage in range(3):
+                selected = stages == stage
+                if bool(selected.any()):
+                    stage_converged_error_sum[stage] += float(
+                        converged_error[selected].sum()
+                    )
+                    stage_consistency_error_sum[stage] += float(
+                        (
+                            converged[selected, 0] - output.action[selected]
+                        ).square().sum()
+                    )
+            converged_residual_sum += float(converged_residual.sum())
+    mse = squared_error_sum / elements
+    future_mse = (
+        sequence_squared_error_sum / sequence_elements
+        if sequence_elements
+        else 0.0
+    )
+    converged_mse = (
+        converged_squared_error_sum / converged_elements
+        if converged_elements
+        else 0.0
+    )
+    solver_consistency_mse = (
+        solver_consistency_squared_sum / converged_elements
+        if converged_elements
+        else 0.0
+    )
+    stage_mse = stage_squared_error_sum / np.maximum(stage_elements, 1.0)
+    stage_converged_mse = stage_converged_error_sum / np.maximum(
+        stage_elements, 1.0
+    )
+    stage_consistency_mse = stage_consistency_error_sum / np.maximum(
+        stage_elements, 1.0
+    )
+    stage_objective = (
+        stage_mse
+        + converged_action_weight * stage_converged_mse
+        + solver_consistency_weight * stage_consistency_mse
+    )
+    result = {
+        "objective": (
+            mse
+            + sequence_weight * future_mse
+            + converged_action_weight * converged_mse
+            + solver_consistency_weight * solver_consistency_mse
+        ),
+        "mse": mse,
+        "rmse": mse ** 0.5,
         "projected_gradient_residual_mean": residual_sum / samples,
-        "future_sequence_mse": (
-            sequence_squared_error_sum / sequence_elements
-            if sequence_elements
+        "future_sequence_mse": future_mse,
+        "converged_action_mse": converged_mse,
+        "solver_consistency_mse": solver_consistency_mse,
+        "converged_projected_gradient_residual_mean": (
+            converged_residual_sum / samples
+            if converged_action_weight > 0 or solver_consistency_weight > 0
             else 0.0
         ),
+        "stage_macro_objective": float(stage_objective.mean()),
     }
+    for stage in range(3):
+        result[f"stage_{stage}_samples"] = int(
+            stage_elements[stage] / policy.action_dim
+        )
+        result[f"stage_{stage}_mse"] = float(stage_mse[stage])
+        result[f"stage_{stage}_rmse"] = float(stage_mse[stage] ** 0.5)
+        result[f"stage_{stage}_converged_action_mse"] = float(
+            stage_converged_mse[stage]
+        )
+        result[f"stage_{stage}_solver_consistency_mse"] = float(
+            stage_consistency_mse[stage]
+        )
+        result[f"stage_{stage}_objective"] = float(stage_objective[stage])
+    return result
 
 
 def main() -> None:
@@ -205,6 +359,9 @@ def main() -> None:
         horizon=args.horizon,
         absolute_action_limit=args.absolute_action_limit,
         solver_iterations=args.solver_iterations,
+        quadratic_log_scale=args.quadratic_log_scale,
+        linear_scale=args.linear_scale,
+        action_quadratic_scale=args.action_quadratic_scale,
         waypoint_count=3,
     )
     policy.koopman.eval()
@@ -258,17 +415,35 @@ def main() -> None:
         torch.from_numpy(targets[train_indices]),
         torch.from_numpy(future_targets[train_indices]),
         torch.from_numpy(future_mask[train_indices]),
+        torch.from_numpy(active_waypoint_index[train_indices]),
     )
     validation_data = TensorDataset(
         torch.from_numpy(observations[validation_indices]),
         torch.from_numpy(targets[validation_indices]),
         torch.from_numpy(future_targets[validation_indices]),
         torch.from_numpy(future_mask[validation_indices]),
+        torch.from_numpy(active_waypoint_index[validation_indices]),
     )
+    train_sampler = None
+    if args.stage_balanced_sampling:
+        train_stages = active_waypoint_index[train_indices]
+        stage_counts = np.bincount(train_stages, minlength=3)
+        if np.any(stage_counts == 0):
+            raise ValueError(
+                "stage-balanced-sampling requires all three stages in training"
+            )
+        sample_weights = 1.0 / stage_counts[train_stages]
+        train_sampler = WeightedRandomSampler(
+            torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(train_indices),
+            replacement=True,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
     train_loader = DataLoader(
         train_data,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         pin_memory=device.type == "cuda",
     )
     validation_loader = DataLoader(
@@ -281,6 +456,7 @@ def main() -> None:
     expected_koopman_sha = sha256(checkpoint)
     start_epoch = 0
     best_validation_mse = float("inf")
+    best_validation_objective = float("inf")
     elapsed_before = 0.0
     if args.resume is not None:
         resume_path = Path(args.resume).expanduser().resolve()
@@ -307,6 +483,13 @@ def main() -> None:
             "solver": "absolute_box_fista_v1",
             "fixed_smoothness": False,
             "sequence_weight": args.sequence_weight,
+            "converged_action_weight": args.converged_action_weight,
+            "solver_consistency_weight": args.solver_consistency_weight,
+            "converged_solver_iterations": args.converged_solver_iterations,
+            "quadratic_log_scale": policy.actor.quadratic_log_scale,
+            "linear_scale": policy.actor.linear_scale,
+            "action_quadratic_scale": policy.actor.action_quadratic_scale,
+            "stage_balanced_sampling": args.stage_balanced_sampling,
         }
         for key, expected in expected_runtime.items():
             actual = resume_payload["runtime"].get(key)
@@ -318,6 +501,12 @@ def main() -> None:
         optimizer.load_state_dict(resume_payload["optimizer"])
         start_epoch = int(resume_payload["epoch"]) + 1
         best_validation_mse = float(resume_payload["best_validation_mse"])
+        best_validation_objective = float(
+            resume_payload.get(
+                "best_validation_objective",
+                best_validation_mse,
+            )
+        )
         elapsed_before = float(resume_payload.get("elapsed_seconds", 0.0))
 
     runtime = {
@@ -330,6 +519,19 @@ def main() -> None:
         "solver": "absolute_box_fista_v1",
         "fixed_smoothness": False,
         "sequence_weight": args.sequence_weight,
+        "converged_action_weight": args.converged_action_weight,
+        "solver_consistency_weight": args.solver_consistency_weight,
+        "converged_solver_iterations": args.converged_solver_iterations,
+        "quadratic_log_scale": policy.actor.quadratic_log_scale,
+        "linear_scale": policy.actor.linear_scale,
+        "action_quadratic_scale": policy.actor.action_quadratic_scale,
+        "stage_balanced_sampling": args.stage_balanced_sampling,
+        "train_stage_counts": np.bincount(
+            active_waypoint_index[train_indices], minlength=3
+        ).tolist(),
+        "validation_stage_counts": np.bincount(
+            active_waypoint_index[validation_indices], minlength=3
+        ).tolist(),
         "train_samples": len(train_data),
         "validation_samples": len(validation_data),
     }
@@ -358,6 +560,8 @@ def main() -> None:
             train_squared_error = 0.0
             train_elements = 0
             train_loss_sum = 0.0
+            train_converged_action_sum = 0.0
+            train_solver_consistency_sum = 0.0
             gradient_norm_sum = 0.0
             batches = 0
             for (
@@ -365,6 +569,7 @@ def main() -> None:
                 batch_targets,
                 batch_future,
                 batch_future_mask,
+                _,
             ) in train_loader:
                 batch_observations = batch_observations.to(device)
                 batch_targets = batch_targets.to(device)
@@ -383,6 +588,30 @@ def main() -> None:
                         1.0
                     )
                     loss = loss + args.sequence_weight * future_loss
+                converged_action_loss = output_actor.action.sum() * 0.0
+                solver_consistency_loss = output_actor.action.sum() * 0.0
+                if (
+                    args.converged_action_weight > 0
+                    or args.solver_consistency_weight > 0
+                ):
+                    converged_sequence, _ = _converged_sequence(
+                        policy.actor,
+                        output_actor,
+                        args.converged_solver_iterations,
+                    )
+                    converged_action = converged_sequence[:, 0]
+                    converged_action_loss = (
+                        converged_action - batch_targets
+                    ).square().mean()
+                    solver_consistency_loss = (
+                        converged_action - output_actor.action
+                    ).square().mean()
+                    loss = (
+                        loss
+                        + args.converged_action_weight * converged_action_loss
+                        + args.solver_consistency_weight
+                        * solver_consistency_loss
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -395,12 +624,22 @@ def main() -> None:
                 train_squared_error += float(squared_error.detach().sum())
                 train_elements += squared_error.numel()
                 train_loss_sum += float(loss.detach())
+                train_converged_action_sum += float(
+                    converged_action_loss.detach()
+                )
+                train_solver_consistency_sum += float(
+                    solver_consistency_loss.detach()
+                )
                 gradient_norm_sum += float(gradient_norm.detach())
                 batches += 1
             validation = _evaluate(
                 policy,
                 validation_loader,
                 device,
+                sequence_weight=args.sequence_weight,
+                converged_action_weight=args.converged_action_weight,
+                solver_consistency_weight=args.solver_consistency_weight,
+                converged_solver_iterations=args.converged_solver_iterations,
             )
             elapsed = elapsed_before + time.monotonic() - started
             row = {
@@ -409,9 +648,21 @@ def main() -> None:
                 "train_mse": train_squared_error / train_elements,
                 "train_rmse": (train_squared_error / train_elements) ** 0.5,
                 "train_loss": train_loss_sum / batches,
+                "train_converged_action_mse": (
+                    train_converged_action_sum / batches
+                ),
+                "train_solver_consistency_mse": (
+                    train_solver_consistency_sum / batches
+                ),
                 "gradient_norm": gradient_norm_sum / batches,
                 **{f"validation_{key}": value for key, value in validation.items()},
             }
+            selection_metric = (
+                "stage_macro_objective"
+                if args.stage_balanced_sampling
+                else "objective"
+            )
+            selection_objective = validation[selection_metric]
             with history_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(row, sort_keys=True) + "\n")
             payload = {
@@ -423,12 +674,20 @@ def main() -> None:
                     best_validation_mse,
                     validation["mse"],
                 ),
+                "best_validation_objective": min(
+                    best_validation_objective,
+                    selection_objective,
+                ),
+                "validation_selection_objective": selection_objective,
+                "validation_selection_metric": selection_metric,
                 "elapsed_seconds": elapsed,
                 "last_report": row,
             }
             _save(output / "last.pt", payload)
-            if validation["mse"] < best_validation_mse:
-                best_validation_mse = validation["mse"]
+            best_validation_mse = min(best_validation_mse, validation["mse"])
+            if selection_objective < best_validation_objective:
+                best_validation_objective = selection_objective
+                payload["best_validation_objective"] = best_validation_objective
                 _save(output / "best_validation.pt", payload)
             if (epoch + 1) % args.checkpoint_interval == 0:
                 _save(output / f"recovery_epoch_{epoch:04d}.pt", payload)
@@ -439,6 +698,7 @@ def main() -> None:
             "method": "bc_kmpc_bc",
             "last_epoch": last_epoch,
             "best_validation_mse": best_validation_mse,
+            "best_validation_objective": best_validation_objective,
             "best_validation_checkpoint": str(
                 (output / "best_validation.pt").resolve()
             ),

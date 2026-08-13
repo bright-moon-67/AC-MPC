@@ -117,3 +117,82 @@ def test_absolute_box_projection_reaches_action_boundary():
     output = actor(torch.zeros(1, 1, dtype=dtype))
     assert bool((output.action_sequence >= -0.3).all())
     assert bool((output.action_sequence <= 0.3).all())
+
+
+def test_explicit_solver_budget_and_kkt_mapping_are_differentiable():
+    dtype = torch.float64
+    actor = KoopmanMPCActor(
+        torch.tensor([[0.9]], dtype=dtype),
+        torch.tensor([[0.25]], dtype=dtype),
+        torch.eye(1, dtype=dtype),
+        horizon=3,
+        context_dim=1,
+        hidden_dims=(4,),
+        action_low=-1.0,
+        action_high=1.0,
+        linear_scale=0.1,
+        solver_iterations=2,
+    )
+    _randomize(actor, seed=813)
+    output = actor(
+        torch.tensor([[0.2]], dtype=dtype),
+        torch.tensor([[0.1]], dtype=dtype),
+    )
+    longer, longer_residual = actor.solve_condensed_qp(
+        output.qp_hessian,
+        output.qp_linear,
+        iterations=20,
+    )
+    assert longer.shape == (1, 3)
+    assert longer_residual.shape == (1,)
+    assert not torch.equal(
+        longer,
+        output.action_sequence.flatten(start_dim=-2),
+    )
+
+    mapping = actor.projected_kkt_mapping(
+        output.qp_hessian,
+        output.qp_linear,
+        torch.tensor([[0.04, -0.02, 0.01]], dtype=dtype),
+    )
+    loss = mapping.square().mean() + longer.square().mean()
+    gradients = torch.autograd.grad(loss, tuple(actor.parameters()))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(float(gradient.abs().sum()) > 0 for gradient in gradients)
+
+
+def test_physical_reference_initializes_a_tracking_cost():
+    dtype = torch.float64
+    actor = KoopmanMPCActor(
+        torch.eye(2, dtype=dtype),
+        torch.ones(2, 1, dtype=dtype) * 0.1,
+        torch.eye(2, dtype=dtype),
+        horizon=2,
+        action_low=-1.0,
+        action_high=1.0,
+        physical_quadratic_scale=torch.ones(2, dtype=dtype),
+        action_quadratic_scale=3.0,
+    )
+    lifted = torch.tensor([[0.1, -0.2]], dtype=dtype)
+    reference = torch.tensor([[0.4, 0.3]], dtype=dtype)
+    quadratic, linear = actor.cost_terms(
+        lifted,
+        physical_reference=reference,
+        action_reference=torch.tensor([[0.2]], dtype=dtype),
+    )
+    torch.testing.assert_close(
+        quadratic[..., :2],
+        torch.ones(1, 2, 2, dtype=dtype),
+    )
+    torch.testing.assert_close(
+        quadratic[..., 2:],
+        torch.full((1, 2, 1), 3.0, dtype=dtype),
+    )
+    torch.testing.assert_close(
+        linear[..., :2],
+        -reference.unsqueeze(-2).expand(1, 2, 2),
+    )
+    torch.testing.assert_close(
+        linear[..., 2:],
+        torch.full((1, 2, 1), -0.6, dtype=dtype),
+    )

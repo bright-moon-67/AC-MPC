@@ -85,7 +85,7 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         self.task_context_dim = (
             self.TASK_CONTEXT_DIM
             if self.waypoint_count == 1
-            else 4 * self.waypoint_count
+            else self.task_observation_dim
         )
         if actor.context_dim != self.task_context_dim:
             raise ValueError(
@@ -158,7 +158,13 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     def features(
         self,
         observation: torch.Tensor,
-    ) -> tuple[HistoryMPCObservation, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        HistoryMPCObservation,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         split = self.split_observation(observation)
         normalized_state = (
             split.physical_state - self.state_mean
@@ -173,6 +179,11 @@ class HistoryKoopmanMPCPolicy(nn.Module):
             actor_context = torch.cat(
                 (normalized_target, target_error), dim=-1
             )
+            active_target = normalized_target
+            action_reference = normalized_state.new_zeros(
+                *normalized_state.shape[:-1],
+                self.action_dim,
+            )
         else:
             waypoint_stop = 3 * self.waypoint_count
             waypoints = split.task_context[..., :waypoint_stop].reshape(
@@ -183,11 +194,37 @@ class HistoryKoopmanMPCPolicy(nn.Module):
             actor_context = torch.cat(
                 (normalized_waypoints.flatten(start_dim=-2), stage), dim=-1
             )
-        return split, lifted, actor_context
+            active_target = torch.sum(
+                normalized_waypoints * stage.unsqueeze(-1),
+                dim=-2,
+            )
+            action_reference = normalized_state.new_zeros(
+                *normalized_state.shape[:-1],
+                self.action_dim,
+            )
+
+        # Standard reference-tracking initialization for PPO without BC:
+        # preserve the current normalized non-tip state and move only the
+        # physical tip coordinates toward the active waypoint.  The learned
+        # cost map remains free to reshape this reference cost during PPO.
+        physical_reference = normalized_state.clone()
+        physical_reference[..., self.tip_indices] = active_target
+        return (
+            split,
+            lifted,
+            actor_context,
+            physical_reference,
+            action_reference,
+        )
 
     def actor_mean(self, observation: torch.Tensor) -> KoopmanMPCActorOutput:
-        _, lifted, actor_context = self.features(observation)
-        return self.actor(lifted, actor_context)
+        _, lifted, actor_context, physical_reference, action_reference = self.features(observation)
+        return self.actor(
+            lifted,
+            actor_context,
+            physical_reference,
+            action_reference,
+        )
 
     def forward(
         self,
@@ -195,8 +232,15 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     ) -> HistoryKoopmanMPCPolicyOutput:
         single = observation.ndim == 1
         observation_batch = observation.unsqueeze(0) if single else observation
-        _, lifted, actor_context = self.features(observation_batch)
-        mpc = self.actor(lifted, actor_context)
+        _, lifted, actor_context, physical_reference, action_reference = self.features(
+            observation_batch
+        )
+        mpc = self.actor(
+            lifted,
+            actor_context,
+            physical_reference,
+            action_reference,
+        )
         if not (
             torch.isfinite(mpc.action).all()
             and torch.isfinite(mpc.quadratic_diagonal).all()

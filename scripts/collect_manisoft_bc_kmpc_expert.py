@@ -24,6 +24,84 @@ from antmaze_ac.rl.serialization import load_history_mpc_checkpoint
 TIP_INDICES = (30, 31, 32)
 
 
+def _minimum_jerk(alpha: np.ndarray) -> np.ndarray:
+    """Match the certified waypoint-bank action ramp."""
+
+    return 10.0 * alpha**3 - 15.0 * alpha**4 + 6.0 * alpha**5
+
+
+def _start_stage_schedule(
+    episodes: int,
+    start_stages: tuple[int, ...],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    cycles = [
+        rng.permutation(start_stages)
+        for _ in range((episodes + len(start_stages) - 1) // len(start_stages))
+    ]
+    return np.concatenate(cycles)[:episodes].astype(np.int64, copy=False)
+
+
+def _warm_start_stage(
+    env: HistoryContextTrackingWrapper,
+    base_env: ManiSoftThreeWaypointTrackingEnv,
+    *,
+    start_stage: int,
+    equilibrium_action: np.ndarray,
+    reference_state: np.ndarray,
+    ramp_steps: int,
+    hold_steps: int,
+) -> tuple[np.ndarray, float]:
+    """Reach a certified physical equilibrium before starting DAgger.
+
+    A compact 45-D waypoint state cannot be teleported into the simulator.
+    Replaying its certified action with the original minimum-jerk ramp gives
+    a dynamically valid full simulator state and a real Koopman history.
+    Warm-up steps are excluded from the collected episode.
+    """
+
+    if start_stage == 0:
+        state = base_env._physical_state()
+        return env._observation(state), 0.0
+    if start_stage not in (1, 2):
+        raise ValueError("start_stage must be 0, 1 or 2")
+
+    action = np.asarray(equilibrium_action, dtype=np.float32).reshape(-1)
+    ramp = _minimum_jerk(np.linspace(0.0, 1.0, ramp_steps))
+    observation = None
+    for alpha in ramp:
+        observation, _, _, _, _ = env.step(action * np.float32(alpha))
+    for _ in range(hold_steps):
+        observation, _, _, _, _ = env.step(action)
+    if observation is None:
+        raise RuntimeError("warm start did not execute any simulator step")
+
+    physical_state = np.asarray(
+        observation[: base_env.observation_space.shape[0]],
+        dtype=np.float32,
+    )
+    reference_tip = np.asarray(reference_state, dtype=np.float32)[
+        np.asarray(TIP_INDICES)
+    ]
+    tip_error = float(
+        np.linalg.norm(physical_state[np.asarray(TIP_INDICES)] - reference_tip)
+    )
+
+    base_env.active_waypoint_index = int(start_stage)
+    base_env.waypoints_completed = int(start_stage)
+    base_env.target_tip = base_env.fixed_waypoints[start_stage].copy()
+    base_env.success_count = 0
+    base_env.step_count = 0
+    distance = float(
+        np.linalg.norm(
+            physical_state[np.asarray(TIP_INDICES)] - base_env.target_tip
+        )
+    )
+    base_env.previous_distance = distance
+    base_env.target_scale = max(distance, np.finfo(np.float32).eps)
+    return env._observation(physical_state), tip_error
+
+
 def _device(specification: str) -> torch.device:
     return torch.device(
         "cuda"
@@ -57,6 +135,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--episode-steps", type=int, default=300)
+    parser.add_argument(
+        "--start-stages",
+        type=int,
+        nargs="+",
+        choices=(0, 1, 2),
+        default=(0,),
+        help="Episode starting stages. Stages 1/2 are reached by replaying "
+        "the preceding certified waypoint action before collection.",
+    )
+    parser.add_argument("--warmup-ramp-steps", type=int, default=100)
+    parser.add_argument("--warmup-hold-steps", type=int, default=400)
+    parser.add_argument("--warmup-tip-tolerance", type=float, default=0.003)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--state-weight", type=float, default=200.0)
     parser.add_argument(
@@ -78,10 +168,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    if min(args.episodes, args.episode_steps, args.horizon) < 1:
+    if min(
+        args.episodes,
+        args.episode_steps,
+        args.horizon,
+        args.warmup_ramp_steps,
+        args.warmup_hold_steps,
+    ) < 1:
         parser.error("episodes, episode-steps and horizon must be positive")
     if args.rollout_noise_std < 0:
         parser.error("rollout-noise-std must be non-negative")
+    if args.warmup_tip_tolerance <= 0:
+        parser.error("warmup-tip-tolerance must be positive")
+    args.start_stages = tuple(dict.fromkeys(args.start_stages))
     return args
 
 
@@ -187,7 +286,11 @@ def main() -> None:
     base_env = ManiSoftThreeWaypointTrackingEnv(
         scenario,
         waypoint_tips=reference_states[:, :, np.asarray(TIP_INDICES)],
-        episode_steps=args.episode_steps,
+        episode_steps=(
+            args.episode_steps
+            + args.warmup_ramp_steps
+            + args.warmup_hold_steps
+        ),
         absolute_action_limit=args.absolute_action_limit,
     )
     env = HistoryContextTrackingWrapper(
@@ -207,6 +310,11 @@ def main() -> None:
             )
         ]
     )[: args.episodes]
+    start_stage_schedule = _start_stage_schedule(
+        args.episodes,
+        args.start_stages,
+        rng,
+    )
     observations: list[np.ndarray] = []
     expert_actions: list[np.ndarray] = []
     applied_actions: list[np.ndarray] = []
@@ -265,6 +373,8 @@ def main() -> None:
     base_samples = len(observations)
     episode_offset = max(episode_ids, default=-1) + 1
     episode_returns: list[float] = []
+    episode_start_stages: list[int] = []
+    warmup_tip_errors: list[float] = []
     try:
         for episode in range(args.episodes):
             observation, reset_info = env.reset(
@@ -274,7 +384,38 @@ def main() -> None:
                 },
             )
             waypoint_triplet_index = int(reset_info["waypoint_triplet_index"])
-            warm_start = None
+            start_stage = int(start_stage_schedule[episode])
+            warmup_tip_error = 0.0
+            if start_stage:
+                equilibrium_index = start_stage - 1
+                observation, warmup_tip_error = _warm_start_stage(
+                    env,
+                    base_env,
+                    start_stage=start_stage,
+                    equilibrium_action=reference_actions[
+                        waypoint_triplet_index, equilibrium_index
+                    ],
+                    reference_state=reference_states[
+                        waypoint_triplet_index, equilibrium_index
+                    ],
+                    ramp_steps=args.warmup_ramp_steps,
+                    hold_steps=args.warmup_hold_steps,
+                )
+                if warmup_tip_error > args.warmup_tip_tolerance:
+                    raise RuntimeError(
+                        "Certified warm start tip error "
+                        f"{1000.0 * warmup_tip_error:.3f} mm exceeds "
+                        f"{1000.0 * args.warmup_tip_tolerance:.3f} mm"
+                    )
+                warm_start = np.repeat(
+                    reference_actions[
+                        waypoint_triplet_index, equilibrium_index
+                    ][None, :],
+                    args.horizon,
+                    axis=0,
+                )
+            else:
+                warm_start = None
             episode_return = 0.0
             executed_steps = 0
             for step in range(args.episode_steps):
@@ -338,6 +479,8 @@ def main() -> None:
                 if terminated or truncated:
                     break
             episode_returns.append(episode_return)
+            episode_start_stages.append(start_stage)
+            warmup_tip_errors.append(warmup_tip_error)
             print(
                 json.dumps(
                     {
@@ -349,6 +492,8 @@ def main() -> None:
                         "waypoints_completed": int(base_env.waypoints_completed),
                         "waypoint_triplet_index": waypoint_triplet_index,
                         "success": bool(terminated),
+                        "start_stage": start_stage,
+                        "warmup_tip_error_mm": 1000.0 * warmup_tip_error,
                     },
                     sort_keys=True,
                 ),
@@ -389,6 +534,16 @@ def main() -> None:
         "new_samples": len(observations) - base_samples,
         "episodes": args.episodes,
         "episode_return_mean": float(np.mean(episode_returns)),
+        "start_stage_episode_counts": {
+            str(stage): int(np.sum(np.asarray(episode_start_stages) == stage))
+            for stage in args.start_stages
+        },
+        "warmup_tip_error_mm_mean": float(
+            1000.0 * np.mean(warmup_tip_errors)
+        ),
+        "warmup_tip_error_mm_max": float(
+            1000.0 * np.max(warmup_tip_errors)
+        ),
         "observation_dim": int(env.observation_space.shape[0]),
         "action_dim": model.action_dim,
         "history_steps": model.history_steps,

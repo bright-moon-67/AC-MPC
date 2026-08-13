@@ -51,9 +51,7 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         if self.waypoint_count < 1:
             raise ValueError("waypoint_count must be positive")
         self.task_context_dim = (
-            3
-            if self.waypoint_count == 1
-            else 4 * self.waypoint_count
+            3 if self.waypoint_count == 1 else 4 * self.waypoint_count
         )
         self.tip_indices = np.asarray(tuple(tip_indices), dtype=np.int64)
         if self.tip_indices.shape != (3,):
@@ -179,6 +177,10 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
 
         tolerance = np.finfo(np.float32).eps * 8
         saturated = np.abs(applied - requested) > tolerance
+        bound = np.logical_or(
+            applied <= base_low + tolerance,
+            applied >= base_high - tolerance,
+        )
         info = dict(info)
         info.update(
             {
@@ -186,6 +188,7 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
                 "applied_action": applied.copy(),
                 "applied_delta_action": (applied - previous).copy(),
                 "action_saturation_ratio": float(np.mean(saturated)),
+                "action_bound_ratio": float(np.mean(bound)),
             }
         )
         return (

@@ -22,6 +22,9 @@ def history_koopman_loss(
     controllability_svd_weight: float = 0.0,
     augmentation_weight: float = 0.0,
     reconstruction_weight: float = 1.0,
+    tip_position_weight: float = 0.0,
+    tip_position_slice: tuple[int, int] | None = None,
+    state_std: torch.Tensor | None = None,
     spectral_radius_limit: float = 1.0,
     target_latent_std: float = 1.0,
     svd_min_singular_value: float = 0.0,
@@ -49,6 +52,33 @@ def history_koopman_loss(
     state_step_errors = (predicted_states - states[:, 1:]).square().mean(dim=(0, 2))
     linear = _weighted_mean(lifted_step_errors, rollout_discount)
     rollout = _weighted_mean(state_step_errors, rollout_discount)
+
+    if tip_position_weight > 0:
+        if tip_position_slice is None or state_std is None:
+            raise ValueError(
+                "tip_position_slice and state_std are required when "
+                "tip_position_weight is positive"
+            )
+        tip_start, tip_stop = map(int, tip_position_slice)
+        if not (0 <= tip_start < tip_stop <= states.shape[-1]):
+            raise ValueError(
+                f"invalid tip position slice {tip_position_slice} for "
+                f"state dimension {states.shape[-1]}"
+            )
+        physical_scale = state_std.to(
+            device=states.device,
+            dtype=states.dtype,
+        )[tip_start:tip_stop]
+        physical_tip_error = (
+            predicted_states[..., tip_start:tip_stop]
+            - states[:, 1:, tip_start:tip_stop]
+        ) * physical_scale
+        tip_step_errors = physical_tip_error.square().mean(dim=(0, 2))
+        tip_position = _weighted_mean(tip_step_errors, rollout_discount)
+        tip_position_h1 = tip_step_errors[0]
+    else:
+        tip_position = states.new_zeros(())
+        tip_position_h1 = states.new_zeros(())
 
     all_contexts = contexts.reshape(-1, model.context_dim)
     phi_std = model.encoder(all_contexts).std(dim=0, unbiased=False)
@@ -81,6 +111,7 @@ def history_koopman_loss(
         + controllability_svd_weight * controllability_svd
         + augmentation_weight * augmentation
         + reconstruction_weight * reconstruction
+        + tip_position_weight * tip_position
     )
     if not torch.isfinite(total):
         raise FloatingPointError("Koopman loss is NaN or Inf")
@@ -94,6 +125,8 @@ def history_koopman_loss(
         controllability_svd=controllability_svd,
         augmentation=augmentation,
         reconstruction=reconstruction,
+        tip_position=tip_position,
+        tip_position_h1=tip_position_h1,
         spectral_radius=spectral_radius,
         latent_std_min=phi_std.min(),
         latent_std_mean=phi_std.mean(),

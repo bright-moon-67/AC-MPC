@@ -27,6 +27,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from antmaze_ac.config import load_config
+from antmaze_ac.data.action_rate_sampling import (
+    ActionRateStratifiedSampler,
+    rate_bin_indices,
+    window_action_rates,
+)
 from antmaze_ac.data.build_sequences import Normalizer
 from antmaze_ac.data.history_windows import AbsoluteActionHistoryWindowDataset
 from antmaze_ac.koopman.checkpoint import load_checkpoint, save_checkpoint, sha256
@@ -53,14 +58,18 @@ def discover_episodes(root: str | Path) -> list[Path]:
 
 def load_episodes(
     paths: list[Path],
+    path_source_ids: list[int],
     expected_state_dim: int,
     expected_action_dim: int,
     continuity_atol: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    if len(paths) != len(path_source_ids):
+        raise ValueError("paths and path_source_ids must have matching lengths")
     states: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     episode_ids: list[np.ndarray] = []
     step_indices: list[np.ndarray] = []
+    source_ids: list[np.ndarray] = []
     max_continuity_error = 0.0
     lengths: list[int] = []
 
@@ -95,6 +104,9 @@ def load_episodes(
         actions.append(action)
         episode_ids.append(np.full(len(state), episode_id, dtype=np.int64))
         step_indices.append(np.arange(len(state), dtype=np.int64))
+        source_ids.append(
+            np.full(len(state), path_source_ids[episode_id], dtype=np.int64)
+        )
         lengths.append(len(state))
         if (episode_id + 1) % 50 == 0 or episode_id + 1 == len(paths):
             print(f"loaded {episode_id + 1}/{len(paths)} episodes", flush=True)
@@ -111,6 +123,7 @@ def load_episodes(
         np.concatenate(actions, axis=0),
         np.concatenate(episode_ids, axis=0),
         np.concatenate(step_indices, axis=0),
+        np.concatenate(source_ids, axis=0),
         diagnostics,
     )
 
@@ -136,7 +149,40 @@ def split_episode_masks(
     return tuple(np.isin(episode_ids, ids) for ids in (train_ids, validation_ids, test_ids))
 
 
-def loss_kwargs_from_config(koopman_config: dict) -> dict:
+def split_episode_masks_by_source(
+    episode_ids: np.ndarray,
+    source_ids: np.ndarray,
+    fractions: tuple[float, float, float],
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split episodes independently within every input dataset root."""
+
+    masks = [np.zeros(len(episode_ids), dtype=bool) for _ in range(3)]
+    for source_id in np.unique(source_ids):
+        source_mask = source_ids == source_id
+        source_splits = split_episode_masks(
+            episode_ids[source_mask], fractions, seed + int(source_id)
+        )
+        source_rows = np.flatnonzero(source_mask)
+        for combined, source_split in zip(masks, source_splits):
+            combined[source_rows[source_split]] = True
+    return tuple(masks)
+
+
+def rate_bin_labels(edges: list[float]) -> list[str]:
+    labels = [f"le_{edges[0]:g}"]
+    labels.extend(
+        f"{left:g}_to_{right:g}"
+        for left, right in zip(edges[:-1], edges[1:])
+    )
+    labels.append(f"gt_{edges[-1]:g}")
+    return labels
+
+
+def loss_kwargs_from_config(
+    koopman_config: dict,
+    state_std: np.ndarray,
+) -> dict:
     weights = koopman_config["loss_weights"]
     return {
         "rollout_discount": koopman_config["rollout_discount"],
@@ -148,6 +194,9 @@ def loss_kwargs_from_config(koopman_config: dict) -> dict:
         "controllability_svd_weight": weights["controllability_svd"],
         "augmentation_weight": weights["augmentation"],
         "reconstruction_weight": weights["reconstruction"],
+        "tip_position_weight": weights["tip_position"],
+        "tip_position_slice": tuple(koopman_config["tip_position_slice"]),
+        "state_std": torch.as_tensor(state_std, dtype=torch.float32),
         "spectral_radius_limit": koopman_config["spectral_radius_limit"],
         "target_latent_std": koopman_config["target_latent_std"],
     }
@@ -171,7 +220,15 @@ def average_loss(model, loader, device, loss_kwargs):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/manisoft_coll.yaml")
-    parser.add_argument("--data", required=True, help="Root containing worker_*/episode_*.npz")
+    parser.add_argument(
+        "--data",
+        action="append",
+        required=True,
+        help=(
+            "Dataset root containing episode_*.npz or worker_*/episode_*.npz. "
+            "Repeat --data to combine smooth and rate-coverage collections."
+        ),
+    )
     parser.add_argument("--output", default=None)
     parser.add_argument("--history-steps", type=int, default=10)
     parser.add_argument("--device", default="auto")
@@ -180,7 +237,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", default=None)
     parser.add_argument("--max-train-windows", type=int, default=None)
     parser.add_argument("--max-validation-windows", type=int, default=None)
+    parser.add_argument(
+        "--rate-stratified-sampling",
+        action="store_true",
+        help="Resample train windows by their peak history/rollout action rate each epoch.",
+    )
+    parser.add_argument(
+        "--action-rate-bins",
+        type=float,
+        nargs="+",
+        default=[0.005, 0.05],
+        help="Strictly increasing max-|delta u| bin edges (default 0.005 0.05).",
+    )
+    parser.add_argument(
+        "--action-rate-fractions",
+        type=float,
+        nargs="+",
+        default=[0.50, 0.35, 0.15],
+        help="Sampling/selection weights for rate bins (default 0.50 0.35 0.15).",
+    )
+    parser.add_argument(
+        "--max-validation-windows-per-rate",
+        type=int,
+        default=20000,
+        help="Maximum deterministic validation windows evaluated in each rate slice.",
+    )
     parser.add_argument("--continuity-atol", type=float, default=1e-6)
+    parser.add_argument(
+        "--tip-position-weight",
+        type=float,
+        default=10000.0,
+        help=(
+            "Weight for physical-unit tip-position rollout MSE in m^2 "
+            "(default 10000, so a 10 mm RMSE contributes about 1.0)."
+        ),
+    )
     parser.add_argument(
         "--wandb-mode",
         choices=["auto", "online", "offline", "disabled"],
@@ -191,6 +282,27 @@ def parse_args() -> argparse.Namespace:
         parser.error("--history-steps must be positive")
     if args.continuity_atol < 0:
         parser.error("--continuity-atol must be non-negative")
+    if args.tip_position_weight < 0:
+        parser.error("--tip-position-weight must be non-negative")
+    if len(args.action_rate_fractions) != len(args.action_rate_bins) + 1:
+        parser.error("--action-rate-fractions must have one more value than --action-rate-bins")
+    if any(value <= 0 for value in args.action_rate_bins) or any(
+        right <= left
+        for left, right in zip(args.action_rate_bins[:-1], args.action_rate_bins[1:])
+    ):
+        parser.error("--action-rate-bins must be positive and strictly increasing")
+    if any(value < 0 for value in args.action_rate_fractions) or not sum(
+        args.action_rate_fractions
+    ):
+        parser.error("--action-rate-fractions must be non-negative and sum to > 0")
+    for name in (
+        "max_train_windows",
+        "max_validation_windows",
+        "max_validation_windows_per_rate",
+    ):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
     return args
 
 
@@ -201,6 +313,10 @@ def main() -> None:
     config["koopman"]["architecture"] = "fullA_history_context_v1"
     config["koopman"]["history_steps"] = int(args.history_steps)
     config["koopman"]["exact_action_integrator"] = False
+    config["koopman"]["tip_position_slice"] = [30, 33]
+    config["koopman"]["loss_weights"]["tip_position"] = float(
+        args.tip_position_weight
+    )
     config["data"]["state_semantics"] = "raw_45d_state_without_previous_action"
     config["data"]["action_semantics"] = "absolute_action"
     set_seed(config["experiment"]["seed"])
@@ -209,22 +325,47 @@ def main() -> None:
         else ("cpu" if args.device == "auto" else args.device)
     )
 
-    paths = discover_episodes(args.data)
+    data_roots = [Path(root).expanduser().resolve() for root in args.data]
+    paths: list[Path] = []
+    path_source_ids: list[int] = []
+    seen_paths: set[Path] = set()
+    source_episode_counts: dict[str, int] = {}
+    for source_id, root in enumerate(data_roots):
+        source_paths = discover_episodes(root)
+        duplicates = seen_paths.intersection(source_paths)
+        if duplicates:
+            raise ValueError(
+                f"dataset roots overlap; duplicate episode {next(iter(duplicates))}"
+            )
+        seen_paths.update(source_paths)
+        paths.extend(source_paths)
+        path_source_ids.extend([source_id] * len(source_paths))
+        source_episode_counts[str(root)] = len(source_paths)
     expected_state_dim = int(config["experiment"]["expected_observation_dim"])
     expected_action_dim = int(config["experiment"]["expected_action_dim"])
-    states, actions, episode_ids, step_indices, diagnostics = load_episodes(
+    (
+        states,
+        actions,
+        episode_ids,
+        step_indices,
+        source_ids,
+        diagnostics,
+    ) = load_episodes(
         paths,
+        path_source_ids,
         expected_state_dim,
         expected_action_dim,
         args.continuity_atol,
     )
+    diagnostics["sources"] = source_episode_counts
     fractions = (
         config["data"]["train_fraction"],
         config["data"]["validation_fraction"],
         config["data"]["test_fraction"],
     )
-    train_mask, validation_mask, test_mask = split_episode_masks(
+    train_mask, validation_mask, test_mask = split_episode_masks_by_source(
         episode_ids,
+        source_ids,
         fractions,
         int(config["experiment"]["seed"]),
     )
@@ -258,17 +399,122 @@ def main() -> None:
         "train_windows": len(train_windows),
         "validation_windows": len(validation_windows),
     }
-    del paths, states, actions, episode_ids, step_indices, train_mask, validation_mask, test_mask
+    train_window_rates = window_action_rates(
+        train_windows.actions,
+        train_windows.episode_ids,
+        train_windows.starts,
+        k_step,
+        args.history_steps,
+    )
+    validation_window_rates = window_action_rates(
+        validation_windows.actions,
+        validation_windows.episode_ids,
+        validation_windows.starts,
+        k_step,
+        args.history_steps,
+    )
+    rate_edges = [float(value) for value in args.action_rate_bins]
+    rate_fractions = np.asarray(args.action_rate_fractions, dtype=np.float64)
+    rate_fractions /= rate_fractions.sum()
+    labels = rate_bin_labels(rate_edges)
+    train_rate_bins = rate_bin_indices(train_window_rates, rate_edges)
+    validation_rate_bins = rate_bin_indices(validation_window_rates, rate_edges)
+    split_summary["train_windows_by_action_rate"] = {
+        label: int(np.sum(train_rate_bins == index))
+        for index, label in enumerate(labels)
+    }
+    split_summary["validation_windows_by_action_rate"] = {
+        label: int(np.sum(validation_rate_bins == index))
+        for index, label in enumerate(labels)
+    }
+    config["data"]["action_rate_sampling"] = {
+        "enabled": bool(args.rate_stratified_sampling),
+        "definition": (
+            "peak max-component |u[t]-u[t-1]| over the history and K-step "
+            "rollout window, with zero previous action at episode boundaries"
+        ),
+        "bin_edges": rate_edges,
+        "fractions": rate_fractions.tolist(),
+        "train_windows_per_epoch": (
+            args.max_train_windows or len(train_windows)
+        ),
+        "validation_selection": (
+            "rate_weighted" if args.rate_stratified_sampling else "natural"
+        ),
+    }
+
+    seed = int(config["experiment"]["seed"])
+    train_sampler = None
+    if args.rate_stratified_sampling:
+        train_sampler = ActionRateStratifiedSampler(
+            train_window_rates,
+            rate_edges,
+            rate_fractions,
+            args.max_train_windows or len(train_windows),
+            seed,
+        )
+    elif args.max_train_windows and args.max_train_windows < len(train_windows):
+        subset_rng = np.random.default_rng(seed)
+        selected = subset_rng.choice(
+            len(train_windows), size=args.max_train_windows, replace=False
+        )
+        train_windows.starts = train_windows.starts[selected]
+
+    validation_slice_loaders: dict[str, DataLoader] = {}
+    validation_slice_weights: dict[str, float] = {}
+    for bin_index, label in enumerate(labels):
+        candidate_indices = np.flatnonzero(validation_rate_bins == bin_index)
+        if not len(candidate_indices):
+            continue
+        slice_rng = np.random.default_rng(seed + 1000 + bin_index)
+        if len(candidate_indices) > args.max_validation_windows_per_rate:
+            candidate_indices = slice_rng.choice(
+                candidate_indices,
+                size=args.max_validation_windows_per_rate,
+                replace=False,
+            )
+        slice_windows = copy.copy(validation_windows)
+        slice_windows.starts = validation_windows.starts[candidate_indices]
+        validation_slice_loaders[label] = DataLoader(
+            slice_windows,
+            batch_size=koopman_config["eval_batch_size"],
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+        )
+        validation_slice_weights[label] = float(rate_fractions[bin_index])
+
+    if args.max_validation_windows and args.max_validation_windows < len(validation_windows):
+        validation_rng = np.random.default_rng(seed + 500)
+        selected = validation_rng.choice(
+            len(validation_windows),
+            size=args.max_validation_windows,
+            replace=False,
+        )
+        validation_windows.starts = validation_windows.starts[selected]
+
+    del (
+        paths,
+        path_source_ids,
+        states,
+        actions,
+        episode_ids,
+        step_indices,
+        source_ids,
+        train_mask,
+        validation_mask,
+        test_mask,
+        train_window_rates,
+        validation_window_rates,
+        train_rate_bins,
+        validation_rate_bins,
+    )
     gc.collect()
 
-    if args.max_train_windows:
-        train_windows.starts = train_windows.starts[: args.max_train_windows]
-    if args.max_validation_windows:
-        validation_windows.starts = validation_windows.starts[: args.max_validation_windows]
     train_loader = DataLoader(
         train_windows,
         batch_size=koopman_config["batch_size"],
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=False,
         pin_memory=device.type == "cuda",
     )
@@ -300,7 +546,14 @@ def main() -> None:
         raise FileExistsError(f"{history_path} already exists; use a fresh output or pass --resume")
     (output / "resolved_config.json").write_text(
         json.dumps(
-            {**config, "dataset": {**diagnostics, **split_summary, "root": str(Path(args.data).resolve())}},
+            {
+                **config,
+                "dataset": {
+                    **diagnostics,
+                    **split_summary,
+                    "roots": [str(root) for root in data_roots],
+                },
+            },
             indent=2,
             sort_keys=True,
         ),
@@ -333,7 +586,7 @@ def main() -> None:
             restore_rng_state(payload["rng_state"])
         history_best_epoch, _ = reconcile_history(history_path, start_epoch)
 
-    loss_kwargs = loss_kwargs_from_config(koopman_config)
+    loss_kwargs = loss_kwargs_from_config(koopman_config, normalizer.std)
     max_epochs = args.max_epochs or int(koopman_config["max_epochs"])
     max_hours = args.max_wall_time_hours or float(koopman_config["max_wall_time_hours"])
     wall_limit = max_hours * 3600.0
@@ -344,6 +597,8 @@ def main() -> None:
     normalizers = {"state": normalizer.state_dict(), "action": "absolute_physical_units"}
 
     for epoch in range(start_epoch, max_epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         train_sums: dict[str, float] = {}
         gradient_sums = {
@@ -393,12 +648,55 @@ def main() -> None:
             {key: value / max(gradient_batches, 1) for key, value in gradient_sums.items()}
         )
         validation_metrics = average_loss(model, validation_loader, device, loss_kwargs)
+        validation_by_action_rate = {
+            label: average_loss(model, loader, device, loss_kwargs)
+            for label, loader in validation_slice_loaders.items()
+        }
+        if args.rate_stratified_sampling:
+            available_weight = sum(
+                validation_slice_weights[label]
+                for label in validation_by_action_rate
+            )
+            if available_weight > 0:
+                selection_validation = sum(
+                    validation_slice_weights[label] * metrics["total"]
+                    for label, metrics in validation_by_action_rate.items()
+                ) / available_weight
+                selection_tip_position = sum(
+                    validation_slice_weights[label] * metrics["tip_position"]
+                    for label, metrics in validation_by_action_rate.items()
+                ) / available_weight
+            else:
+                selection_validation = float(
+                    np.mean(
+                        [
+                            metrics["total"]
+                            for metrics in validation_by_action_rate.values()
+                        ]
+                    )
+                )
+                selection_tip_position = float(
+                    np.mean(
+                        [
+                            metrics["tip_position"]
+                            for metrics in validation_by_action_rate.values()
+                        ]
+                    )
+                )
+        else:
+            selection_validation = validation_metrics["total"]
+            selection_tip_position = validation_metrics["tip_position"]
         elapsed = elapsed_before + time.monotonic() - started
         row = {
             "epoch": epoch,
             "elapsed_seconds": elapsed,
             "train": train_metrics,
             "validation": validation_metrics,
+            "validation_by_action_rate": validation_by_action_rate,
+            "selection_validation": selection_validation,
+            "selection_tip_position_rmse_mm": (
+                max(selection_tip_position, 0.0) ** 0.5 * 1000.0
+            ),
         }
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
@@ -409,11 +707,17 @@ def main() -> None:
                     "elapsed_seconds": elapsed,
                     **{f"train/{key}": value for key, value in train_metrics.items()},
                     **{f"validation/{key}": value for key, value in validation_metrics.items()},
+                    **{
+                        f"validation_rate/{label}/{key}": value
+                        for label, metrics in validation_by_action_rate.items()
+                        for key, value in metrics.items()
+                    },
+                    "validation/selection": selection_validation,
                 },
                 step=epoch,
             )
-        if validation_metrics["total"] < best_validation:
-            best_validation = validation_metrics["total"]
+        if selection_validation < best_validation:
+            best_validation = selection_validation
             best_epoch = epoch
             save_checkpoint(
                 output / "best_validation.pt",
@@ -464,6 +768,13 @@ def main() -> None:
         "elapsed_seconds_total": elapsed,
         "best_epoch": best_epoch,
         "best_validation": best_validation,
+        "best_validation_metric": (
+            "rate_weighted_total_including_physical_tip_loss"
+            if args.rate_stratified_sampling
+            else "natural_total_including_physical_tip_loss"
+        ),
+        "tip_position_weight": float(args.tip_position_weight),
+        "tip_position_slice": [30, 33],
         "stop_reason": stop_reason,
         "best_checkpoint_sha256": sha256(output / "best_validation.pt"),
         "last_checkpoint_sha256": sha256(output / "last.pt"),

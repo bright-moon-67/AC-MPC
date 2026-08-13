@@ -15,8 +15,10 @@ import torch
 
 from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
 from antmaze_ac.envs.manisoft_tracking_env import (
+    MANISOFT_WAYPOINT_SUCCESS_STREAK,
+    MANISOFT_WAYPOINT_SUCCESS_THRESHOLD,
     ManiSoftThreeWaypointTrackingEnv,
-    load_manisoft_waypoint_references,
+    load_manisoft_waypoint_reference_bank,
 )
 from antmaze_ac.koopman.checkpoint import sha256
 from antmaze_ac.rl.ppo import collect_rollout, collect_vector_rollout, ppo_update
@@ -82,12 +84,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waypoint-root",
         required=True,
-        help="Directory containing ref_4cm/ref_8cm/ref_12cm and actions/.",
+        help="Directory containing the certified waypoint-bank manifest.json.",
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--episode-steps", type=int, default=300)
     parser.add_argument("--horizon", type=int, default=10)
-    parser.add_argument("--solver-iterations", type=int, default=20)
+    parser.add_argument(
+        "--solver-iterations",
+        type=int,
+        default=None,
+        help="Override the BC checkpoint solver depth; otherwise inherit it.",
+    )
+    parser.add_argument("--quadratic-log-scale", type=float, default=None)
+    parser.add_argument("--linear-scale", type=float, default=None)
+    parser.add_argument("--action-quadratic-scale", type=float, default=None)
     parser.add_argument("--absolute-action-limit", type=float, default=0.30)
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--rollout-steps", type=int, default=None)
@@ -134,22 +144,54 @@ def main() -> None:
         if not path.is_file():
             raise FileNotFoundError(f"Missing {name}: {path}")
 
-    (
-        reference_states,
-        _,
-        reference_paths,
-        action_paths,
-    ) = load_manisoft_waypoint_references(waypoint_root)
-    waypoint_tips = reference_states[:, np.asarray(TIP_INDICES)]
-    reference_hashes = [sha256(path) for path in reference_paths]
-    action_hashes = [sha256(path) for path in action_paths]
+    waypoint_bank = load_manisoft_waypoint_reference_bank(waypoint_root)
+    if waypoint_bank.scenario_sha256 != sha256(scenario):
+        raise ValueError("Waypoint bank was certified with another scenario")
+    waypoint_tips = waypoint_bank.states[:, :, np.asarray(TIP_INDICES)]
+
+    initialization_payload = None
+    initialization_path = args.bc_checkpoint or args.resume
+    if initialization_path is not None:
+        initialization_payload = torch.load(
+            Path(initialization_path).expanduser().resolve(),
+            map_location=device,
+            weights_only=False,
+        )
+    initialization_runtime = (
+        initialization_payload.get("runtime", {})
+        if initialization_payload is not None
+        else {}
+    )
+    solver_iterations = (
+        args.solver_iterations
+        if args.solver_iterations is not None
+        else initialization_runtime.get("solver_iterations")
+    )
+    quadratic_log_scale = (
+        args.quadratic_log_scale
+        if args.quadratic_log_scale is not None
+        else initialization_runtime.get("quadratic_log_scale")
+    )
+    linear_scale = (
+        args.linear_scale
+        if args.linear_scale is not None
+        else initialization_runtime.get("linear_scale")
+    )
+    action_quadratic_scale = (
+        args.action_quadratic_scale
+        if args.action_quadratic_scale is not None
+        else initialization_runtime.get("action_quadratic_scale")
+    )
 
     policy, koopman_payload = make_history_mpc_policy(
         koopman_path,
         device,
         horizon=args.horizon,
         absolute_action_limit=args.absolute_action_limit,
-        solver_iterations=args.solver_iterations,
+        solver_iterations=solver_iterations,
+        quadratic_log_scale=quadratic_log_scale,
+        linear_scale=linear_scale,
+        action_quadratic_scale=action_quadratic_scale,
         waypoint_count=3,
     )
     config = koopman_payload["config"]
@@ -176,12 +218,15 @@ def main() -> None:
     bc_initialization = None
     if args.bc_checkpoint is not None:
         bc_path = Path(args.bc_checkpoint).expanduser().resolve()
-        bc_payload = torch.load(bc_path, map_location=device, weights_only=False)
+        bc_payload = initialization_payload
+        if bc_payload is None:
+            raise RuntimeError("BC initialization payload was not loaded")
         if bc_payload.get("method") != "bc_kmpc_bc":
             raise ValueError("--bc-checkpoint is not a BC-KMPC BC checkpoint")
-        if int(bc_payload.get("format_version", 0)) < 4:
+        if int(bc_payload.get("format_version", 0)) < 5:
             raise ValueError(
-                "BC checkpoint predates absolute-action box FISTA and must be retrained"
+                "BC checkpoint predates randomized waypoint-bank BC-KMPC and "
+                "must be retrained"
             )
         if bc_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
             raise ValueError("BC checkpoint references another Koopman model")
@@ -192,6 +237,9 @@ def main() -> None:
             ("waypoint_count", 3),
             ("solver", "absolute_box_fista_v1"),
             ("fixed_smoothness", False),
+            ("quadratic_log_scale", policy.actor.quadratic_log_scale),
+            ("linear_scale", policy.actor.linear_scale),
+            ("action_quadratic_scale", policy.actor.action_quadratic_scale),
         ):
             actual = bc_payload["runtime"].get(key)
             if actual != expected:
@@ -200,8 +248,8 @@ def main() -> None:
                 )
         policy.actor.load_state_dict(bc_payload["actor"])
         if (
-            bc_payload.get("reference_sha256") != reference_hashes
-            or bc_payload.get("action_sha256") != action_hashes
+            bc_payload.get("waypoint_bank_sha256")
+            != waypoint_bank.manifest_sha256
         ):
             raise ValueError("BC checkpoint references another waypoint set")
         bc_initialization = {
@@ -240,6 +288,8 @@ def main() -> None:
         "horizon": policy.actor.horizon,
         "solver_iterations": policy.actor.solver_iterations,
         "absolute_action_limit": args.absolute_action_limit,
+        "success_threshold": MANISOFT_WAYPOINT_SUCCESS_THRESHOLD,
+        "required_success_streak": MANISOFT_WAYPOINT_SUCCESS_STREAK,
         "observation_dim": policy.observation_dim,
         "history_steps": policy.history_steps,
         "waypoint_count": policy.waypoint_count,
@@ -253,17 +303,20 @@ def main() -> None:
         "target_kl": args.target_kl,
         "solver": "absolute_box_fista_v1",
         "fixed_smoothness": False,
+        "quadratic_log_scale": policy.actor.quadratic_log_scale,
+        "linear_scale": policy.actor.linear_scale,
+        "action_quadratic_scale": policy.actor.action_quadratic_scale,
     }
     metadata = {
         "method": "actor_critic_bc_kmpc",
-        "format_version": 4,
+        "format_version": 5,
         "koopman_checkpoint": str(koopman_path),
         "koopman_checkpoint_sha256": expected_koopman_sha,
         "waypoint_root": str(waypoint_root),
-        "references": [str(path) for path in reference_paths],
-        "reference_sha256": reference_hashes,
-        "actions": [str(path) for path in action_paths],
-        "action_sha256": action_hashes,
+        "waypoint_bank_manifest": str(waypoint_bank.manifest_path),
+        "waypoint_bank_sha256": waypoint_bank.manifest_sha256,
+        "waypoint_triplet_count": waypoint_bank.triplet_count,
+        "references": [str(path) for path in waypoint_bank.reference_paths],
         "scenario": str(scenario),
         "seed": args.seed,
         "runtime": runtime,
@@ -283,15 +336,16 @@ def main() -> None:
         )
         if resume_payload.get("method") != "actor_critic_bc_kmpc":
             raise ValueError("Resume checkpoint is not actor-critic BC-KMPC")
-        if int(resume_payload.get("format_version", 0)) < 4:
+        if int(resume_payload.get("format_version", 0)) < 5:
             raise ValueError(
-                "Resume checkpoint predates absolute-action box FISTA and is incompatible"
+                "Resume checkpoint predates randomized waypoint-bank BC-KMPC "
+                "and is incompatible"
             )
         if resume_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
             raise ValueError("Resume checkpoint references another Koopman model")
         if (
-            resume_payload.get("reference_sha256") != reference_hashes
-            or resume_payload.get("action_sha256") != action_hashes
+            resume_payload.get("waypoint_bank_sha256")
+            != waypoint_bank.manifest_sha256
         ):
             raise ValueError("Resume checkpoint references another waypoint set")
         if resume_payload["runtime"] != runtime:

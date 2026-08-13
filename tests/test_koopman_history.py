@@ -57,6 +57,41 @@ def test_history_model_loss_and_gradients() -> None:
     assert all(parameter.grad is not None for parameter in model.encoder.parameters())
 
 
+def test_physical_tip_loss_uses_state_scale_and_enters_total() -> None:
+    torch.manual_seed(4)
+    model = HistoryDeepKoopman(
+        state_dim=5,
+        action_dim=2,
+        lift_dim=4,
+        hidden_dims=(8,),
+        activation="silu",
+        history_steps=2,
+    )
+    contexts = torch.randn(3, 4, model.context_dim)
+    states = torch.randn(3, 4, model.state_dim)
+    actions = torch.randn(3, 3, model.action_dim)
+    state_std = torch.tensor([0.01, 0.02, 0.03, 2.0, 3.0])
+
+    baseline = history_koopman_loss(model, contexts, states, actions)
+    weighted = history_koopman_loss(
+        model,
+        contexts,
+        states,
+        actions,
+        tip_position_weight=10000.0,
+        tip_position_slice=(0, 3),
+        state_std=state_std,
+    )
+
+    torch.testing.assert_close(
+        weighted.total - baseline.total,
+        10000.0 * weighted.tip_position,
+    )
+    assert float(weighted.tip_position) > 0
+    assert float(weighted.tip_position_h1) > 0
+    assert weighted.scalars()["tip_position_rmse_mm"] > 0
+
+
 def test_current_action_is_not_part_of_current_context() -> None:
     states = np.arange(10, dtype=np.float32).reshape(-1, 1)
     actions = np.arange(10, dtype=np.float32).reshape(-1, 1)

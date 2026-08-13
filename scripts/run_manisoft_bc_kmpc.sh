@@ -17,6 +17,9 @@ ppo_output="$6"
 device="${7:-cuda}"
 horizon="${BC_KMPC_HORIZON:-10}"
 solver_iterations="${BC_KMPC_SOLVER_ITERATIONS:-20}"
+quadratic_log_scale="${BC_KMPC_QUADRATIC_LOG_SCALE:-1.5}"
+linear_scale="${BC_KMPC_LINEAR_SCALE:-10.0}"
+action_quadratic_scale="${BC_KMPC_ACTION_QUADRATIC_SCALE:-1.0}"
 
 for path in "${koopman_checkpoint}" "${scenario}"; do
     if [[ ! -f "${path}" ]]; then
@@ -72,6 +75,9 @@ if [[ "${bc_complete}" != true ]]; then
         --batch-size "${BC_KMPC_BC_BATCH_SIZE:-256}" \
         --horizon "${horizon}" \
         --solver-iterations "${solver_iterations}" \
+        --quadratic-log-scale "${quadratic_log_scale}" \
+        --linear-scale "${linear_scale}" \
+        --action-quadratic-scale "${action_quadratic_scale}" \
         --sequence-weight "${BC_KMPC_SEQUENCE_WEIGHT:-0.25}" \
         --device "${device}" \
         "${resume_bc[@]}"
@@ -93,6 +99,9 @@ fi
     --episode-steps "${BC_KMPC_EPISODE_STEPS:-300}" \
     --horizon "${horizon}" \
     --solver-iterations "${solver_iterations}" \
+    --quadratic-log-scale "${quadratic_log_scale}" \
+    --linear-scale "${linear_scale}" \
+    --action-quadratic-scale "${action_quadratic_scale}" \
     --num-envs "${BC_KMPC_NUM_ENVS:-1}" \
     --actor-learning-rate "${BC_KMPC_ACTOR_LEARNING_RATE:-0.0001}" \
     --target-kl "${BC_KMPC_TARGET_KL:-0.02}" \

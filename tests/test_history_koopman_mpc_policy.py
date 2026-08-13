@@ -174,9 +174,19 @@ def test_history_mpc_policy_three_waypoint_context():
     observations = torch.zeros(2, policy.observation_dim)
     observations[:, -12:-3] = torch.arange(9, dtype=torch.float32)
     observations[:, -3:] = torch.tensor([0.0, 1.0, 0.0])
-    split, _, actor_context = policy.features(observations)
+    split, _, actor_context, physical_reference, action_reference = policy.features(
+        observations
+    )
     assert split.task_context.shape == (2, 12)
     assert actor_context.shape == (2, 12)
     torch.testing.assert_close(actor_context[:, -3:], observations[:, -3:])
+    # Stage one selects the second waypoint.  Non-tip coordinates retain the
+    # current normalized state (zero in this fixture).
+    torch.testing.assert_close(
+        physical_reference[:, :3],
+        torch.tensor([[3.0, 4.0, 5.0], [3.0, 4.0, 5.0]]),
+    )
+    torch.testing.assert_close(physical_reference[:, 3:], torch.zeros(2, 2))
+    torch.testing.assert_close(action_reference, torch.zeros(2, 2))
     output = policy(observations)
     assert output.mean.shape == (2, 2)
