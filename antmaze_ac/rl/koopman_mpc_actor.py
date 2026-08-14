@@ -91,6 +91,7 @@ class KoopmanMPCActor(nn.Module):
         linear_scale: float = 10.0,
         action_quadratic_scale: float = 1.0,
         max_delta: float | None = None,
+        normalized_delta_curvature: float = 0.0,
         solver_iterations: int = 20,
         step_fraction: float = 0.95,
         solver_epsilon: float = 1e-6,
@@ -121,6 +122,12 @@ class KoopmanMPCActor(nn.Module):
             raise ValueError("solver_epsilon must be positive")
         if max_delta is not None and max_delta <= 0:
             raise ValueError("max_delta must be positive when configured")
+        if normalized_delta_curvature < 0:
+            raise ValueError("normalized_delta_curvature must be non-negative")
+        if normalized_delta_curvature > 0 and max_delta is None:
+            raise ValueError(
+                "normalized_delta_curvature requires max_delta"
+            )
 
         self.lifted_dim = lifted_dim
         self.physical_dim = physical_dim
@@ -132,6 +139,7 @@ class KoopmanMPCActor(nn.Module):
         self.linear_scale = float(linear_scale)
         self.action_quadratic_scale = float(action_quadratic_scale)
         self.max_delta = None if max_delta is None else float(max_delta)
+        self.normalized_delta_curvature = float(normalized_delta_curvature)
         self.solver_iterations = int(solver_iterations)
         self.step_fraction = float(step_fraction)
         self.solver_epsilon = float(solver_epsilon)
@@ -393,6 +401,15 @@ class KoopmanMPCActor(nn.Module):
         transformed_linear = (
             absolute_gradient_at_offset.unsqueeze(-2) @ transform
         ).squeeze(-2)
+        if self.normalized_delta_curvature:
+            identity = torch.eye(
+                transformed_hessian.shape[-1],
+                dtype=transformed_hessian.dtype,
+                device=transformed_hessian.device,
+            )
+            transformed_hessian = transformed_hessian + (
+                self.normalized_delta_curvature * identity
+            )
         return transformed_hessian, transformed_linear
 
     def normalized_delta_bounds(

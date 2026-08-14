@@ -303,6 +303,7 @@ def make_manisoft_ppo_policy(
     action_quadratic_scale: float = 1.0,
     tip_weight: float = 1.0,
     max_delta: float | None = 0.001,
+    normalized_delta_curvature: float = 0.0,
 ) -> tuple[StandardHistoryPPOPolicy | HistoryKoopmanMPCPolicy, dict]:
     """Build one of the two from-scratch PPO comparison policies."""
 
@@ -392,6 +393,7 @@ def make_manisoft_ppo_policy(
         linear_scale=linear_scale,
         action_quadratic_scale=action_quadratic_scale,
         max_delta=max_delta,
+        normalized_delta_curvature=normalized_delta_curvature,
         solver_iterations=solver_iterations,
     )
     critic = Critic(
@@ -447,6 +449,9 @@ def load_manisoft_ppo_checkpoint(
             if payload["actor_name"] != "ppo_kmpc"
             or runtime.get("max_delta") is None
             else float(runtime["max_delta"])
+        ),
+        normalized_delta_curvature=float(
+            runtime.get("normalized_delta_curvature", 0.0)
         ),
     )
     policy.load_state_dict(payload["policy"])

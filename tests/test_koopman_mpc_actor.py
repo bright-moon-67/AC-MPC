@@ -259,3 +259,41 @@ def test_normalized_delta_qp_matches_absolute_cost_and_rate_limits():
         dim=-2,
     )
     assert bool((physical_delta.abs() <= 0.001 + 1e-12).all())
+
+
+def test_normalized_delta_curvature_shifts_only_decision_hessian():
+    dtype = torch.float64
+    common = dict(
+        A=torch.tensor([[0.9]], dtype=dtype),
+        B=torch.tensor([[0.2]], dtype=dtype),
+        C=torch.eye(1, dtype=dtype),
+        horizon=3,
+        hidden_dims=(),
+        max_delta=0.015,
+    )
+    base = KoopmanMPCActor(**common)
+    regularized = KoopmanMPCActor(
+        **common,
+        normalized_delta_curvature=1e-4,
+    )
+    absolute_hessian = torch.tensor(
+        [[[1.0, 0.1, 0.0], [0.1, 1.2, 0.2], [0.0, 0.2, 0.8]]],
+        dtype=dtype,
+    )
+    absolute_linear = torch.tensor([[0.2, -0.1, 0.3]], dtype=dtype)
+    previous = torch.tensor([[0.05]], dtype=dtype)
+    base_hessian, base_linear = base.normalized_delta_quadratic(
+        absolute_hessian,
+        absolute_linear,
+        previous,
+    )
+    shifted_hessian, shifted_linear = regularized.normalized_delta_quadratic(
+        absolute_hessian,
+        absolute_linear,
+        previous,
+    )
+    torch.testing.assert_close(shifted_linear, base_linear)
+    torch.testing.assert_close(
+        shifted_hessian,
+        base_hessian + 1e-4 * torch.eye(3, dtype=dtype),
+    )

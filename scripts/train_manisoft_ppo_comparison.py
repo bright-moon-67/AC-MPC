@@ -40,7 +40,7 @@ TIP_INDICES = (30, 31, 32)
 METHOD = "manisoft_ppo_from_scratch"
 FORMAT_VERSION = 1
 TRAINING_SPEC_VERSION = (
-    "manisoft_three_waypoint_reward_5mm_normalized_delta_kmpc_v3"
+    "manisoft_three_waypoint_reward_5mm_normalized_delta_kmpc_v4"
 )
 
 
@@ -125,14 +125,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--linear-scale", type=float, default=10.0)
     parser.add_argument("--action-quadratic-scale", type=float, default=1.0)
     parser.add_argument("--tip-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--normalized-delta-curvature",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed rho*I curvature added directly to the normalized-delta "
+            "QP Hessian; zero preserves the original objective."
+        ),
+    )
 
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
-    parser.add_argument("--num-envs", type=int, default=1)
-    parser.add_argument("--minibatch-size", type=int, default=256)
-    parser.add_argument("--update-epochs", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--num-envs", type=int, default=8)
+    parser.add_argument("--minibatch-size", type=int, default=512)
+    parser.add_argument("--update-epochs", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument("--actor-learning-rate", type=float, default=None)
+    parser.add_argument("--std-learning-rate", type=float, default=1e-6)
+    parser.add_argument(
+        "--freeze-log-std",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze exploration std while validating actor-mean learning.",
+    )
     parser.add_argument(
         "--anneal-learning-rate",
         action=argparse.BooleanOptionalAction,
@@ -148,11 +164,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--value-coefficient", type=float, default=0.5)
     parser.add_argument("--entropy-coefficient", type=float, default=1e-4)
-    parser.add_argument("--initial-action-std", type=float, default=0.015)
+    parser.add_argument("--initial-action-std", type=float, default=0.10)
     parser.add_argument("--minimum-action-std", type=float, default=0.001)
     parser.add_argument("--maximum-action-std", type=float, default=0.20)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--target-kl", type=float, default=0.02)
+    parser.add_argument("--kl-soft-stop-multiplier", type=float, default=1.5)
+    parser.add_argument("--kl-hard-rollback-multiplier", type=float, default=3.0)
+    parser.add_argument(
+        "--normalize-advantages-globally",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--checkpoint-interval-updates", type=int, default=10)
     parser.add_argument("--max-wall-time-hours", type=float, default=None)
     parser.add_argument("--resume", default=None)
@@ -192,6 +215,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.action_quadratic_scale,
         args.tip_weight,
         args.learning_rate,
+        args.std_learning_rate,
         args.gamma,
         args.gae_lambda,
         args.clip_range,
@@ -201,6 +225,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.maximum_action_std,
         args.max_grad_norm,
         args.target_kl,
+        args.kl_soft_stop_multiplier,
+        args.kl_hard_rollback_multiplier,
     )
     if min(positive) <= 0:
         raise ValueError("PPO scales, rates, and standard deviations must be positive")
@@ -212,8 +238,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Action standard-deviation bounds are inconsistent")
     if args.entropy_coefficient < 0:
         raise ValueError("--entropy-coefficient must be non-negative")
+    if args.normalized_delta_curvature < 0:
+        raise ValueError("--normalized-delta-curvature must be non-negative")
+    if args.actor != "ppo_kmpc" and args.normalized_delta_curvature:
+        raise ValueError(
+            "--normalized-delta-curvature is only valid for PPO-KMPC"
+        )
     if args.actor_learning_rate is not None and args.actor_learning_rate <= 0:
         raise ValueError("--actor-learning-rate must be positive")
+    if args.kl_hard_rollback_multiplier < args.kl_soft_stop_multiplier:
+        raise ValueError(
+            "--kl-hard-rollback-multiplier must be >= "
+            "--kl-soft-stop-multiplier"
+        )
     if args.max_wall_time_hours is not None and args.max_wall_time_hours <= 0:
         raise ValueError("--max-wall-time-hours must be positive")
     if args.actor == "ppo_kmpc" and args.max_delta <= 0:
@@ -260,7 +297,7 @@ def main() -> None:
     actor_learning_rate = float(
         args.actor_learning_rate
         if args.actor_learning_rate is not None
-        else (3e-4 if args.actor == "ppo_mlp" else 3e-6)
+        else (3e-4 if args.actor == "ppo_mlp" else 3e-8)
     )
     policy, koopman_payload = make_manisoft_ppo_policy(
         args.actor,
@@ -278,15 +315,29 @@ def main() -> None:
         action_quadratic_scale=args.action_quadratic_scale,
         tip_weight=args.tip_weight,
         max_delta=(args.max_delta if args.actor == "ppo_kmpc" else None),
+        normalized_delta_curvature=args.normalized_delta_curvature,
     )
     actor_parameters = [p for p in policy.actor.parameters() if p.requires_grad]
-    auxiliary_parameters = [*policy.critic.parameters(), policy.log_std]
-    optimizer = torch.optim.Adam(
-        [
-            {"params": actor_parameters, "lr": actor_learning_rate},
-            {"params": auxiliary_parameters, "lr": args.learning_rate},
-        ],
+    critic_parameters = [p for p in policy.critic.parameters() if p.requires_grad]
+    policy.log_std.requires_grad_(not args.freeze_log_std)
+    actor_optimizer = torch.optim.Adam(
+        actor_parameters,
+        lr=actor_learning_rate,
         eps=1e-5,
+    )
+    critic_optimizer = torch.optim.Adam(
+        critic_parameters,
+        lr=args.learning_rate,
+        eps=1e-5,
+    )
+    std_optimizer = (
+        None
+        if args.freeze_log_std
+        else torch.optim.Adam(
+            [policy.log_std],
+            lr=args.std_learning_rate,
+            eps=1e-5,
+        )
     )
 
     runtime = {
@@ -310,6 +361,7 @@ def main() -> None:
         "linear_scale": args.linear_scale,
         "action_quadratic_scale": args.action_quadratic_scale,
         "tip_weight": args.tip_weight,
+        "normalized_delta_curvature": args.normalized_delta_curvature,
         "solver": (
             None
             if args.actor == "ppo_mlp"
@@ -330,6 +382,8 @@ def main() -> None:
             else "normalized_delta"
         ),
         "action_distribution": policy.ACTION_DISTRIBUTION,
+        "freeze_log_std": args.freeze_log_std,
+        "std_learning_rate": args.std_learning_rate,
         "cost_initialization": (
             None
             if args.actor == "ppo_mlp"
@@ -347,6 +401,8 @@ def main() -> None:
         "update_epochs": args.update_epochs,
         "learning_rate": args.learning_rate,
         "actor_learning_rate": actor_learning_rate,
+        "std_learning_rate": args.std_learning_rate,
+        "freeze_log_std": args.freeze_log_std,
         "anneal_learning_rate": args.anneal_learning_rate,
         "gamma": args.gamma,
         "gae_lambda": args.gae_lambda,
@@ -356,6 +412,9 @@ def main() -> None:
         "entropy_coefficient": args.entropy_coefficient,
         "max_grad_norm": args.max_grad_norm,
         "target_kl": args.target_kl,
+        "kl_soft_stop_multiplier": args.kl_soft_stop_multiplier,
+        "kl_hard_rollback_multiplier": args.kl_hard_rollback_multiplier,
+        "normalize_advantages_globally": args.normalize_advantages_globally,
     }
     metadata = {
         "method": METHOD,
@@ -424,7 +483,10 @@ def main() -> None:
         if int(payload.get("seed", -1)) != args.seed:
             raise ValueError("Resume seed does not match --seed")
         policy.load_state_dict(payload["policy"])
-        optimizer.load_state_dict(payload["optimizer"])
+        actor_optimizer.load_state_dict(payload["actor_optimizer"])
+        critic_optimizer.load_state_dict(payload["critic_optimizer"])
+        if std_optimizer is not None:
+            std_optimizer.load_state_dict(payload["std_optimizer"])
         timesteps = int(payload["timesteps"])
         update = int(payload["update"])
         elapsed_before = float(payload.get("elapsed_seconds", 0.0))
@@ -442,6 +504,9 @@ def main() -> None:
             "trainable_actor_parameters": sum(p.numel() for p in actor_parameters),
             "trainable_critic_parameters": sum(
                 p.numel() for p in policy.critic.parameters()
+            ),
+            "trainable_log_std_parameters": (
+                policy.log_std.numel() if policy.log_std.requires_grad else 0
             ),
         },
     )
@@ -472,7 +537,11 @@ def main() -> None:
         return {
             **metadata,
             "policy": policy.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "actor_optimizer": actor_optimizer.state_dict(),
+            "critic_optimizer": critic_optimizer.state_dict(),
+            "std_optimizer": (
+                None if std_optimizer is None else std_optimizer.state_dict()
+            ),
             "timesteps": timesteps,
             "update": update,
             "elapsed_seconds": elapsed_seconds,
@@ -494,8 +563,16 @@ def main() -> None:
                 raise ValueError("Final rollout is not divisible by --num-envs")
             if args.anneal_learning_rate:
                 fraction = max(0.0, 1.0 - update / max(total_updates, 1))
-                optimizer.param_groups[0]["lr"] = fraction * actor_learning_rate
-                optimizer.param_groups[1]["lr"] = fraction * args.learning_rate
+                actor_optimizer.param_groups[0]["lr"] = (
+                    fraction * actor_learning_rate
+                )
+                critic_optimizer.param_groups[0]["lr"] = (
+                    fraction * args.learning_rate
+                )
+                if std_optimizer is not None:
+                    std_optimizer.param_groups[0]["lr"] = (
+                        fraction * args.std_learning_rate
+                    )
 
             synchronize = (
                 (lambda: torch.cuda.synchronize(device))
@@ -529,7 +606,7 @@ def main() -> None:
             update_started = time.perf_counter()
             metrics = ppo_update(
                 policy,
-                optimizer,
+                actor_optimizer,
                 rollout,
                 update_epochs=args.update_epochs,
                 minibatch_size=args.minibatch_size,
@@ -541,6 +618,15 @@ def main() -> None:
                 clip_value_loss=args.clip_value_loss,
                 minimum_log_std=minimum_log_std,
                 maximum_log_std=maximum_log_std,
+                critic_optimizer=critic_optimizer,
+                std_optimizer=std_optimizer,
+                kl_soft_stop_multiplier=args.kl_soft_stop_multiplier,
+                kl_hard_rollback_multiplier=(
+                    args.kl_hard_rollback_multiplier
+                ),
+                normalize_advantages_globally=(
+                    args.normalize_advantages_globally
+                ),
             )
             synchronize()
             update_seconds = time.perf_counter() - update_started
@@ -575,8 +661,13 @@ def main() -> None:
                 "update": update,
                 "timesteps": timesteps,
                 "elapsed_seconds": elapsed,
-                "actor_learning_rate": optimizer.param_groups[0]["lr"],
-                "learning_rate": optimizer.param_groups[1]["lr"],
+                "actor_learning_rate": actor_optimizer.param_groups[0]["lr"],
+                "learning_rate": critic_optimizer.param_groups[0]["lr"],
+                "std_learning_rate": (
+                    None
+                    if std_optimizer is None
+                    else std_optimizer.param_groups[0]["lr"]
+                ),
                 "rollout_seconds": rollout_seconds,
                 "ppo_update_seconds": update_seconds,
                 "transitions_per_second": current_steps

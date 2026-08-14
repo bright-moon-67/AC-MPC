@@ -185,6 +185,85 @@ def test_from_scratch_ppo_update_and_std_bounds(tmp_path):
     env.close()
 
 
+def _separated_optimizer_update(tmp_path, *, hard_multiplier):
+    policy = _make("ppo_mlp", _checkpoint(tmp_path))
+    policy.log_std.requires_grad_(False)
+    env = HistoryContextTrackingWrapper(
+        _ThreeWaypointEnv(),
+        history_steps=2,
+        state_mean=np.zeros(45, dtype=np.float32),
+        state_std=np.ones(45, dtype=np.float32),
+    )
+    observation, _ = env.reset(seed=17)
+    env._ppo_observation = observation
+    rollout = collect_rollout(
+        env,
+        policy,
+        steps=8,
+        gamma=0.99,
+        gae_lambda=0.95,
+        device=torch.device("cpu"),
+    )
+    actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=1e-3)
+    critic_optimizer = torch.optim.Adam(policy.critic.parameters(), lr=1e-3)
+    actor_before = [p.detach().clone() for p in policy.actor.parameters()]
+    critic_before = [p.detach().clone() for p in policy.critic.parameters()]
+    metrics = ppo_update(
+        policy,
+        actor_optimizer,
+        rollout,
+        update_epochs=2,
+        minibatch_size=4,
+        clip_range=0.2,
+        value_coefficient=0.5,
+        entropy_coefficient=0.0,
+        max_grad_norm=0.5,
+        target_kl=1e-12,
+        critic_optimizer=critic_optimizer,
+        kl_soft_stop_multiplier=1.5,
+        kl_hard_rollback_multiplier=hard_multiplier,
+    )
+    env.close()
+    return policy, actor_before, critic_before, metrics
+
+
+def test_soft_kl_stop_keeps_actor_step_and_finishes_critic_updates(tmp_path):
+    policy, actor_before, critic_before, metrics = _separated_optimizer_update(
+        tmp_path,
+        hard_multiplier=1e20,
+    )
+    assert metrics["ppo_kl_soft_stopped"] == 1.0
+    assert metrics["ppo_kl_hard_rollbacks"] == 0.0
+    assert metrics["ppo_actor_optimizer_steps"] == 1.0
+    assert metrics["ppo_critic_optimizer_steps"] == 4.0
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(actor_before, policy.actor.parameters())
+    )
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(critic_before, policy.critic.parameters())
+    )
+
+
+def test_hard_kl_rollback_restores_only_actor_and_trains_critic(tmp_path):
+    policy, actor_before, critic_before, metrics = _separated_optimizer_update(
+        tmp_path,
+        hard_multiplier=3.0,
+    )
+    assert metrics["ppo_kl_hard_rollbacks"] == 1.0
+    assert metrics["ppo_actor_optimizer_steps"] == 0.0
+    assert metrics["ppo_critic_optimizer_steps"] == 4.0
+    assert all(
+        torch.equal(before, after)
+        for before, after in zip(actor_before, policy.actor.parameters())
+    )
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(critic_before, policy.critic.parameters())
+    )
+
+
 def test_kmpc_rollout_uses_same_bounded_normalized_delta_for_ppo_and_env(
     tmp_path,
 ):

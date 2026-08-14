@@ -351,7 +351,23 @@ def ppo_update(
     clip_value_loss: bool = False,
     minimum_log_std: float | None = None,
     maximum_log_std: float | None = None,
+    critic_optimizer: torch.optim.Optimizer | None = None,
+    std_optimizer: torch.optim.Optimizer | None = None,
+    kl_soft_stop_multiplier: float = 1.5,
+    kl_hard_rollback_multiplier: float = 3.0,
+    normalize_advantages_globally: bool = True,
 ) -> dict[str, float]:
+    if kl_soft_stop_multiplier <= 0:
+        raise ValueError("kl_soft_stop_multiplier must be positive")
+    if kl_hard_rollback_multiplier < kl_soft_stop_multiplier:
+        raise ValueError(
+            "kl_hard_rollback_multiplier must be >= "
+            "kl_soft_stop_multiplier"
+        )
+    if std_optimizer is not None and critic_optimizer is None:
+        raise ValueError(
+            "std_optimizer requires the separated critic_optimizer path"
+        )
     if (
         minimum_log_std is not None
         and maximum_log_std is not None
@@ -387,14 +403,36 @@ def ppo_update(
     }
     count = len(rollout.observations)
     old_values = rollout.returns - rollout.advantages
+    normalized_advantages = rollout.advantages
+    if normalize_advantages_globally and count > 1:
+        normalized_advantages = (
+            normalized_advantages - normalized_advantages.mean()
+        ) / (normalized_advantages.std() + 1e-8)
     optimizer_steps = 0
+    critic_optimizer_steps = 0
+    std_optimizer_steps = 0
+    actor_grad_norms: list[torch.Tensor] = []
+    critic_grad_norms: list[torch.Tensor] = []
+    std_grad_norms: list[torch.Tensor] = []
     early_stopped = False
+    soft_stopped = False
+    hard_rollbacks = 0
     early_stop_kl = torch.zeros((), device=rollout.observations.device)
+    separated_optimizers = critic_optimizer is not None
+    actor_updates_enabled = True
 
-    def snapshot_optimizer_step():
+    def optimizer_parameters(current_optimizer):
+        return [
+            parameter
+            for group in current_optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.requires_grad
+        ]
+
+    def snapshot_optimizer_step(current_optimizer):
         parameters = [
             parameter
-            for group in optimizer.param_groups
+            for group in current_optimizer.param_groups
             for parameter in group["params"]
             if parameter.requires_grad
         ]
@@ -407,18 +445,45 @@ def ppo_update(
                     if torch.is_tensor(value)
                     else copy.deepcopy(value)
                 )
-                for key, value in optimizer.state.get(parameter, {}).items()
+                for key, value in current_optimizer.state.get(parameter, {}).items()
             }
         return parameters, parameter_values, optimizer_values
 
     @torch.no_grad()
-    def restore_optimizer_step(snapshot) -> None:
+    def restore_optimizer_step(current_optimizer, snapshot) -> None:
         parameters, parameter_values, optimizer_values = snapshot
         for parameter, value in zip(parameters, parameter_values):
             parameter.copy_(value)
-            state = optimizer.state[parameter]
+            state = current_optimizer.state[parameter]
             state.clear()
             state.update(optimizer_values[parameter])
+
+    def clip_optimizer_gradients(current_optimizer) -> torch.Tensor:
+        parameters = optimizer_parameters(current_optimizer)
+        if not parameters:
+            return torch.zeros((), device=rollout.observations.device)
+        return torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+
+    soft_kl_limit = (
+        None
+        if target_kl is None
+        else float(target_kl) * float(kl_soft_stop_multiplier)
+    )
+    hard_kl_limit = (
+        None
+        if target_kl is None
+        else float(target_kl) * float(kl_hard_rollback_multiplier)
+    )
+    actor_update_snapshot = (
+        snapshot_optimizer_step(optimizer)
+        if separated_optimizers and hard_kl_limit is not None
+        else None
+    )
+    std_update_snapshot = (
+        snapshot_optimizer_step(std_optimizer)
+        if std_optimizer is not None and hard_kl_limit is not None
+        else None
+    )
     for _ in range(update_epochs):
         permutation = torch.randperm(count, device=rollout.observations.device)
         for start in range(0, count, minibatch_size):
@@ -428,8 +493,8 @@ def ppo_update(
             )
             solver_retry = getattr(policy_output, "solver_retry_used", None)
             solver_fallback = getattr(policy_output, "solver_fallback_used", None)
-            advantages = rollout.advantages[indices]
-            if len(advantages) > 1:
+            advantages = normalized_advantages[indices]
+            if not normalize_advantages_globally and len(advantages) > 1:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             ratio = torch.exp(log_prob - rollout.old_log_probs[indices])
             objective = ratio * advantages
@@ -454,62 +519,199 @@ def ppo_update(
                 log_ratio = log_prob - rollout.old_log_probs[indices]
                 approx_kl = ((torch.exp(log_ratio) - 1.0) - log_ratio).mean()
                 clip_fraction = (torch.abs(ratio - 1.0) > clip_range).float().mean()
-            if target_kl is not None and float(approx_kl) > target_kl:
-                early_stopped = True
-                early_stop_kl = approx_kl.detach()
-                break
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-            if not torch.isfinite(grad_norm):
-                raise FloatingPointError("PPO gradient is NaN or Inf")
-            step_snapshot = (
-                snapshot_optimizer_step() if target_kl is not None else None
-            )
-            optimizer.step()
-            log_std = getattr(policy, "log_std", None)
-            if log_std is not None and (
-                minimum_log_std is not None or maximum_log_std is not None
+            if (
+                separated_optimizers
+                and optimizer_steps > 0
+                and hard_kl_limit is not None
+                and float(approx_kl) > hard_kl_limit
             ):
-                with torch.no_grad():
-                    log_std.clamp_(
-                        min=(
-                            -float("inf")
-                            if minimum_log_std is None
-                            else minimum_log_std
-                        ),
-                        max=(
-                            float("inf")
-                            if maximum_log_std is None
-                            else maximum_log_std
-                        ),
-                    )
-            # A pre-step KL guard cannot detect the jump caused by the current
-            # Adam step.  Re-evaluate the same minibatch transactionally and
-            # roll back both parameters and Adam moments when that jump exceeds
-            # the trust-region budget.  This is essential for sensitive
-            # differentiable MPC actors with small exploration variance.
-            with torch.no_grad():
-                following_log_prob = policy.evaluate_actions(
-                    rollout.observations[indices],
-                    rollout.actions[indices],
-                )[0]
-                following_log_ratio = (
-                    following_log_prob - rollout.old_log_probs[indices]
-                )
-                following_ratio = torch.exp(following_log_ratio)
-                following_kl = (
-                    (following_ratio - 1.0) - following_log_ratio
-                ).mean()
-                following_clip_fraction = (
-                    torch.abs(following_ratio - 1.0) > clip_range
-                ).float().mean()
-            if target_kl is not None and float(following_kl) > target_kl:
-                restore_optimizer_step(step_snapshot)
+                # A step can look safe on its own minibatch yet generalize to a
+                # catastrophic KL on the next one. In that case restore only
+                # this update's policy parameters/moments; critic learning is
+                # deliberately retained.
+                restore_optimizer_step(optimizer, actor_update_snapshot)
+                if std_optimizer is not None:
+                    restore_optimizer_step(std_optimizer, std_update_snapshot)
+                optimizer_steps = 0
+                std_optimizer_steps = 0
+                hard_rollbacks += 1
                 early_stopped = True
-                early_stop_kl = following_kl.detach()
+                actor_updates_enabled = False
+                early_stop_kl = approx_kl.detach()
+            elif (
+                actor_updates_enabled
+                and soft_kl_limit is not None
+                and float(approx_kl) > soft_kl_limit
+            ):
+                early_stopped = True
+                soft_stopped = True
+                early_stop_kl = approx_kl.detach()
+                actor_updates_enabled = False
+
+            actor_grad_norm = torch.zeros((), device=values.device)
+            critic_grad_norm = torch.zeros((), device=values.device)
+            std_grad_norm = torch.zeros((), device=values.device)
+            following_kl = approx_kl
+            following_clip_fraction = clip_fraction
+
+            if separated_optimizers:
+                # Actor and log-std are the only policy-distribution parameters.
+                # A KL event must not discard critic parameters or Adam moments.
+                if actor_updates_enabled:
+                    optimizer.zero_grad(set_to_none=True)
+                    if std_optimizer is not None:
+                        std_optimizer.zero_grad(set_to_none=True)
+                    actor_loss = policy_loss - entropy_coefficient * entropy_mean
+                    actor_loss.backward(retain_graph=True)
+                    actor_grad_norm = clip_optimizer_gradients(optimizer)
+                    actor_grad_norms.append(actor_grad_norm.detach())
+                    if std_optimizer is not None:
+                        std_grad_norm = clip_optimizer_gradients(std_optimizer)
+                        std_grad_norms.append(std_grad_norm.detach())
+                    if not torch.isfinite(actor_grad_norm) or not torch.isfinite(
+                        std_grad_norm
+                    ):
+                        raise FloatingPointError("PPO policy gradient is NaN or Inf")
+                    optimizer.step()
+                    if std_optimizer is not None:
+                        std_optimizer.step()
+                    log_std = getattr(policy, "log_std", None)
+                    if log_std is not None and log_std.requires_grad and (
+                        minimum_log_std is not None or maximum_log_std is not None
+                    ):
+                        with torch.no_grad():
+                            log_std.clamp_(
+                                min=(
+                                    -float("inf")
+                                    if minimum_log_std is None
+                                    else minimum_log_std
+                                ),
+                                max=(
+                                    float("inf")
+                                    if maximum_log_std is None
+                                    else maximum_log_std
+                                ),
+                            )
+                    with torch.no_grad():
+                        following_log_prob = policy.evaluate_actions(
+                            rollout.observations[indices],
+                            rollout.actions[indices],
+                        )[0]
+                        following_log_ratio = (
+                            following_log_prob - rollout.old_log_probs[indices]
+                        )
+                        following_ratio = torch.exp(following_log_ratio)
+                        following_kl = (
+                            (following_ratio - 1.0) - following_log_ratio
+                        ).mean()
+                        following_clip_fraction = (
+                            torch.abs(following_ratio - 1.0) > clip_range
+                        ).float().mean()
+                    if (
+                        hard_kl_limit is not None
+                        and float(following_kl) > hard_kl_limit
+                    ):
+                        restore_optimizer_step(optimizer, actor_update_snapshot)
+                        if std_optimizer is not None:
+                            restore_optimizer_step(
+                                std_optimizer, std_update_snapshot
+                            )
+                        optimizer_steps = 0
+                        std_optimizer_steps = 0
+                        hard_rollbacks += 1
+                        early_stopped = True
+                        actor_updates_enabled = False
+                        early_stop_kl = following_kl.detach()
+                    else:
+                        optimizer_steps += 1
+                        if std_optimizer is not None:
+                            std_optimizer_steps += 1
+                        if (
+                            soft_kl_limit is not None
+                            and float(following_kl) > soft_kl_limit
+                        ):
+                            # Keep this reasonable policy step, but do not reuse
+                            # the rollout for any further actor updates.
+                            early_stopped = True
+                            soft_stopped = True
+                            actor_updates_enabled = False
+                            early_stop_kl = following_kl.detach()
+
+                critic_optimizer.zero_grad(set_to_none=True)
+                (value_coefficient * value_loss).backward()
+                critic_grad_norm = clip_optimizer_gradients(critic_optimizer)
+                critic_grad_norms.append(critic_grad_norm.detach())
+                if not torch.isfinite(critic_grad_norm):
+                    raise FloatingPointError("PPO critic gradient is NaN or Inf")
+                critic_optimizer.step()
+                critic_optimizer_steps += 1
+                grad_norm = actor_grad_norm
             else:
-                optimizer_steps += 1
+                # Backward-compatible shared-optimizer route. Mild KL excesses
+                # are retained; only a catastrophic post-step jump is reverted.
+                if not actor_updates_enabled:
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = clip_optimizer_gradients(optimizer)
+                if not torch.isfinite(grad_norm):
+                    raise FloatingPointError("PPO gradient is NaN or Inf")
+                step_snapshot = (
+                    snapshot_optimizer_step(optimizer)
+                    if hard_kl_limit is not None
+                    else None
+                )
+                optimizer.step()
+                log_std = getattr(policy, "log_std", None)
+                if log_std is not None and (
+                    minimum_log_std is not None or maximum_log_std is not None
+                ):
+                    with torch.no_grad():
+                        log_std.clamp_(
+                            min=(
+                                -float("inf")
+                                if minimum_log_std is None
+                                else minimum_log_std
+                            ),
+                            max=(
+                                float("inf")
+                                if maximum_log_std is None
+                                else maximum_log_std
+                            ),
+                        )
+                with torch.no_grad():
+                    following_log_prob = policy.evaluate_actions(
+                        rollout.observations[indices], rollout.actions[indices]
+                    )[0]
+                    following_log_ratio = (
+                        following_log_prob - rollout.old_log_probs[indices]
+                    )
+                    following_ratio = torch.exp(following_log_ratio)
+                    following_kl = (
+                        (following_ratio - 1.0) - following_log_ratio
+                    ).mean()
+                    following_clip_fraction = (
+                        torch.abs(following_ratio - 1.0) > clip_range
+                    ).float().mean()
+                if (
+                    hard_kl_limit is not None
+                    and float(following_kl) > hard_kl_limit
+                ):
+                    restore_optimizer_step(optimizer, step_snapshot)
+                    hard_rollbacks += 1
+                    early_stopped = True
+                    actor_updates_enabled = False
+                    early_stop_kl = following_kl.detach()
+                else:
+                    optimizer_steps += 1
+                    if (
+                        soft_kl_limit is not None
+                        and float(following_kl) > soft_kl_limit
+                    ):
+                        early_stopped = True
+                        soft_stopped = True
+                        actor_updates_enabled = False
+                        early_stop_kl = following_kl.detach()
             for key, value in {
                 "policy": policy_loss,
                 "value": value_loss,
@@ -533,8 +735,9 @@ def ppo_update(
                 # synchronization and materially slows small-matrix DARE PPO.
                 metrics[key].append(value.detach())
             if early_stopped:
-                break
-        if early_stopped:
+                if not separated_optimizers:
+                    break
+        if early_stopped and not separated_optimizers:
             break
     result = {
         key: (
@@ -547,6 +750,27 @@ def ppo_update(
     result["ppo_optimizer_steps"] = float(optimizer_steps)
     result["ppo_early_stopped"] = float(early_stopped)
     result["ppo_early_stop_kl"] = float(early_stop_kl.cpu())
+    if separated_optimizers:
+        result["actor_grad_norm"] = (
+            float(torch.stack(actor_grad_norms).mean().cpu())
+            if actor_grad_norms
+            else 0.0
+        )
+        result["critic_grad_norm"] = (
+            float(torch.stack(critic_grad_norms).mean().cpu())
+            if critic_grad_norms
+            else 0.0
+        )
+        result["std_grad_norm"] = (
+            float(torch.stack(std_grad_norms).mean().cpu())
+            if std_grad_norms
+            else 0.0
+        )
+        result["ppo_actor_optimizer_steps"] = float(optimizer_steps)
+        result["ppo_critic_optimizer_steps"] = float(critic_optimizer_steps)
+        result["ppo_std_optimizer_steps"] = float(std_optimizer_steps)
+        result["ppo_kl_soft_stopped"] = float(soft_stopped)
+        result["ppo_kl_hard_rollbacks"] = float(hard_rollbacks)
     if early_stopped:
         # Report the KL that actually activated the guard; the minibatches that
         # preceded it can all have near-zero pre-update KL.
