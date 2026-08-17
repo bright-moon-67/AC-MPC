@@ -498,7 +498,7 @@ def build_actor(
     kmpc_horizon: int,
     kmpc_solver_iterations: int,
 ) -> nn.Module:
-    if "AC-KMPC" in method:
+    if "AC-KMPC" in method or method == "Cal-QL-MPVE":
         if koopman is None:
             raise ValueError("AC-KMPC actor requires a Koopman model")
         return KMPCTanhGaussianActor(
