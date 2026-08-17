@@ -655,10 +655,11 @@ class StructuredKoopmanMPCActor(KoopmanMPCActor):
 
     The policy learns only five bounded positive multipliers: three tip-axis
     weights, one shared action weight, and one terminal tip multiplier.  The
-    signed linear cost is fixed by the standard reference-tracking identities
-    ``p_x=-Q*x_ref`` and ``p_u=-R*u_ref``.  This prevents PPO from independently
-    rewriting every stage/state/action linear term while preserving the same
-    zero-output tracking controller as :class:`KoopmanMPCActor`.
+    default signed linear cost is fixed by the standard reference-tracking
+    identities ``p_x=-Q*x_ref`` and ``p_u=-R*u_ref``.  The controlled
+    ``reference_mode='implicit'`` ablation keeps those five q multipliers but
+    learns a free upstream-style stage-wise p.  The terminal multiplier can be
+    fixed to one without changing the output-head shape for a paired ablation.
     """
 
     STRUCTURED_OUTPUT_DIM = 5
@@ -668,10 +669,16 @@ class StructuredKoopmanMPCActor(KoopmanMPCActor):
         *args,
         structured_log_scale: float = math.log(2.0),
         structured_tip_indices: tuple[int, int, int] = (30, 31, 32),
+        reference_mode: str = "explicit",
+        use_terminal_multiplier: bool = True,
         **kwargs,
     ) -> None:
         if structured_log_scale <= 0:
             raise ValueError("structured_log_scale must be positive")
+        if reference_mode not in ("explicit", "implicit"):
+            raise ValueError(
+                "reference_mode must be 'explicit' or 'implicit'"
+            )
         super().__init__(*args, **kwargs)
         tip_indices = torch.as_tensor(
             structured_tip_indices,
@@ -685,15 +692,28 @@ class StructuredKoopmanMPCActor(KoopmanMPCActor):
         ):
             raise ValueError("structured_tip_indices are outside physical state")
         self.structured_log_scale = float(structured_log_scale)
+        self.reference_mode = str(reference_mode)
+        self.use_terminal_multiplier = bool(use_terminal_multiplier)
         self.register_buffer(
             "structured_tip_indices",
             tip_indices,
             persistent=False,
         )
+        # The implicit-reference ablation preserves the five structured
+        # positive q multipliers and changes only the source of the signed
+        # linear term: instead of injecting -Q*x_ref/-R*u_ref, it learns the
+        # same stage-wise free p used by the upstream actor.  Keeping q
+        # structured avoids confounding this reference ablation with the
+        # separate full-vs-structured cost-map difference.
+        linear_output_dim = (
+            0
+            if self.reference_mode == "explicit"
+            else self.horizon * self.augmented_dim
+        )
         self.network = _mlp(
             self.lifted_dim + self.context_dim,
             kwargs.get("hidden_dims", (256, 256)),
-            self.STRUCTURED_OUTPUT_DIM,
+            self.STRUCTURED_OUTPUT_DIM + linear_output_dim,
             kwargs.get("activation", "gelu"),
         ).to(dtype=self.A.dtype, device=self.A.device)
         final = self.network[-1]
@@ -701,7 +721,11 @@ class StructuredKoopmanMPCActor(KoopmanMPCActor):
             raise TypeError("Expected a linear final structured cost layer")
         nn.init.zeros_(final.weight)
         nn.init.zeros_(final.bias)
-        self.cost_parameterization = "structured_reference_weights_v1"
+        self.cost_parameterization = (
+            "structured_reference_weights_v1"
+            if self.reference_mode == "explicit"
+            else "structured_q_implicit_stage_linear_v1"
+        )
 
     def cost_terms(
         self,
@@ -724,10 +748,18 @@ class StructuredKoopmanMPCActor(KoopmanMPCActor):
             raise ValueError("This actor was constructed without context")
 
         raw = self.network(network_input)
-        log_multipliers = self.structured_log_scale * torch.tanh(raw)
+        structured_raw = raw[..., : self.STRUCTURED_OUTPUT_DIM]
+        log_multipliers = self.structured_log_scale * torch.tanh(
+            structured_raw
+        )
         tip_log = log_multipliers[..., :3]
         action_multiplier = torch.exp(log_multipliers[..., 3])
-        terminal_log = log_multipliers[..., 4]
+        terminal_log = (
+            log_multipliers[..., 4]
+            if self.use_terminal_multiplier
+            else torch.zeros_like(log_multipliers[..., 4])
+        )
+        terminal_multiplier = torch.exp(terminal_log)
 
         state_log = lifted_state.new_zeros(
             *batch_shape,
@@ -746,6 +778,34 @@ class StructuredKoopmanMPCActor(KoopmanMPCActor):
             self.action_dim,
         )
         quadratic = torch.cat((q_state, q_action), dim=-1)
+
+        if self.reference_mode == "implicit":
+            if physical_reference is not None or action_reference is not None:
+                raise ValueError(
+                    "Implicit-reference structured cost must not receive "
+                    "explicit physical/action references"
+                )
+            learned_linear = self.linear_scale * torch.tanh(
+                raw[..., self.STRUCTURED_OUTPUT_DIM :]
+            ).reshape(
+                *batch_shape,
+                self.horizon,
+                self.augmented_dim,
+            )
+            linear_state = learned_linear[..., : self.physical_dim]
+            linear_action = learned_linear[..., self.physical_dim :]
+            if self.use_terminal_multiplier:
+                # Treat the terminal scalar as a multiplier on the complete
+                # final-tip stage cost.  Scaling q and p together preserves
+                # the implicit target -p/q while keeping Q2 orthogonal to Q8.
+                linear_state = linear_state.clone()
+                linear_state[..., -1, self.structured_tip_indices] = (
+                    linear_state[..., -1, self.structured_tip_indices]
+                    * terminal_multiplier.unsqueeze(-1)
+                )
+            return quadratic, torch.cat(
+                (linear_state, linear_action), dim=-1
+            )
 
         linear_state = torch.zeros_like(q_state)
         linear_action = torch.zeros_like(q_action)

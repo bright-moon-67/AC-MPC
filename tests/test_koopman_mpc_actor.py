@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 from antmaze_ac.rl.koopman_mpc_actor import (
@@ -396,3 +397,85 @@ def test_structured_cost_has_bounded_multipliers_and_finite_gradients():
     gradients = torch.autograd.grad(loss, tuple(actor.parameters()))
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
     assert any(float(gradient.abs().sum()) > 0 for gradient in gradients)
+
+
+def test_structured_implicit_reference_keeps_q_and_learns_free_stage_p():
+    dtype = torch.float64
+    actor = StructuredKoopmanMPCActor(
+        torch.eye(4, dtype=dtype) * 0.9,
+        torch.ones(4, 2, dtype=dtype) * 0.05,
+        torch.eye(4, dtype=dtype),
+        horizon=3,
+        context_dim=2,
+        hidden_dims=(7,),
+        physical_quadratic_scale=torch.tensor(
+            [1e-8, 2.0, 3.0, 4.0], dtype=dtype
+        ),
+        action_quadratic_scale=5.0,
+        structured_tip_indices=(1, 2, 3),
+        reference_mode="implicit",
+    )
+    lifted = torch.randn(5, 4, dtype=dtype)
+    context = torch.randn(5, 2, dtype=dtype)
+    quadratic, linear = actor.cost_terms(lifted, context)
+    expected_q = torch.tensor(
+        [1e-8, 2.0, 3.0, 4.0, 5.0, 5.0], dtype=dtype
+    )
+    torch.testing.assert_close(
+        quadratic,
+        expected_q.expand(5, 3, 6),
+    )
+    torch.testing.assert_close(linear, torch.zeros_like(linear))
+    assert actor.network[-1].out_features == 5 + 3 * 6
+
+    with torch.no_grad():
+        actor.network[-1].bias[5:] = 0.2
+    _, learned_linear = actor.cost_terms(lifted, context)
+    assert bool((learned_linear.abs() > 0).all())
+    with pytest.raises(ValueError, match="must not receive explicit"):
+        actor.cost_terms(
+            lifted,
+            context,
+            torch.zeros(5, 4, dtype=dtype),
+            torch.zeros(5, 2, dtype=dtype),
+        )
+
+
+def test_structured_terminal_multiplier_can_be_disabled_without_shape_change():
+    dtype = torch.float64
+    common = dict(
+        A=torch.eye(4, dtype=dtype) * 0.9,
+        B=torch.ones(4, 2, dtype=dtype) * 0.05,
+        C=torch.eye(4, dtype=dtype),
+        horizon=3,
+        context_dim=2,
+        hidden_dims=(7,),
+        physical_quadratic_scale=torch.ones(4, dtype=dtype),
+        structured_tip_indices=(1, 2, 3),
+    )
+    terminal_on = StructuredKoopmanMPCActor(**common)
+    terminal_off = StructuredKoopmanMPCActor(
+        **common,
+        use_terminal_multiplier=False,
+    )
+    terminal_off.load_state_dict(terminal_on.state_dict())
+    with torch.no_grad():
+        terminal_on.network[-1].bias[4] = 1.0
+        terminal_off.network[-1].bias[4] = 1.0
+    lifted = torch.randn(5, 4, dtype=dtype)
+    context = torch.randn(5, 2, dtype=dtype)
+    reference = torch.randn(5, 4, dtype=dtype)
+    action_reference = torch.randn(5, 2, dtype=dtype)
+    q_on, _ = terminal_on.cost_terms(
+        lifted, context, reference, action_reference
+    )
+    q_off, p_off = terminal_off.cost_terms(
+        lifted, context, reference, action_reference
+    )
+    torch.testing.assert_close(q_off[..., -1, 1:4], q_off[..., 0, 1:4])
+    assert bool((q_on[..., -1, 1:4] > q_off[..., -1, 1:4]).all())
+    torch.testing.assert_close(
+        p_off[..., :4], -q_off[..., :4] * reference.unsqueeze(-2)
+    )
+    assert terminal_on.network[-1].out_features == 5
+    assert terminal_off.network[-1].out_features == 5

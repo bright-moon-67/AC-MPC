@@ -306,6 +306,8 @@ def make_manisoft_ppo_policy(
     normalized_delta_curvature: float = 0.0,
     kmpc_cost_parameterization: str = "full",
     structured_log_scale: float = math.log(2.0),
+    kmpc_reference_mode: str = "explicit",
+    structured_terminal_multiplier: bool = True,
 ) -> tuple[StandardHistoryPPOPolicy | HistoryKoopmanMPCPolicy, dict]:
     """Build one of the two from-scratch PPO comparison policies."""
 
@@ -322,6 +324,18 @@ def make_manisoft_ppo_policy(
     if kmpc_cost_parameterization not in ("full", "structured"):
         raise ValueError(
             "kmpc_cost_parameterization must be 'full' or 'structured'"
+        )
+    if kmpc_reference_mode not in ("explicit", "implicit"):
+        raise ValueError(
+            "kmpc_reference_mode must be 'explicit' or 'implicit'"
+        )
+    if (
+        kmpc_reference_mode == "implicit"
+        and kmpc_cost_parameterization != "structured"
+    ):
+        raise ValueError(
+            "The controlled implicit-reference ablation requires the "
+            "structured q parameterization"
         )
     if structured_log_scale <= 0:
         raise ValueError("structured_log_scale must be positive")
@@ -395,10 +409,12 @@ def make_manisoft_ppo_policy(
     if kmpc_cost_parameterization == "structured":
         actor_kwargs["structured_log_scale"] = structured_log_scale
         actor_kwargs["structured_tip_indices"] = (30, 31, 32)
-    actor = actor_class(
-        koopman.A,
-        koopman.B,
-        koopman.C[: koopman.state_dim],
+        actor_kwargs["reference_mode"] = kmpc_reference_mode
+        actor_kwargs["use_terminal_multiplier"] = bool(
+            structured_terminal_multiplier
+        )
+
+    common_actor_kwargs = dict(
         horizon=horizon,
         context_dim=context_dim,
         hidden_dims=kmpc_hidden_dims,
@@ -412,8 +428,44 @@ def make_manisoft_ppo_policy(
         max_delta=max_delta,
         normalized_delta_curvature=normalized_delta_curvature,
         solver_iterations=solver_iterations,
-        **actor_kwargs,
     )
+
+    if (
+        kmpc_cost_parameterization == "structured"
+        and kmpc_reference_mode == "implicit"
+    ):
+        # The implicit p head is wider than the v15e five-output head.  Align
+        # the post-actor RNG state with the v15e construction so the critic
+        # initialization and rollout RNG remain paired across ablations.
+        pre_actor_rng = torch.random.get_rng_state()
+        StructuredKoopmanMPCActor(
+            koopman.A,
+            koopman.B,
+            koopman.C[: koopman.state_dim],
+            **common_actor_kwargs,
+            structured_log_scale=structured_log_scale,
+            structured_tip_indices=(30, 31, 32),
+            reference_mode="explicit",
+            use_terminal_multiplier=bool(structured_terminal_multiplier),
+        )
+        post_v15e_actor_rng = torch.random.get_rng_state()
+        torch.random.set_rng_state(pre_actor_rng)
+        actor = actor_class(
+            koopman.A,
+            koopman.B,
+            koopman.C[: koopman.state_dim],
+            **common_actor_kwargs,
+            **actor_kwargs,
+        )
+        torch.random.set_rng_state(post_v15e_actor_rng)
+    else:
+        actor = actor_class(
+            koopman.A,
+            koopman.B,
+            koopman.C[: koopman.state_dim],
+            **common_actor_kwargs,
+            **actor_kwargs,
+        )
     critic = Critic(
         koopman.lifted_dim + context_dim,
         hidden_dims=(256, 256),
@@ -430,7 +482,11 @@ def make_manisoft_ppo_policy(
         log_std_init=log_std_init,
     )
     policy.cost_initialization = (
-        "structured_reference_weights_v1"
+        (
+            "structured_reference_weights_v1"
+            if kmpc_reference_mode == "explicit"
+            else "structured_q_implicit_stage_linear_zero_v1"
+        )
         if kmpc_cost_parameterization == "structured"
         else "active_waypoint_tip_only_v1"
     )
@@ -480,6 +536,12 @@ def load_manisoft_ppo_checkpoint(
         ),
         structured_log_scale=float(
             runtime.get("structured_log_scale") or math.log(2.0)
+        ),
+        kmpc_reference_mode=str(
+            runtime.get("kmpc_reference_mode", "explicit")
+        ),
+        structured_terminal_multiplier=bool(
+            runtime.get("structured_terminal_multiplier", True)
         ),
     )
     policy.load_state_dict(payload["policy"])

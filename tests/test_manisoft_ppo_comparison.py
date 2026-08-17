@@ -77,7 +77,7 @@ def _checkpoint(tmp_path):
     return path
 
 
-def _make(name, checkpoint, *, cost_parameterization="full"):
+def _make(name, checkpoint, *, cost_parameterization="full", **kwargs):
     return make_manisoft_ppo_policy(
         name,
         checkpoint,
@@ -87,6 +87,7 @@ def _make(name, checkpoint, *, cost_parameterization="full"):
         horizon=2,
         solver_iterations=4,
         kmpc_cost_parameterization=cost_parameterization,
+        **kwargs,
     )[0]
 
 
@@ -327,6 +328,69 @@ def test_structured_kmpc_policy_reduces_cost_map_and_backpropagates(tmp_path):
     assert structured.cost_initialization == "structured_reference_weights_v1"
 
 
+def test_source_style_ablation_axes_are_independent(tmp_path):
+    checkpoint = _checkpoint(tmp_path)
+    observations = torch.zeros(5, 45 + 2 * (45 + 3) + 12)
+    observations[:, -3] = 1.0
+
+    torch.manual_seed(901)
+    baseline = _make(
+        "ppo_kmpc",
+        checkpoint,
+        cost_parameterization="structured",
+    )
+    torch.manual_seed(901)
+    implicit = _make(
+        "ppo_kmpc",
+        checkpoint,
+        cost_parameterization="structured",
+        kmpc_reference_mode="implicit",
+    )
+    assert implicit.cost_initialization == (
+        "structured_q_implicit_stage_linear_zero_v1"
+    )
+    assert implicit.actor.reference_mode == "implicit"
+    # The wider implicit-p actor consumes a matched RNG substream so its
+    # critic is paired with the v15e baseline.
+    for baseline_parameter, implicit_parameter in zip(
+        baseline.critic.parameters(), implicit.critic.parameters()
+    ):
+        torch.testing.assert_close(baseline_parameter, implicit_parameter)
+    assert implicit(observations).mean.shape == (5, 3)
+
+    torch.manual_seed(902)
+    terminal_on = _make(
+        "ppo_kmpc",
+        checkpoint,
+        cost_parameterization="structured",
+    )
+    torch.manual_seed(902)
+    terminal_off = _make(
+        "ppo_kmpc",
+        checkpoint,
+        cost_parameterization="structured",
+        structured_terminal_multiplier=False,
+    )
+    torch.testing.assert_close(
+        terminal_on(observations).mean,
+        terminal_off(observations).mean,
+    )
+    assert not terminal_off.actor.use_terminal_multiplier
+    assert terminal_off.actor.network[-1].out_features == 5
+
+    absolute = _make(
+        "ppo_kmpc",
+        checkpoint,
+        cost_parameterization="structured",
+        max_delta=None,
+        initial_action_std=0.00225,
+    )
+    absolute_output = absolute(observations)
+    assert absolute.actor.max_delta is None
+    assert absolute.ACTION_DISTRIBUTION == "diagonal_normal_v1"
+    assert float(absolute_output.mean.abs().max()) <= 0.3 + 1e-6
+
+
 def test_comparison_checkpoint_round_trip(tmp_path):
     koopman_path = _checkpoint(tmp_path)
     cases = (
@@ -377,3 +441,68 @@ def test_comparison_checkpoint_round_trip(tmp_path):
         )
         torch.testing.assert_close(restored(observations).mean, expected)
         assert payload["actor_name"] == actor_name
+
+
+def test_ablation_checkpoint_round_trip(tmp_path):
+    koopman_path = _checkpoint(tmp_path)
+    cases = (
+        (
+            "implicit",
+            {"kmpc_reference_mode": "implicit"},
+            {"kmpc_reference_mode": "implicit", "max_delta": 0.001},
+        ),
+        (
+            "absolute",
+            {"max_delta": None, "initial_action_std": 0.00225},
+            {"max_delta": None, "initial_action_std": 0.00225},
+        ),
+        (
+            "no_terminal",
+            {"structured_terminal_multiplier": False},
+            {"structured_terminal_multiplier": False, "max_delta": 0.001},
+        ),
+    )
+    for name, factory_kwargs, runtime_overrides in cases:
+        policy = _make(
+            "ppo_kmpc",
+            koopman_path,
+            cost_parameterization="structured",
+            **factory_kwargs,
+        )
+        observations = torch.zeros(2, policy.observation_dim)
+        observations[:, -3] = 1.0
+        expected = policy(observations).mean.detach()
+        runtime = {
+            "absolute_action_limit": 0.3,
+            "progress_reward_scale": 1.0,
+            "initial_action_std": 0.015,
+            "waypoint_count": 3,
+            "mlp_hidden_dims": [16, 16],
+            "kmpc_hidden_dims": [12],
+            "horizon": 2,
+            "solver_iterations": 4,
+            "quadratic_log_scale": 1.5,
+            "linear_scale": 10.0,
+            "action_quadratic_scale": 1.0,
+            "tip_weight": 1.0,
+            "max_delta": 0.001,
+            "kmpc_cost_parameterization": "structured",
+            "structured_log_scale": math.log(2.0),
+            **runtime_overrides,
+        }
+        path = tmp_path / f"ablation_{name}.pt"
+        torch.save(
+            {
+                "method": "manisoft_ppo_from_scratch",
+                "actor_name": "ppo_kmpc",
+                "koopman_checkpoint": str(koopman_path),
+                "koopman_checkpoint_sha256": sha256(koopman_path),
+                "runtime": runtime,
+                "policy": policy.state_dict(),
+            },
+            path,
+        )
+        restored, _, _ = load_manisoft_ppo_checkpoint(
+            path, torch.device("cpu")
+        )
+        torch.testing.assert_close(restored(observations).mean, expected)

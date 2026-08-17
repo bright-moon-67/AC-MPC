@@ -298,6 +298,9 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         split, lifted, actor_context, physical_reference, action_reference = (
             self.features(observation)
         )
+        if getattr(self.actor, "reference_mode", "explicit") == "implicit":
+            physical_reference = None
+            action_reference = None
         return self.actor(
             lifted,
             actor_context,
@@ -332,6 +335,9 @@ class HistoryKoopmanMPCPolicy(nn.Module):
             self.features(observation_batch)
         )
         previous_action = self.previous_action(split)
+        if getattr(self.actor, "reference_mode", "explicit") == "implicit":
+            physical_reference = None
+            action_reference = None
         mpc = self.actor(
             lifted,
             actor_context,

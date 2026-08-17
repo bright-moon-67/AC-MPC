@@ -35,6 +35,7 @@ wandb/
 /docs/*
 !/docs/manisoft_bc_kmpc.md
 !/docs/manisoft_history_mlp_baseline.md
+!/docs/kmpc_v15e_vs_upstream_cost_and_solver.md
 /private_notes/
 *.private.md
 

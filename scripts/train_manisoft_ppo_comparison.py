@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from functools import partial
+import hashlib
 import json
 import math
 import os
@@ -67,6 +68,19 @@ def _write_json(path: Path, payload: dict) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def _module_sha256(module: torch.nn.Module) -> str:
+    """Hash initialized module tensors for paired-ablation provenance."""
+
+    digest = hashlib.sha256()
+    for name, tensor in sorted(module.state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _make_env(
@@ -144,6 +158,35 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Log-range of each structured cost multiplier. The default "
             "constrains individual multipliers to [0.5, 2.0]."
+        ),
+    )
+    parser.add_argument(
+        "--kmpc-reference-mode",
+        choices=("explicit", "implicit"),
+        default="explicit",
+        help=(
+            "Reference source for structured PPO-KMPC. 'explicit' is the "
+            "v15e -Q*x_ref/-R*u_ref cost; 'implicit' keeps the same "
+            "structured q and learns upstream-style free stage linear terms."
+        ),
+    )
+    parser.add_argument(
+        "--kmpc-decision-space",
+        choices=("normalized_delta", "absolute"),
+        default="normalized_delta",
+        help=(
+            "PPO-KMPC decision/action semantics. 'absolute' reproduces the "
+            "upstream direct-U box-only formulation and removes the rate "
+            "limit while preserving matched physical exploration noise."
+        ),
+    )
+    parser.add_argument(
+        "--structured-terminal-multiplier",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable the learned final-tip multiplier. Disabling it keeps the "
+            "fifth output head but fixes its multiplier to one."
         ),
     )
     parser.add_argument(
@@ -281,6 +324,32 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--kmpc-cost-parameterization is only valid for PPO-KMPC"
         )
+    if args.actor != "ppo_kmpc" and args.kmpc_reference_mode != "explicit":
+        raise ValueError("--kmpc-reference-mode is only valid for PPO-KMPC")
+    if (
+        args.actor != "ppo_kmpc"
+        and args.kmpc_decision_space != "normalized_delta"
+    ):
+        raise ValueError("--kmpc-decision-space is only valid for PPO-KMPC")
+    if args.actor != "ppo_kmpc" and not args.structured_terminal_multiplier:
+        raise ValueError(
+            "--no-structured-terminal-multiplier is only valid for PPO-KMPC"
+        )
+    if (
+        args.kmpc_reference_mode == "implicit"
+        and args.kmpc_cost_parameterization != "structured"
+    ):
+        raise ValueError(
+            "The implicit-reference ablation keeps structured q; use "
+            "--kmpc-cost-parameterization structured"
+        )
+    if (
+        not args.structured_terminal_multiplier
+        and args.kmpc_cost_parameterization != "structured"
+    ):
+        raise ValueError(
+            "The terminal-multiplier ablation requires structured cost"
+        )
     if args.actor_learning_rate is not None and args.actor_learning_rate <= 0:
         raise ValueError("--actor-learning-rate must be positive")
     if args.kl_hard_rollback_multiplier < args.kl_soft_stop_multiplier:
@@ -291,8 +360,21 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.max_wall_time_hours is not None and args.max_wall_time_hours <= 0:
         raise ValueError("--max-wall-time-hours must be positive")
     if args.actor == "ppo_kmpc" and args.max_delta <= 0:
-        raise ValueError("PPO-KMPC requires --max-delta > 0")
-    if args.actor == "ppo_kmpc" and args.solver_iterations < 80:
+        raise ValueError(
+            "PPO-KMPC requires --max-delta > 0 as the v15e rate/noise scale"
+        )
+    if (
+        args.kmpc_decision_space == "absolute"
+        and args.normalized_delta_curvature
+    ):
+        raise ValueError(
+            "--normalized-delta-curvature is invalid in absolute decision space"
+        )
+    if (
+        args.actor == "ppo_kmpc"
+        and args.kmpc_decision_space == "normalized_delta"
+        and args.solver_iterations < 80
+    ):
         raise ValueError(
             "Normalized-delta PPO-KMPC requires --solver-iterations >= 80"
         )
@@ -341,12 +423,36 @@ def main() -> None:
         actor_learning_rate = 1e-5
     else:
         actor_learning_rate = 3e-8
+
+    normalized_delta_policy = (
+        args.actor == "ppo_kmpc"
+        and args.kmpc_decision_space == "normalized_delta"
+    )
+    actor_max_delta = args.max_delta if normalized_delta_policy else None
+    # v15e's 0.18 is dimensionless D-space noise.  For the direct-U
+    # ablation, convert it to physical action units so Q3 changes only the
+    # decision/constraint formulation instead of increasing exploration by
+    # 1/max_delta (=80 for v15e).
+    action_std_unit_scale = (
+        args.max_delta
+        if args.actor == "ppo_kmpc" and not normalized_delta_policy
+        else 1.0
+    )
+    effective_initial_action_std = (
+        args.initial_action_std * action_std_unit_scale
+    )
+    effective_minimum_action_std = (
+        args.minimum_action_std * action_std_unit_scale
+    )
+    effective_maximum_action_std = (
+        args.maximum_action_std * action_std_unit_scale
+    )
     policy, koopman_payload = make_manisoft_ppo_policy(
         args.actor,
         koopman_path,
         device,
         absolute_action_limit=args.absolute_action_limit,
-        initial_action_std=args.initial_action_std,
+        initial_action_std=effective_initial_action_std,
         waypoint_count=3,
         mlp_hidden_dims=args.mlp_hidden_dims,
         kmpc_hidden_dims=args.kmpc_hidden_dims,
@@ -356,10 +462,12 @@ def main() -> None:
         linear_scale=args.linear_scale,
         action_quadratic_scale=args.action_quadratic_scale,
         tip_weight=args.tip_weight,
-        max_delta=(args.max_delta if args.actor == "ppo_kmpc" else None),
+        max_delta=actor_max_delta,
         normalized_delta_curvature=args.normalized_delta_curvature,
         kmpc_cost_parameterization=args.kmpc_cost_parameterization,
         structured_log_scale=args.structured_log_scale,
+        kmpc_reference_mode=args.kmpc_reference_mode,
+        structured_terminal_multiplier=args.structured_terminal_multiplier,
     )
     actor_parameters = [p for p in policy.actor.parameters() if p.requires_grad]
     critic_parameters = [p for p in policy.critic.parameters() if p.requires_grad]
@@ -390,9 +498,9 @@ def main() -> None:
         "progress_reward_scale": args.progress_reward_scale,
         "success_threshold": MANISOFT_WAYPOINT_SUCCESS_THRESHOLD,
         "required_success_streak": MANISOFT_WAYPOINT_SUCCESS_STREAK,
-        "initial_action_std": args.initial_action_std,
-        "minimum_action_std": args.minimum_action_std,
-        "maximum_action_std": args.maximum_action_std,
+        "initial_action_std": effective_initial_action_std,
+        "minimum_action_std": effective_minimum_action_std,
+        "maximum_action_std": effective_maximum_action_std,
         "observation_dim": policy.observation_dim,
         "history_steps": policy.history_steps,
         "waypoint_count": policy.waypoint_count,
@@ -420,20 +528,22 @@ def main() -> None:
         "solver": (
             None
             if args.actor == "ppo_mlp"
-            else "normalized_delta_box_fista_v1"
+            else (
+                "normalized_delta_box_fista_v1"
+                if normalized_delta_policy
+                else "absolute_action_box_fista_v1"
+            )
         ),
         "fixed_smoothness": False,
-        "max_delta": (
-            None if args.actor == "ppo_mlp" else args.max_delta
-        ),
+        "max_delta": actor_max_delta,
         "policy_action_semantics": (
             "absolute_action"
-            if args.actor == "ppo_mlp"
+            if args.actor == "ppo_mlp" or not normalized_delta_policy
             else "normalized_delta_action"
         ),
         "action_std_units": (
             "physical_action"
-            if args.actor == "ppo_mlp"
+            if args.actor == "ppo_mlp" or not normalized_delta_policy
             else "normalized_delta"
         ),
         "action_distribution": policy.ACTION_DISTRIBUTION,
@@ -445,6 +555,26 @@ def main() -> None:
             else policy.cost_initialization
         ),
     }
+    if args.actor == "ppo_kmpc" and args.kmpc_reference_mode != "explicit":
+        runtime["kmpc_reference_mode"] = args.kmpc_reference_mode
+    if args.actor == "ppo_kmpc" and not args.structured_terminal_multiplier:
+        runtime["structured_terminal_multiplier"] = False
+    if args.actor == "ppo_kmpc" and not normalized_delta_policy:
+        runtime.update(
+            {
+                "kmpc_decision_space": "absolute",
+                "configured_max_delta": args.max_delta,
+                "configured_initial_action_std": args.initial_action_std,
+                "configured_minimum_action_std": args.minimum_action_std,
+                "configured_maximum_action_std": args.maximum_action_std,
+                "physical_exploration_std_initial": (
+                    effective_initial_action_std
+                ),
+                "exploration_std_conversion": (
+                    "v15e_normalized_delta_to_physical_v1"
+                ),
+            }
+        )
     if args.actor == "ppo_mlp":
         runtime["mlp_feature_extractor"] = (
             "frozen_history_koopman_lift_plus_waypoints_v1"
@@ -558,9 +688,11 @@ def main() -> None:
             "resolved_actor_learning_rate": actor_learning_rate,
             "device": str(device),
             "trainable_actor_parameters": sum(p.numel() for p in actor_parameters),
+            "initial_actor_sha256": _module_sha256(policy.actor),
             "trainable_critic_parameters": sum(
                 p.numel() for p in policy.critic.parameters()
             ),
+            "initial_critic_sha256": _module_sha256(policy.critic),
             "trainable_log_std_parameters": (
                 policy.log_std.numel() if policy.log_std.requires_grad else 0
             ),
@@ -583,7 +715,7 @@ def main() -> None:
         "state_mean": np.asarray(state_stats["mean"], dtype=np.float32),
         "state_std": np.asarray(state_stats["std"], dtype=np.float32),
         "max_delta": (
-            args.max_delta if args.actor == "ppo_kmpc" else None
+            actor_max_delta
         ),
     }
     if args.parallel_env_processes:
@@ -619,8 +751,8 @@ def main() -> None:
             "best_score": list(best_score),
         }
 
-    minimum_log_std = math.log(args.minimum_action_std)
-    maximum_log_std = math.log(args.maximum_action_std)
+    minimum_log_std = math.log(effective_minimum_action_std)
+    maximum_log_std = math.log(effective_maximum_action_std)
     total_updates = math.ceil(args.total_timesteps / args.rollout_steps)
     started = time.monotonic()
     wall_time_reached = False
@@ -779,6 +911,14 @@ def main() -> None:
                 "policy_mean_abs_mean": float(diagnostic.mean.abs().mean()),
                 "log_std": policy.log_std.detach().cpu().tolist(),
                 "action_std_mean": float(policy.log_std.exp().mean()),
+                "physical_exploration_std_mean": float(
+                    policy.log_std.exp().mean()
+                    * (
+                        args.max_delta
+                        if normalized_delta_policy
+                        else 1.0
+                    )
+                ),
             }
             if args.actor == "ppo_kmpc":
                 high_solution, high_residual = policy.actor.solve_condensed_qp(
@@ -792,46 +932,64 @@ def main() -> None:
                     policy.actor.horizon,
                     policy.actor.action_dim,
                 )[:, 0]
-                if diagnostic.mpc.normalized_delta is None:
-                    raise RuntimeError(
-                        "PPO-KMPC diagnostic is missing normalized delta"
+                if normalized_delta_policy:
+                    if diagnostic.mpc.normalized_delta is None:
+                        raise RuntimeError(
+                            "PPO-KMPC diagnostic is missing normalized delta"
+                        )
+                    deployed_first = diagnostic.mpc.normalized_delta.reshape(
+                        -1,
+                        policy.actor.action_dim,
                     )
-                deployed_first = diagnostic.mpc.normalized_delta.reshape(
-                    -1,
-                    policy.actor.action_dim,
-                )
+                else:
+                    deployed_first = diagnostic.mpc.action.reshape(
+                        -1,
+                        policy.actor.action_dim,
+                    )
                 difference = high_first - deployed_first
-                row.update(
-                    {
-                        "quadratic_weight_mean": float(
-                            diagnostic.mpc.quadratic_diagonal.mean()
-                        ),
-                        "linear_weight_abs_mean": float(
-                            diagnostic.mpc.linear_term.abs().mean()
-                        ),
-                        "projected_gradient_residual_mean": float(
-                            diagnostic.mpc.projected_gradient_residual.mean()
-                        ),
-                        "diagnostic_solver_residual_mean": float(
-                            high_residual.mean()
-                        ),
-                        "diagnostic_first_action_l2_difference_mean": float(
-                            torch.linalg.vector_norm(difference, dim=-1).mean()
-                        ),
-                        "diagnostic_first_action_abs_difference_max": float(
-                            difference.abs().max()
-                        ),
-                        "normalized_delta_abs_mean": float(
-                            rollout.actions.abs().mean()
-                        ),
-                        "normalized_delta_bound_rate": float(
-                            (rollout.actions.abs() >= 1.0 - 1e-6)
-                            .float()
-                            .mean()
-                        ),
-                        "physical_delta_limit": args.max_delta,
-                    }
-                )
+                kmpc_metrics = {
+                    "quadratic_weight_mean": float(
+                        diagnostic.mpc.quadratic_diagonal.mean()
+                    ),
+                    "linear_weight_abs_mean": float(
+                        diagnostic.mpc.linear_term.abs().mean()
+                    ),
+                    "projected_gradient_residual_mean": float(
+                        diagnostic.mpc.projected_gradient_residual.mean()
+                    ),
+                    "diagnostic_solver_residual_mean": float(
+                        high_residual.mean()
+                    ),
+                    "diagnostic_first_action_l2_difference_mean": float(
+                        torch.linalg.vector_norm(difference, dim=-1).mean()
+                    ),
+                    "diagnostic_first_action_abs_difference_max": float(
+                        difference.abs().max()
+                    ),
+                }
+                if normalized_delta_policy:
+                    kmpc_metrics.update(
+                        {
+                            "normalized_delta_abs_mean": float(
+                                rollout.actions.abs().mean()
+                            ),
+                            "normalized_delta_bound_rate": float(
+                                (rollout.actions.abs() >= 1.0 - 1e-6)
+                                .float()
+                                .mean()
+                            ),
+                            "physical_delta_limit": args.max_delta,
+                        }
+                    )
+                else:
+                    kmpc_metrics.update(
+                        {
+                            "normalized_delta_abs_mean": None,
+                            "normalized_delta_bound_rate": None,
+                            "physical_delta_limit": None,
+                        }
+                    )
+                row.update(kmpc_metrics)
 
             is_best = False
             if (
