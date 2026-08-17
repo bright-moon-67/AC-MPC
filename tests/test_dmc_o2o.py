@@ -1128,6 +1128,45 @@ def test_mpve_runs_online_only_once_per_real_step_and_uses_nine_model_steps(
         learner.update(_tensor_batch(), utd=1, phase="typo")  # type: ignore[arg-type]
 
 
+def test_offline_mpve_is_standalone_and_runs_only_during_offline_updates(
+    koopman_path: Path,
+) -> None:
+    config = dataclasses.replace(
+        _small_config("Cal-RLPD-AC-KMPC-Offline-MPVE"),
+        kmpc_horizon=10,
+        mpve_total_horizon=10,
+    )
+    assert config.uses_offline_mpve
+    assert not config.uses_online_mpve
+    assert not config.requires_offline_fork
+    assert config.requires_own_offline_pretraining
+
+    learner = O2OLearner(
+        config, FrozenKoopman(koopman_path), torch.device("cpu")
+    )
+    model_steps = 0
+    original_step = learner.koopman.step
+
+    def counted_step(lifted_state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        nonlocal model_steps
+        model_steps += 1
+        return original_step(lifted_state, action)
+
+    learner.koopman.step = counted_step  # type: ignore[method-assign]
+    offline_metrics = learner.update(
+        _tensor_batch(size=8), utd=2, phase="offline"
+    )
+    assert model_steps == 9
+    assert offline_metrics["mpve_applied"] == 1.0
+    assert offline_metrics["mpve_loss"] > 0.0
+
+    online_metrics = learner.update(
+        _tensor_batch(size=8), utd=2, phase="online"
+    )
+    assert model_steps == 9
+    assert online_metrics["mpve_applied"] == 0.0
+
+
 def test_checkpoint_round_trip_restores_learner_replay_and_rng(
     tmp_path: Path, koopman_path: Path
 ) -> None:

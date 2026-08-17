@@ -122,9 +122,9 @@ def _validate_initialization_lineage(
     koopman_sha256: str | None,
     environment_protocol: Mapping[str, Any],
 ) -> None:
-    if not config.uses_mpve:
+    if not config.requires_offline_fork:
         if initialization is not None:
-            raise ValueError("Non-MPVE checkpoint contains fork lineage")
+            raise ValueError("Non-forking checkpoint contains fork lineage")
         return
     if not isinstance(initialization, Mapping):
         raise ValueError("MPVE checkpoint is missing offline-fork lineage")

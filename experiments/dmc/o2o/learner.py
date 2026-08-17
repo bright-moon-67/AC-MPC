@@ -744,12 +744,15 @@ class O2OLearner:
             batch_slice = slice(index * size, (index + 1) * size)
             mini_batch = batch.slice(batch_slice)
             mini_cache = cache.slice(batch_slice)
-            # MPVE is an online-only auxiliary and runs once per real
-            # environment step, independent of REDQ's critic UTD.  The first
-            # UTD-1 minibatches remain pure real-transition TD updates.
+            # MPVE runs once per logical update, independent of REDQ's critic
+            # UTD.  Its scope is part of the immutable method identity:
+            # Offline-MPVE applies it during offline pretraining, while the
+            # original MPVE ablation applies it only online.
             apply_mpve = (
-                self.config.uses_mpve
-                and phase == "online"
+                (
+                    phase == "offline" and self.config.uses_offline_mpve
+                    or phase == "online" and self.config.uses_online_mpve
+                )
                 and index + 1 == utd
             )
             metrics = self.update_critic(
