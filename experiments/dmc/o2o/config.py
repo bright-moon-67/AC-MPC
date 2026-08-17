@@ -202,6 +202,18 @@ METHOD_SPECS: dict[str, MethodSpec] = {
 # legacy matrix/aggregate contract remains unchanged.  They are launched and
 # stopped independently and may have their own execution horizon.
 STANDALONE_METHOD_SPECS: dict[str, MethodSpec] = {
+    "Cal-QL-MPVE": MethodSpec(
+        name="Cal-QL-MPVE",
+        representation="koopman_lifted",
+        actor="ac_kmpc",
+        mpve_scope="both",
+        profile="exorl_cql_backbone_calql_ac_kmpc_mpve_v1",
+        **{
+            key: value
+            for key, value in _CALQL_AC_KMPC.items()
+            if key not in ("profile", "representation", "actor", "mpve_scope")
+        },
+    ),
     "Cal-RLPD-AC-KMPC-Offline-MPVE": MethodSpec(
         name="Cal-RLPD-AC-KMPC-Offline-MPVE",
         representation="koopman_lifted",
