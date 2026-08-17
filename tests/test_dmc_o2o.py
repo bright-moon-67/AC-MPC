@@ -595,7 +595,15 @@ def test_method_specs_freeze_raw_and_structured_algorithm_profiles() -> None:
     )
     # This pair is the controlled Cal-QL comparison: the representation,
     # actor, method name and label differ; all optimization semantics match.
-    excluded = {"name", "representation", "actor", "profile"}
+    # The structured Cal-QL actor is deliberately capacity-matched to the
+    # raw Cal-QL actor, so its controller hidden topology is an intended
+    # method-specific difference rather than a shared optimization setting.
+    assert (calql.controller_hidden_dim, calql.controller_hidden_layers) == (128, 1)
+    assert (calql_kmpc.controller_hidden_dim, calql_kmpc.controller_hidden_layers) == (1024, 2)
+    excluded = {
+        "name", "representation", "actor", "profile",
+        "controller_hidden_dim", "controller_hidden_layers",
+    }
     raw_spec = dataclasses.asdict(calql.method_spec)
     kmpc_spec = dataclasses.asdict(calql_kmpc.method_spec)
     assert {

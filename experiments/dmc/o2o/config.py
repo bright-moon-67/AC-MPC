@@ -40,6 +40,8 @@ class MethodSpec:
     batch_size: int
     hidden_dim: int
     critic_hidden_layers: int
+    controller_hidden_dim: int
+    controller_hidden_layers: int
     critic_ensemble_size: int
     target_critic_subset: int
     target_tau: float
@@ -77,6 +79,8 @@ _CALQL_RAW = dict(
     batch_size=1024,
     hidden_dim=1024,
     critic_hidden_layers=2,
+    controller_hidden_dim=128,
+    controller_hidden_layers=1,
     critic_ensemble_size=2,
     target_critic_subset=2,
     target_tau=0.01,
@@ -111,6 +115,8 @@ _RLPD_RAW = dict(
     batch_size=256,
     hidden_dim=256,
     critic_hidden_layers=2,
+    controller_hidden_dim=128,
+    controller_hidden_layers=1,
     critic_ensemble_size=10,
     target_critic_subset=2,
     target_tau=0.005,
@@ -135,6 +141,8 @@ _CALQL_AC_KMPC = {
     **_CALQL_RAW,
     "representation": "koopman_lifted",
     "actor": "ac_kmpc",
+    "controller_hidden_dim": 1024,
+    "controller_hidden_layers": 2,
     "profile": "exorl_cql_backbone_calql_ac_kmpc_lifted_v1",
 }
 _CAL_RLPD = dict(
@@ -146,6 +154,8 @@ _CAL_RLPD = dict(
     batch_size=256,
     hidden_dim=256,
     critic_hidden_layers=2,
+    controller_hidden_dim=128,
+    controller_hidden_layers=1,
     critic_ensemble_size=10,
     target_critic_subset=2,
     target_tau=0.005,
@@ -244,6 +254,8 @@ class O2OConfig:
     batch_size: int | None = None
     hidden_dim: int | None = None
     critic_hidden_layers: int | None = None
+    controller_hidden_dim: int | None = None
+    controller_hidden_layers: int | None = None
     critic_ensemble_size: int | None = None
     target_critic_subset: int | None = None
     discount: float = 0.99
@@ -282,7 +294,6 @@ class O2OConfig:
 
     kmpc_horizon: int = 20
     kmpc_solver_iterations: int = 20
-    controller_hidden_dim: int = 128
     mpve_total_horizon: int = 10
     mpve_loss_weight: float = 1.0
 
@@ -300,6 +311,8 @@ class O2OConfig:
             "batch_size",
             "hidden_dim",
             "critic_hidden_layers",
+            "controller_hidden_dim",
+            "controller_hidden_layers",
             "critic_ensemble_size",
             "target_critic_subset",
             "target_tau",
@@ -334,10 +347,11 @@ class O2OConfig:
             raise ValueError(f"Unknown method {self.method!r}; expected {TRAIN_METHODS}")
         integer_fields = (
             "batch_size", "hidden_dim", "critic_hidden_layers",
+            "controller_hidden_dim", "controller_hidden_layers",
             "critic_ensemble_size", "target_critic_subset", "offline_updates",
             "cql_actions", "online_steps", "online_utd", "online_warmup_steps",
             "replay_capacity", "num_envs", "env_workers", "kmpc_horizon",
-            "kmpc_solver_iterations", "controller_hidden_dim",
+            "kmpc_solver_iterations",
             "mpve_total_horizon", "eval_interval_online_steps", "eval_episodes",
             "checkpoint_interval_updates", "log_interval_updates",
             "offline_eval_interval_updates",

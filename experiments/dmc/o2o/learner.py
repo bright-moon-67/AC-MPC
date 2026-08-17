@@ -253,6 +253,7 @@ class O2OLearner:
                 controller_hidden_dim=config.controller_hidden_dim,
                 kmpc_horizon=config.kmpc_horizon,
                 kmpc_solver_iterations=config.kmpc_solver_iterations,
+                controller_hidden_layers=config.controller_hidden_layers,
             ).to(device)
         with _cpu_initialization_stream(self.rng_substream_seeds["critic_init"]):
             self.critic = build_critic(
