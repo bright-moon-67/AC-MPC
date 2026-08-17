@@ -1,6 +1,11 @@
+import math
+
 import torch
 
-from antmaze_ac.rl.koopman_mpc_actor import KoopmanMPCActor
+from antmaze_ac.rl.koopman_mpc_actor import (
+    KoopmanMPCActor,
+    StructuredKoopmanMPCActor,
+)
 
 
 def _randomize(module: torch.nn.Module, seed: int) -> None:
@@ -297,3 +302,97 @@ def test_normalized_delta_curvature_shifts_only_decision_hessian():
         shifted_hessian,
         base_hessian + 1e-4 * torch.eye(3, dtype=dtype),
     )
+
+
+def test_structured_cost_starts_at_same_reference_tracking_objective():
+    dtype = torch.float64
+    common = dict(
+        A=torch.eye(4, dtype=dtype) * 0.9,
+        B=torch.ones(4, 2, dtype=dtype) * 0.05,
+        C=torch.eye(4, dtype=dtype),
+        horizon=3,
+        context_dim=2,
+        hidden_dims=(7,),
+        physical_quadratic_scale=torch.tensor(
+            [1e-8, 2.0, 3.0, 4.0], dtype=dtype
+        ),
+        action_quadratic_scale=5.0,
+    )
+    full = KoopmanMPCActor(**common)
+    structured = StructuredKoopmanMPCActor(
+        **common,
+        structured_tip_indices=(1, 2, 3),
+    )
+    lifted = torch.randn(5, 4, dtype=dtype)
+    context = torch.randn(5, 2, dtype=dtype)
+    state_reference = torch.randn(5, 4, dtype=dtype)
+    action_reference = torch.randn(5, 2, dtype=dtype)
+    full_quadratic, full_linear = full.cost_terms(
+        lifted,
+        context,
+        state_reference,
+        action_reference,
+    )
+    structured_quadratic, structured_linear = structured.cost_terms(
+        lifted,
+        context,
+        state_reference,
+        action_reference,
+    )
+    torch.testing.assert_close(structured_quadratic, full_quadratic)
+    torch.testing.assert_close(structured_linear, full_linear)
+    assert structured.network[-1].out_features == 5
+    assert sum(p.numel() for p in structured.parameters()) < sum(
+        p.numel() for p in full.parameters()
+    )
+
+
+def test_structured_cost_has_bounded_multipliers_and_finite_gradients():
+    dtype = torch.float64
+    actor = StructuredKoopmanMPCActor(
+        torch.eye(4, dtype=dtype) * 0.9,
+        torch.ones(4, 2, dtype=dtype) * 0.05,
+        torch.eye(4, dtype=dtype),
+        horizon=3,
+        context_dim=2,
+        hidden_dims=(7,),
+        physical_quadratic_scale=torch.ones(4, dtype=dtype),
+        action_quadratic_scale=2.0,
+        structured_log_scale=math.log(2.0),
+        structured_tip_indices=(1, 2, 3),
+        action_low=-0.3,
+        action_high=0.3,
+        max_delta=0.01,
+        solver_iterations=10,
+    )
+    _randomize(actor, seed=1408)
+    lifted = torch.randn(6, 4, dtype=dtype)
+    context = torch.randn(6, 2, dtype=dtype)
+    state_reference = torch.randn(6, 4, dtype=dtype)
+    action_reference = torch.randn(6, 2, dtype=dtype)
+    quadratic, linear = actor.cost_terms(
+        lifted,
+        context,
+        state_reference,
+        action_reference,
+    )
+    state_q = quadratic[..., :4]
+    action_q = quadratic[..., 4:]
+    assert float(state_q[..., 1:].min()) >= 0.25 - 1e-12
+    assert float(state_q[..., 1:].max()) <= 4.0 + 1e-12
+    assert float(action_q.min()) >= 1.0 - 1e-12
+    assert float(action_q.max()) <= 4.0 + 1e-12
+    torch.testing.assert_close(
+        linear[..., :4],
+        -state_q * state_reference.unsqueeze(-2),
+    )
+    torch.testing.assert_close(
+        linear[..., 4:],
+        -action_q * action_reference.unsqueeze(-2),
+    )
+    # The structured cost map itself remains differentiable even when a
+    # particular box-QP test instance lands on a saturated active set.
+    loss = quadratic.mean() + 0.01 * linear.square().mean()
+    gradients = torch.autograd.grad(loss, tuple(actor.parameters()))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(float(gradient.abs().sum()) > 0 for gradient in gradients)

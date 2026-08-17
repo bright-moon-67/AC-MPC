@@ -15,7 +15,7 @@ from antmaze_ac.koopman.history_model import HistoryDeepKoopman
 
 from .critic import Critic
 from .history_koopman_mpc_policy import HistoryKoopmanMPCPolicy
-from .koopman_mpc_actor import KoopmanMPCActor
+from .koopman_mpc_actor import KoopmanMPCActor, StructuredKoopmanMPCActor
 
 
 PPO_ACTOR_NAMES = ("ppo_mlp", "ppo_kmpc")
@@ -304,6 +304,8 @@ def make_manisoft_ppo_policy(
     tip_weight: float = 1.0,
     max_delta: float | None = 0.001,
     normalized_delta_curvature: float = 0.0,
+    kmpc_cost_parameterization: str = "full",
+    structured_log_scale: float = math.log(2.0),
 ) -> tuple[StandardHistoryPPOPolicy | HistoryKoopmanMPCPolicy, dict]:
     """Build one of the two from-scratch PPO comparison policies."""
 
@@ -317,6 +319,12 @@ def make_manisoft_ppo_policy(
         raise ValueError("Action limit and initial standard deviation must be positive")
     if max_delta is not None and max_delta <= 0:
         raise ValueError("max_delta must be positive when configured")
+    if kmpc_cost_parameterization not in ("full", "structured"):
+        raise ValueError(
+            "kmpc_cost_parameterization must be 'full' or 'structured'"
+        )
+    if structured_log_scale <= 0:
+        raise ValueError("structured_log_scale must be positive")
     checkpoint = Path(koopman_checkpoint).expanduser().resolve()
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     architecture = payload.get("architecture", {})
@@ -378,7 +386,16 @@ def make_manisoft_ppo_policy(
     # Tip-only initialization: the only non-negligible state penalty is the
     # three-dimensional active-goal error available at deployment time.
     physical_quadratic_scale[tip_indices] = float(tip_weight)
-    actor = KoopmanMPCActor(
+    actor_class = (
+        StructuredKoopmanMPCActor
+        if kmpc_cost_parameterization == "structured"
+        else KoopmanMPCActor
+    )
+    actor_kwargs = {}
+    if kmpc_cost_parameterization == "structured":
+        actor_kwargs["structured_log_scale"] = structured_log_scale
+        actor_kwargs["structured_tip_indices"] = (30, 31, 32)
+    actor = actor_class(
         koopman.A,
         koopman.B,
         koopman.C[: koopman.state_dim],
@@ -395,6 +412,7 @@ def make_manisoft_ppo_policy(
         max_delta=max_delta,
         normalized_delta_curvature=normalized_delta_curvature,
         solver_iterations=solver_iterations,
+        **actor_kwargs,
     )
     critic = Critic(
         koopman.lifted_dim + context_dim,
@@ -411,7 +429,11 @@ def make_manisoft_ppo_policy(
         waypoint_count=waypoint_count,
         log_std_init=log_std_init,
     )
-    policy.cost_initialization = "active_waypoint_tip_only_v1"
+    policy.cost_initialization = (
+        "structured_reference_weights_v1"
+        if kmpc_cost_parameterization == "structured"
+        else "active_waypoint_tip_only_v1"
+    )
     return policy.to(device), loaded_payload
 
 
@@ -452,6 +474,12 @@ def load_manisoft_ppo_checkpoint(
         ),
         normalized_delta_curvature=float(
             runtime.get("normalized_delta_curvature", 0.0)
+        ),
+        kmpc_cost_parameterization=str(
+            runtime.get("kmpc_cost_parameterization") or "full"
+        ),
+        structured_log_scale=float(
+            runtime.get("structured_log_scale") or math.log(2.0)
         ),
     )
     policy.load_state_dict(payload["policy"])

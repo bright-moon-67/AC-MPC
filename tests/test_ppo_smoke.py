@@ -3,6 +3,7 @@ import numpy as np
 import torch
 
 from antmaze_ac.envs.delta_action_wrapper import DeltaActionWrapper
+from antmaze_ac.envs.process_vector_env import ProcessVectorEnv
 from antmaze_ac.rl.delta_policy import DeltaPolicy
 from antmaze_ac.rl.ppo import (
     collect_rollout,
@@ -136,3 +137,36 @@ def test_vector_rollout_requires_divisible_transition_count():
         )
     for env in envs:
         env.close()
+
+
+def test_process_vector_rollout_matches_vector_contract():
+    torch.manual_seed(17)
+    envs = ProcessVectorEnv(
+        [lambda: DeltaActionWrapper(ShortEnv()) for _ in range(4)]
+    )
+    envs.reset([17, 18, 19, 20])
+    policy = DeltaPolicy(
+        5,
+        2,
+        torch.zeros(5),
+        torch.ones(5),
+        hidden_dims=(8, 8),
+        log_std_init=0.0,
+        activation="relu",
+    )
+    try:
+        rollout = collect_vector_rollout(
+            envs,
+            policy,
+            steps=40,
+            gamma=0.99,
+            gae_lambda=0.95,
+            device=torch.device("cpu"),
+        )
+        assert rollout.observations.shape == (40, 5)
+        assert rollout.actions.shape == (40, 2)
+        assert len(rollout.episode_returns) == 8
+        assert np.all(rollout.episode_lengths == 5)
+        assert np.all(envs.episode_lengths == 0)
+    finally:
+        envs.close()

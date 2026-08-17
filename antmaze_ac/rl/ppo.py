@@ -149,7 +149,9 @@ def collect_vector_rollout(
 
     Environments are stepped independently and reset explicitly. This keeps
     each DeltaActionWrapper's previous action isolated while batching the
-    expensive actor and DARE inference across environments.
+    expensive actor and DARE inference across environments. ``envs`` may also
+    be a process-vector pool exposing batched ``step`` and ``reset_indices``
+    methods; in that case physics simulation executes concurrently.
     """
 
     environment_count = len(envs)
@@ -160,17 +162,33 @@ def collect_vector_rollout(
             f"steps={steps} must be divisible by num_envs={environment_count}"
         )
     time_steps = steps // environment_count
-    current_observations = []
-    episode_returns = []
-    episode_lengths = []
-    for env in envs:
-        if not hasattr(env, "_ppo_observation"):
-            observation, _ = env.reset()
-        else:
-            observation = env._ppo_observation
-        current_observations.append(np.asarray(observation, dtype=np.float32))
-        episode_returns.append(float(getattr(env, "_ppo_episode_return", 0.0)))
-        episode_lengths.append(int(getattr(env, "_ppo_episode_length", 0)))
+    process_pool = hasattr(envs, "reset_indices") and hasattr(
+        envs, "current_observations"
+    )
+    if process_pool:
+        if envs.current_observations is None:
+            raise RuntimeError("Process vector environments must be reset first")
+        current_observations = list(envs.current_observations)
+        episode_returns = envs.episode_returns.tolist()
+        episode_lengths = envs.episode_lengths.tolist()
+    else:
+        current_observations = []
+        episode_returns = []
+        episode_lengths = []
+        for env in envs:
+            if not hasattr(env, "_ppo_observation"):
+                observation, _ = env.reset()
+            else:
+                observation = env._ppo_observation
+            current_observations.append(
+                np.asarray(observation, dtype=np.float32)
+            )
+            episode_returns.append(
+                float(getattr(env, "_ppo_episode_return", 0.0))
+            )
+            episode_lengths.append(
+                int(getattr(env, "_ppo_episode_length", 0))
+            )
 
     observations, actions, log_probs, values = [], [], [], []
     rewards, dones, saturation, action_bound = [], [], [], []
@@ -202,15 +220,22 @@ def collect_vector_rollout(
             solver_retry = np.zeros(environment_count, dtype=np.float32)
             solver_fallback = np.zeros(environment_count, dtype=np.float32)
         action_array = action.detach().cpu().numpy()
-        next_observations = []
+        next_observations: list[np.ndarray | None] = [None] * environment_count
         step_rewards, step_dones, step_saturation, step_action_bound = [], [], [], []
         step_action_abs_mean, step_delta_action_l2 = [], []
         step_delta_action_abs_max = []
         step_distances = []
-        for index, env in enumerate(envs):
-            next_observation, reward, terminated, truncated, info = env.step(
-                action_array[index]
-            )
+        step_results = (
+            envs.step(action_array)
+            if process_pool
+            else [
+                env.step(action_array[index])
+                for index, env in enumerate(envs)
+            ]
+        )
+        reset_indices = []
+        for index, result in enumerate(step_results):
+            next_observation, reward, terminated, truncated, info = result
             done = bool(terminated or truncated)
             episode_returns[index] += float(reward)
             episode_lengths[index] += 1
@@ -225,9 +250,12 @@ def collect_vector_rollout(
                 )
                 episode_returns[index] = 0.0
                 episode_lengths[index] = 0
-                next_observation, _ = env.reset()
-            next_observations.append(
-                np.asarray(next_observation, dtype=np.float32)
+                if process_pool:
+                    reset_indices.append(index)
+                else:
+                    next_observation, _ = envs[index].reset()
+            next_observations[index] = np.asarray(
+                next_observation, dtype=np.float32
             )
             step_rewards.append(float(reward))
             step_dones.append(float(done))
@@ -249,6 +277,14 @@ def collect_vector_rollout(
             step_delta_action_l2.append(float(np.linalg.norm(delta)))
             step_delta_action_abs_max.append(float(np.max(np.abs(delta))))
             step_distances.append(float(info.get("distance", np.nan)))
+        if process_pool and reset_indices:
+            reset_results = envs.reset_indices(reset_indices)
+            for index, (reset_observation, _) in reset_results.items():
+                next_observations[index] = np.asarray(
+                    reset_observation, dtype=np.float32
+                )
+        if any(observation is None for observation in next_observations):
+            raise RuntimeError("Vector rollout produced a missing observation")
         observations.append(observation_tensor)
         actions.append(action)
         log_probs.append(log_prob)
@@ -265,10 +301,15 @@ def collect_vector_rollout(
         dare_fallback.append(solver_fallback)
         current_observations = next_observations
 
-    for index, env in enumerate(envs):
-        env._ppo_observation = current_observations[index]
-        env._ppo_episode_return = episode_returns[index]
-        env._ppo_episode_length = episode_lengths[index]
+    if process_pool:
+        envs.current_observations = current_observations
+        envs.episode_returns = np.asarray(episode_returns, dtype=np.float64)
+        envs.episode_lengths = np.asarray(episode_lengths, dtype=np.int64)
+    else:
+        for index, env in enumerate(envs):
+            env._ppo_observation = current_observations[index]
+            env._ppo_episode_return = episode_returns[index]
+            env._ppo_episode_length = episode_lengths[index]
 
     next_observation_tensor = torch.as_tensor(
         np.stack(current_observations),

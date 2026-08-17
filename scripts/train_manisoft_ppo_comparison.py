@@ -11,6 +11,7 @@ actor and differentiable finite-horizon Koopman MPC layer. Neither uses BC.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import json
 import math
 import os
@@ -28,6 +29,7 @@ from antmaze_ac.envs.manisoft_tracking_env import (
     ManiSoftThreeWaypointTrackingEnv,
     load_manisoft_waypoint_reference_bank,
 )
+from antmaze_ac.envs.process_vector_env import ProcessVectorEnv
 from antmaze_ac.koopman.checkpoint import sha256
 from antmaze_ac.rl.manisoft_ppo_policies import (
     PPO_ACTOR_NAMES,
@@ -40,7 +42,7 @@ TIP_INDICES = (30, 31, 32)
 METHOD = "manisoft_ppo_from_scratch"
 FORMAT_VERSION = 1
 TRAINING_SPEC_VERSION = (
-    "manisoft_three_waypoint_reward_5mm_normalized_delta_kmpc_v4"
+    "manisoft_three_waypoint_reward_5mm_normalized_delta_kmpc_v5"
 )
 
 
@@ -126,6 +128,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-quadratic-scale", type=float, default=1.0)
     parser.add_argument("--tip-weight", type=float, default=1.0)
     parser.add_argument(
+        "--kmpc-cost-parameterization",
+        choices=("full", "structured"),
+        default="full",
+        help=(
+            "PPO-KMPC cost map: 'full' learns every horizon cost term; "
+            "'structured' learns only five bounded positive reference-cost "
+            "multipliers."
+        ),
+    )
+    parser.add_argument(
+        "--structured-log-scale",
+        type=float,
+        default=math.log(2.0),
+        help=(
+            "Log-range of each structured cost multiplier. The default "
+            "constrains individual multipliers to [0.5, 2.0]."
+        ),
+    )
+    parser.add_argument(
         "--normalized-delta-curvature",
         type=float,
         default=0.0,
@@ -138,6 +159,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--num-envs", type=int, default=8)
+    parser.add_argument(
+        "--parallel-env-processes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run each vector environment in a spawned CPU process while "
+            "keeping policy inference GPU-batched."
+        ),
+    )
     parser.add_argument("--minibatch-size", type=int, default=512)
     parser.add_argument("--update-epochs", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-5)
@@ -205,6 +235,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rollout-steps must be divisible by --num-envs")
     if args.total_timesteps % args.num_envs:
         raise ValueError("--total-timesteps must be divisible by --num-envs")
+    if args.parallel_env_processes and args.num_envs < 2:
+        raise ValueError("--parallel-env-processes requires --num-envs >= 2")
     if not 2 <= args.minibatch_size <= args.rollout_steps:
         raise ValueError("--minibatch-size must lie in [2, rollout-steps]")
     positive = (
@@ -214,6 +246,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.linear_scale,
         args.action_quadratic_scale,
         args.tip_weight,
+        args.structured_log_scale,
         args.learning_rate,
         args.std_learning_rate,
         args.gamma,
@@ -243,6 +276,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.actor != "ppo_kmpc" and args.normalized_delta_curvature:
         raise ValueError(
             "--normalized-delta-curvature is only valid for PPO-KMPC"
+        )
+    if args.actor != "ppo_kmpc" and args.kmpc_cost_parameterization != "full":
+        raise ValueError(
+            "--kmpc-cost-parameterization is only valid for PPO-KMPC"
         )
     if args.actor_learning_rate is not None and args.actor_learning_rate <= 0:
         raise ValueError("--actor-learning-rate must be positive")
@@ -294,11 +331,16 @@ def main() -> None:
         raise ValueError("Waypoint bank was certified with another scenario")
     waypoint_tips = waypoint_bank.states[:, :, np.asarray(TIP_INDICES)]
 
-    actor_learning_rate = float(
-        args.actor_learning_rate
-        if args.actor_learning_rate is not None
-        else (3e-4 if args.actor == "ppo_mlp" else 3e-8)
-    )
+    if args.actor_learning_rate is not None:
+        actor_learning_rate = float(args.actor_learning_rate)
+    elif args.actor == "ppo_mlp":
+        actor_learning_rate = 3e-4
+    elif args.kmpc_cost_parameterization == "structured":
+        # A real-environment one-update smoke test kept KL at 8.2e-4 with
+        # this rate.  The legacy full map remains far more sensitive.
+        actor_learning_rate = 1e-5
+    else:
+        actor_learning_rate = 3e-8
     policy, koopman_payload = make_manisoft_ppo_policy(
         args.actor,
         koopman_path,
@@ -316,6 +358,8 @@ def main() -> None:
         tip_weight=args.tip_weight,
         max_delta=(args.max_delta if args.actor == "ppo_kmpc" else None),
         normalized_delta_curvature=args.normalized_delta_curvature,
+        kmpc_cost_parameterization=args.kmpc_cost_parameterization,
+        structured_log_scale=args.structured_log_scale,
     )
     actor_parameters = [p for p in policy.actor.parameters() if p.requires_grad]
     critic_parameters = [p for p in policy.critic.parameters() if p.requires_grad]
@@ -362,6 +406,17 @@ def main() -> None:
         "action_quadratic_scale": args.action_quadratic_scale,
         "tip_weight": args.tip_weight,
         "normalized_delta_curvature": args.normalized_delta_curvature,
+        "kmpc_cost_parameterization": (
+            None
+            if args.actor == "ppo_mlp"
+            else args.kmpc_cost_parameterization
+        ),
+        "structured_log_scale": (
+            None
+            if args.actor == "ppo_mlp"
+            or args.kmpc_cost_parameterization != "structured"
+            else args.structured_log_scale
+        ),
         "solver": (
             None
             if args.actor == "ppo_mlp"
@@ -387,7 +442,7 @@ def main() -> None:
         "cost_initialization": (
             None
             if args.actor == "ppo_mlp"
-            else "active_waypoint_tip_only_v1"
+            else policy.cost_initialization
         ),
     }
     if args.actor == "ppo_mlp":
@@ -426,8 +481,9 @@ def main() -> None:
             "critic; no behavior cloning"
             if args.actor == "ppo_mlp"
             else (
-                "random cost-map actor and MLP critic; frozen pretrained "
-                "history Koopman encoder and A/B/C; no behavior cloning"
+                f"random {args.kmpc_cost_parameterization} cost-map actor "
+                "and MLP critic; frozen pretrained history Koopman encoder "
+                "and A/B/C; no behavior cloning"
             )
         ),
         "bc_checkpoint": None,
@@ -508,30 +564,45 @@ def main() -> None:
             "trainable_log_std_parameters": (
                 policy.log_std.numel() if policy.log_std.requires_grad else 0
             ),
+            "environment_execution": (
+                "spawn_process_vector_v1"
+                if args.parallel_env_processes
+                else "in_process_sequential_vector_v1"
+            ),
         },
     )
 
     state_stats = koopman_payload["normalizers"]["state"]
-    envs = [
-        _make_env(
-            scenario=scenario,
-            waypoint_tips=waypoint_tips,
-            episode_steps=args.episode_steps,
-            absolute_action_limit=args.absolute_action_limit,
-            progress_reward_scale=args.progress_reward_scale,
-            history_steps=policy.history_steps,
-            state_mean=np.asarray(state_stats["mean"], dtype=np.float32),
-            state_std=np.asarray(state_stats["std"], dtype=np.float32),
-            max_delta=(
-                args.max_delta if args.actor == "ppo_kmpc" else None
-            ),
+    environment_kwargs = {
+        "scenario": scenario,
+        "waypoint_tips": waypoint_tips,
+        "episode_steps": args.episode_steps,
+        "absolute_action_limit": args.absolute_action_limit,
+        "progress_reward_scale": args.progress_reward_scale,
+        "history_steps": policy.history_steps,
+        "state_mean": np.asarray(state_stats["mean"], dtype=np.float32),
+        "state_std": np.asarray(state_stats["std"], dtype=np.float32),
+        "max_delta": (
+            args.max_delta if args.actor == "ppo_kmpc" else None
+        ),
+    }
+    if args.parallel_env_processes:
+        envs = ProcessVectorEnv(
+            [
+                partial(_make_env, **environment_kwargs)
+                for _ in range(args.num_envs)
+            ]
         )
-        for _ in range(args.num_envs)
-    ]
-    for index, env in enumerate(envs):
-        observation, _ = env.reset(seed=args.seed + index)
-        env._ppo_observation = observation
-        env.action_space.seed(args.seed + index)
+        envs.reset([args.seed + index for index in range(args.num_envs)])
+    else:
+        envs = [
+            _make_env(**environment_kwargs)
+            for _ in range(args.num_envs)
+        ]
+        for index, env in enumerate(envs):
+            observation, _ = env.reset(seed=args.seed + index)
+            env._ppo_observation = observation
+            env.action_space.seed(args.seed + index)
 
     def checkpoint_payload(elapsed_seconds: float) -> dict:
         return {
@@ -827,8 +898,11 @@ def main() -> None:
         )
         raise
     finally:
-        for env in envs:
-            env.close()
+        if isinstance(envs, ProcessVectorEnv):
+            envs.close()
+        else:
+            for env in envs:
+                env.close()
 
 
 if __name__ == "__main__":

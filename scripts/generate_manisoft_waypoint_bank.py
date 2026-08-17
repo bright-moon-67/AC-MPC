@@ -6,6 +6,12 @@ The three waypoints use increasing action scales 0.25/0.50/0.75.  Every
 waypoint is simulated twice in fresh environments and is accepted only when
 both runs hold the tip within the configured position/speed tolerances for the
 entire final certification window.
+
+By default the action directions carry a small vertical (z) weight (0.25 vs
+1.0 on x/y), so the certified triplets lie almost entirely in the horizontal
+plane.  Pass ``--z-variation-probability`` and ``--z-action-weight`` to make a
+fraction of triplets rise or fall out of that plane along the z axis, which
+adds vertical diversity while keeping the radial three-waypoint structure.
 """
 
 from __future__ import annotations
@@ -41,10 +47,16 @@ def spatial_basis() -> np.ndarray:
     )
 
 
-def sample_terminal_action(rng: np.random.Generator, peak: float) -> np.ndarray:
+def sample_terminal_action(
+    rng: np.random.Generator, peak: float, *, z_weight: float = 0.25
+) -> np.ndarray:
     coefficients = rng.normal(size=ACTION_SHAPE)
     coefficients *= MODE_WEIGHTS[:, None]
-    coefficients *= AXIS_WEIGHTS[None, :]
+    axis_weights = np.asarray(
+        (AXIS_WEIGHTS[0], AXIS_WEIGHTS[1], float(z_weight)),
+        dtype=np.float64,
+    )
+    coefficients *= axis_weights[None, :]
     action = spatial_basis() @ coefficients
     raw_peak = float(np.max(np.abs(action)))
     if raw_peak <= 0:
@@ -121,6 +133,26 @@ def parse_args() -> argparse.Namespace:
         metavar=("G1_MIN", "G1_MAX", "G2_MIN", "G2_MAX", "G3_MIN", "G3_MAX"),
     )
     parser.add_argument("--min-adjacent-distance-cm", type=float, default=2.5)
+    parser.add_argument(
+        "--z-variation-probability",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of triplets whose sampled action direction gets an "
+            "enhanced vertical (z) component, lifting the three waypoints "
+            "out of the original horizontal plane."
+        ),
+    )
+    parser.add_argument(
+        "--z-action-weight",
+        type=float,
+        default=0.6,
+        help=(
+            "z-axis action coefficient weight used for z-variant triplets. "
+            "0.25 reproduces the original near-horizontal plane; larger "
+            "values add a stronger vertical tip displacement."
+        ),
+    )
     args = parser.parse_args()
     if min(args.triplets, args.max_attempts, args.stable_steps) < 1:
         parser.error("triplets, max-attempts and stable-steps must be positive")
@@ -147,6 +179,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("every distance range must have 0 < minimum < maximum")
     if round(args.hold_seconds * args.control_hz) < args.stable_steps:
         parser.error("hold-seconds is shorter than the certification window")
+    if not 0.0 <= args.z_variation_probability <= 1.0:
+        parser.error("z-variation-probability must be in [0, 1]")
+    if args.z_action_weight <= 0:
+        parser.error("z-action-weight must be positive")
     return args
 
 
@@ -291,7 +327,16 @@ def main() -> None:
     for attempt in range(args.max_attempts):
         if len(triplets) >= args.triplets:
             break
-        base_action = sample_terminal_action(rng, args.base_action_peak).reshape(-1)
+        use_z_variant = (
+            args.z_variation_probability > 0.0
+            and rng.random() < args.z_variation_probability
+        )
+        z_weight = (
+            args.z_action_weight if use_z_variant else float(AXIS_WEIGHTS[2])
+        )
+        base_action = sample_terminal_action(
+            rng, args.base_action_peak, z_weight=z_weight
+        ).reshape(-1)
         generated: list[Certificate] = []
         failed_reason = None
         for index, scale in enumerate(scales):
@@ -370,6 +415,8 @@ def main() -> None:
                 "index": triplet_index,
                 "source_attempt": attempt,
                 "base_action": base_action.tolist(),
+                "z_variant": bool(use_z_variant),
+                "z_action_weight": float(z_weight),
                 "waypoints": waypoint_rows,
             }
         )
@@ -399,6 +446,7 @@ def main() -> None:
         "scenario": str(scenario),
         "scenario_sha256": _sha256(scenario),
         "triplet_count": len(triplets),
+        "z_variant_count": sum(1 for t in triplets if t["z_variant"]),
         "waypoint_count": 3,
         "state_dim": 45,
         "action_dim": 18,
@@ -414,6 +462,10 @@ def main() -> None:
             "replay_tip_tolerance_m": args.replay_tip_tolerance,
             "distance_ranges_cm": np.asarray(args.distance_ranges_cm).reshape(3, 2).tolist(),
             "min_adjacent_distance_cm": args.min_adjacent_distance_cm,
+            "z_variation": {
+                "probability": args.z_variation_probability,
+                "action_weight": args.z_action_weight,
+            },
         },
         "generator_arguments": {
             key: str(value) if isinstance(value, Path) else value

@@ -77,7 +77,7 @@ def _checkpoint(tmp_path):
     return path
 
 
-def _make(name, checkpoint):
+def _make(name, checkpoint, *, cost_parameterization="full"):
     return make_manisoft_ppo_policy(
         name,
         checkpoint,
@@ -86,6 +86,7 @@ def _make(name, checkpoint):
         kmpc_hidden_dims=(12,),
         horizon=2,
         solver_iterations=4,
+        kmpc_cost_parameterization=cost_parameterization,
     )[0]
 
 
@@ -296,10 +297,49 @@ def test_kmpc_rollout_uses_same_bounded_normalized_delta_for_ppo_and_env(
     env.close()
 
 
+def test_structured_kmpc_policy_reduces_cost_map_and_backpropagates(tmp_path):
+    checkpoint = _checkpoint(tmp_path)
+    full = _make("ppo_kmpc", checkpoint)
+    structured = _make(
+        "ppo_kmpc",
+        checkpoint,
+        cost_parameterization="structured",
+    )
+    observations = torch.zeros(5, structured.observation_dim)
+    observations[:, -3] = 1.0
+    full_output = full(observations)
+    structured_output = structured(observations)
+    torch.testing.assert_close(structured_output.mean, full_output.mean)
+    assert structured.actor.network[-1].out_features == 5
+    assert sum(p.numel() for p in structured.actor.parameters()) < sum(
+        p.numel() for p in full.actor.parameters()
+    )
+    actions = structured_output.distribution.sample().detach()
+    log_prob, entropy, values, _ = structured.evaluate_actions(
+        observations,
+        actions,
+    )
+    (-log_prob.mean() - 1e-4 * entropy.mean() + values.square().mean()).backward()
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in structured.actor.parameters()
+    )
+    assert structured.cost_initialization == "structured_reference_weights_v1"
+
+
 def test_comparison_checkpoint_round_trip(tmp_path):
     koopman_path = _checkpoint(tmp_path)
-    for actor_name in ("ppo_mlp", "ppo_kmpc"):
-        policy = _make(actor_name, koopman_path)
+    cases = (
+        ("ppo_mlp", "full"),
+        ("ppo_kmpc", "full"),
+        ("ppo_kmpc", "structured"),
+    )
+    for actor_name, cost_parameterization in cases:
+        policy = _make(
+            actor_name,
+            koopman_path,
+            cost_parameterization=cost_parameterization,
+        )
         observations = torch.zeros(2, policy.observation_dim)
         observations[:, -3] = 1.0
         expected = policy(observations).mean.detach()
@@ -317,8 +357,10 @@ def test_comparison_checkpoint_round_trip(tmp_path):
             "action_quadratic_scale": 1.0,
             "tip_weight": 1.0,
             "max_delta": 0.001 if actor_name == "ppo_kmpc" else None,
+            "kmpc_cost_parameterization": cost_parameterization,
+            "structured_log_scale": math.log(2.0),
         }
-        path = tmp_path / f"{actor_name}.pt"
+        path = tmp_path / f"{actor_name}_{cost_parameterization}.pt"
         torch.save(
             {
                 "method": "manisoft_ppo_from_scratch",

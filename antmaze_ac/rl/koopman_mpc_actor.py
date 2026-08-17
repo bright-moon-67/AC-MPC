@@ -648,3 +648,121 @@ class KoopmanMPCActor(nn.Module):
             normalized_delta_sequence=normalized_delta_sequence,
             previous_action=previous_output,
         )
+
+
+class StructuredKoopmanMPCActor(KoopmanMPCActor):
+    """Low-dimensional reference-cost actor for PPO-KMPC.
+
+    The policy learns only five bounded positive multipliers: three tip-axis
+    weights, one shared action weight, and one terminal tip multiplier.  The
+    signed linear cost is fixed by the standard reference-tracking identities
+    ``p_x=-Q*x_ref`` and ``p_u=-R*u_ref``.  This prevents PPO from independently
+    rewriting every stage/state/action linear term while preserving the same
+    zero-output tracking controller as :class:`KoopmanMPCActor`.
+    """
+
+    STRUCTURED_OUTPUT_DIM = 5
+
+    def __init__(
+        self,
+        *args,
+        structured_log_scale: float = math.log(2.0),
+        structured_tip_indices: tuple[int, int, int] = (30, 31, 32),
+        **kwargs,
+    ) -> None:
+        if structured_log_scale <= 0:
+            raise ValueError("structured_log_scale must be positive")
+        super().__init__(*args, **kwargs)
+        tip_indices = torch.as_tensor(
+            structured_tip_indices,
+            dtype=torch.long,
+            device=self.A.device,
+        )
+        if tip_indices.shape != (3,):
+            raise ValueError("structured_tip_indices must contain three indices")
+        if bool((tip_indices < 0).any()) or bool(
+            (tip_indices >= self.physical_dim).any()
+        ):
+            raise ValueError("structured_tip_indices are outside physical state")
+        self.structured_log_scale = float(structured_log_scale)
+        self.register_buffer(
+            "structured_tip_indices",
+            tip_indices,
+            persistent=False,
+        )
+        self.network = _mlp(
+            self.lifted_dim + self.context_dim,
+            kwargs.get("hidden_dims", (256, 256)),
+            self.STRUCTURED_OUTPUT_DIM,
+            kwargs.get("activation", "gelu"),
+        ).to(dtype=self.A.dtype, device=self.A.device)
+        final = self.network[-1]
+        if not isinstance(final, nn.Linear):
+            raise TypeError("Expected a linear final structured cost layer")
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+        self.cost_parameterization = "structured_reference_weights_v1"
+
+    def cost_terms(
+        self,
+        lifted_state: torch.Tensor,
+        context: torch.Tensor | None = None,
+        physical_reference: torch.Tensor | None = None,
+        action_reference: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if lifted_state.shape[-1] != self.lifted_dim:
+            raise ValueError("Wrong lifted-state dimension")
+        batch_shape = lifted_state.shape[:-1]
+        network_input = lifted_state
+        if self.context_dim:
+            if context is None or context.shape[-1] != self.context_dim:
+                raise ValueError("Wrong or missing actor context dimension")
+            if context.shape[:-1] != batch_shape:
+                raise ValueError("Actor context batch shape does not match lifted state")
+            network_input = torch.cat((lifted_state, context), dim=-1)
+        elif context is not None:
+            raise ValueError("This actor was constructed without context")
+
+        raw = self.network(network_input)
+        log_multipliers = self.structured_log_scale * torch.tanh(raw)
+        tip_log = log_multipliers[..., :3]
+        action_multiplier = torch.exp(log_multipliers[..., 3])
+        terminal_log = log_multipliers[..., 4]
+
+        state_log = lifted_state.new_zeros(
+            *batch_shape,
+            self.horizon,
+            self.physical_dim,
+        )
+        state_log[..., :, self.structured_tip_indices] = tip_log.unsqueeze(-2)
+        state_log[..., -1, self.structured_tip_indices] = (
+            tip_log + terminal_log.unsqueeze(-1)
+        )
+        q_state = self.physical_quadratic_scale * torch.exp(state_log)
+        q_action = self.action_quadratic_scale * action_multiplier[..., None, None]
+        q_action = q_action.expand(
+            *batch_shape,
+            self.horizon,
+            self.action_dim,
+        )
+        quadratic = torch.cat((q_state, q_action), dim=-1)
+
+        linear_state = torch.zeros_like(q_state)
+        linear_action = torch.zeros_like(q_action)
+        if physical_reference is not None:
+            expected_reference = (*batch_shape, self.physical_dim)
+            if physical_reference.shape != expected_reference:
+                raise ValueError(
+                    "physical_reference must have shape "
+                    f"{expected_reference}, got {tuple(physical_reference.shape)}"
+                )
+            linear_state = -q_state * physical_reference.unsqueeze(-2)
+        if action_reference is not None:
+            expected_action_reference = (*batch_shape, self.action_dim)
+            if action_reference.shape != expected_action_reference:
+                raise ValueError(
+                    "action_reference must have shape "
+                    f"{expected_action_reference}, got {tuple(action_reference.shape)}"
+                )
+            linear_action = -q_action * action_reference.unsqueeze(-2)
+        return quadratic, torch.cat((linear_state, linear_action), dim=-1)
