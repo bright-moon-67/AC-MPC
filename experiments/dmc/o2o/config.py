@@ -178,6 +178,15 @@ _CAL_RLPD = dict(
     env_workers=5,
 )
 
+# Capacity-matched structured RLPD variants.  Their critic/replay/optimizer
+# recipe remains RLPD; only the AC-KMPC controller torso is widened to the
+# same two 1024-wide hidden layers used by Cal-QL.
+_CAL_RLPD_KMPC_WIDE = {
+    **{key: value for key, value in _CAL_RLPD.items() if key != "profile"},
+    "controller_hidden_dim": 1024,
+    "controller_hidden_layers": 2,
+}
+
 METHOD_SPECS: dict[str, MethodSpec] = {
     "Cal-QL-Raw": MethodSpec(name="Cal-QL-Raw", **_CALQL_RAW),
     "Cal-QL-AC-KMPC": MethodSpec(
@@ -212,6 +221,22 @@ METHOD_SPECS: dict[str, MethodSpec] = {
 # legacy matrix/aggregate contract remains unchanged.  They are launched and
 # stopped independently and may have their own execution horizon.
 STANDALONE_METHOD_SPECS: dict[str, MethodSpec] = {
+    "Cal-RLPD-KMPC": MethodSpec(
+        name="Cal-RLPD-KMPC",
+        representation="koopman_lifted",
+        actor="ac_kmpc",
+        mpve_scope="off",
+        profile="calql_regularized_rlpd_cal_kmpc_wide_v1",
+        **_CAL_RLPD_KMPC_WIDE,
+    ),
+    "Cal-RLPD-MPVE": MethodSpec(
+        name="Cal-RLPD-MPVE",
+        representation="koopman_lifted",
+        actor="ac_kmpc",
+        mpve_scope="both",
+        profile="calql_regularized_rlpd_cal_kmpc_mpve_wide_v1",
+        **_CAL_RLPD_KMPC_WIDE,
+    ),
     "Cal-QL-MPVE": MethodSpec(
         name="Cal-QL-MPVE",
         representation="koopman_lifted",
