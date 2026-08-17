@@ -131,7 +131,11 @@ def _config(method: str, seed: int) -> O2OConfig:
         seed=seed,
         device="cpu",
         hidden_dim=12,
-        critic_hidden_layers=2 if method == "Cal-QL-Raw" else 1,
+        critic_hidden_layers=(
+            2
+            if O2OConfig(method=method).network_profile == "exorl_cql"
+            else 1
+        ),
         critic_ensemble_size=2,
         target_critic_subset=2,
         offline_updates=1,
@@ -683,7 +687,7 @@ def test_formal_aggregate_requires_full_matrix_and_identical_seed_sets(
         )
         for seed in (11, 12)
     ]
-    with pytest.raises(ValueError, match="complete five-method matrix"):
+    with pytest.raises(ValueError, match="complete method matrix"):
         aggregate_runs(partial)
 
     run_dirs = []

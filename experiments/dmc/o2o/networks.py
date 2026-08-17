@@ -278,11 +278,15 @@ class KMPCTanhGaussianActor(nn.Module):
         horizon: int = 20,
         solver_iterations: int = 20,
         hidden_dim: int = 128,
+        log_std_min: float = LOG_STD_MIN,
     ) -> None:
         super().__init__()
         self.koopman = koopman
         self.horizon = int(horizon)
         self.solver_iterations = int(solver_iterations)
+        self.log_std_min = float(log_std_min)
+        if not math.isfinite(self.log_std_min) or self.log_std_min >= LOG_STD_MAX:
+            raise ValueError("KMPC log-std lower bound is invalid")
         physical_dim = koopman.state_dim
         action_dim = koopman.action_dim
         output_dim = 2 * horizon * (physical_dim + action_dim)
@@ -355,7 +359,7 @@ class KMPCTanhGaussianActor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         plan = self.plan(lifted_state)
         location = atanh_clipped(plan[..., 0, :])
-        log_std = self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).expand_as(location)
+        log_std = self.log_std.clamp(self.log_std_min, LOG_STD_MAX).expand_as(location)
         return location, log_std, plan
 
     def sample(
@@ -502,6 +506,11 @@ def build_actor(
             horizon=kmpc_horizon,
             solver_iterations=kmpc_solver_iterations,
             hidden_dim=controller_hidden_dim,
+            log_std_min=(
+                EXORL_CQL_LOG_STD_MIN
+                if network_profile == "exorl_cql"
+                else LOG_STD_MIN
+            ),
         )
     if koopman is not None:
         raise ValueError("Raw MLP actor must not receive a Koopman model")

@@ -712,7 +712,7 @@ def aggregate_runs(
         grouped[str(run["method"])].append(run)
     if require_complete and set(grouped) != set(METHODS):
         raise ValueError(
-            "Formal aggregation requires exactly the complete five-method matrix"
+            "Formal aggregation requires exactly the complete method matrix"
         )
     for run in runs:
         method = str(run["method"])

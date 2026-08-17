@@ -2,7 +2,7 @@
 
 The representation boundary lives here rather than in string matching spread
 through the trainer.  A ``*-Raw`` method is therefore structurally incapable
-of requesting Koopman features; only the two AC-KMPC methods may do so.
+of requesting Koopman features; only AC-KMPC methods may do so.
 """
 
 from __future__ import annotations
@@ -130,6 +130,12 @@ _RLPD_RAW = dict(
     num_envs=5,
     env_workers=5,
 )
+_CALQL_AC_KMPC = {
+    **_CALQL_RAW,
+    "representation": "koopman_lifted",
+    "actor": "ac_kmpc",
+    "profile": "exorl_cql_backbone_calql_ac_kmpc_lifted_v1",
+}
 _CAL_RLPD = dict(
     offline_pretraining=True,
     calql=True,
@@ -163,6 +169,9 @@ _CAL_RLPD = dict(
 
 METHOD_SPECS: dict[str, MethodSpec] = {
     "Cal-QL-Raw": MethodSpec(name="Cal-QL-Raw", **_CALQL_RAW),
+    "Cal-QL-AC-KMPC": MethodSpec(
+        name="Cal-QL-AC-KMPC", **_CALQL_AC_KMPC
+    ),
     "RLPD-Raw": MethodSpec(name="RLPD-Raw", **_RLPD_RAW),
     "Cal-RLPD-Raw": MethodSpec(
         name="Cal-RLPD-Raw",
@@ -249,6 +258,7 @@ class O2OConfig:
     eval_episodes: int = 10
     checkpoint_interval_updates: int = 10_000
     log_interval_updates: int = 1_000
+    offline_eval_interval_updates: int = 10_000
 
     def __post_init__(self) -> None:
         if self.method not in METHOD_SPECS:
@@ -298,6 +308,7 @@ class O2OConfig:
             "kmpc_solver_iterations", "controller_hidden_dim",
             "mpve_total_horizon", "eval_interval_online_steps", "eval_episodes",
             "checkpoint_interval_updates", "log_interval_updates",
+            "offline_eval_interval_updates",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -314,7 +325,9 @@ class O2OConfig:
         if self.env_workers > self.num_envs:
             raise ValueError("env_workers cannot exceed num_envs")
         if self.requires_completed_online_returns and self.num_envs != 1:
-            raise ValueError("Cal-QL-Raw requires num_envs=1 for exact online MC returns")
+            raise ValueError(
+                "Methods with exact online MC returns require num_envs=1"
+            )
         for name in ("online_steps", "online_warmup_steps", "eval_interval_online_steps"):
             if getattr(self, name) % self.num_envs:
                 raise ValueError(f"{name} must be divisible by num_envs")

@@ -914,6 +914,62 @@ def run(
 
     started = time.time()
     if config.requires_own_offline_pretraining:
+        def evaluate_offline_diagnostic_if_due() -> None:
+            """Persist an idempotent fixed-seed diagnostic at offline milestones."""
+
+            if (
+                offline_update <= 0
+                or offline_update >= config.offline_updates
+                or offline_update % config.offline_eval_interval_updates
+            ):
+                return
+            if _has_metric_row(
+                metrics_path,
+                phase="offline_diagnostic",
+                offline_update=offline_update,
+                online_step=0,
+            ):
+                return
+            # The checkpoint is authoritative before the relatively slow
+            # environment evaluation, so a crash resumes and reconstructs
+            # this exact missing diagnostic rather than skipping it.
+            atomic_torch_save(
+                latest_path,
+                _checkpoint_payload(
+                    config=config,
+                    dataset=dataset,
+                    koopman=koopman,
+                    observation_normalizer=observation_normalizer,
+                    learner=learner,
+                    replay=replay,
+                    generator=generator,
+                    phase="offline",
+                    offline_update=offline_update,
+                    online_step=0,
+                    online_episode=0,
+                    environment_protocol=environment_protocol,
+                    best_return=best_return,
+                    best_online_step=best_online_step,
+                    initialization=initialization,
+                    online_extension=extension_metadata,
+                ),
+            )
+            diagnostic = evaluate(
+                learner, episodes=config.eval_episodes, seed_base=9_100_000
+            )
+            _append_jsonl(
+                metrics_path,
+                {
+                    "phase": "offline_diagnostic",
+                    "offline_update": offline_update,
+                    "online_step": 0,
+                    **diagnostic,
+                },
+            )
+
+        # Covers a process interruption after the milestone checkpoint but
+        # before its diagnostic row was durably flushed.
+        evaluate_offline_diagnostic_if_due()
         while offline_update < config.offline_updates:
             batch_np = mark_offline(dataset.sample(config.batch_size, generator))
             metrics = learner.update(
@@ -958,6 +1014,7 @@ def run(
                         online_extension=extension_metadata,
                     ),
                 )
+            evaluate_offline_diagnostic_if_due()
         # The configured budget need not be a multiple of the periodic
         # checkpoint interval.  Make the completed offline learner/RNG state
         # authoritative before evaluating or exposing the fork artifact.
@@ -1320,6 +1377,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-workers", type=int)
     parser.add_argument("--cql-weight", type=float, default=0.01)
     parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument(
+        "--offline-eval-interval-updates", type=int, default=10_000
+    )
     parser.add_argument("--initialize-from-offline", type=Path)
     parser.add_argument("--extend-online-steps", type=int)
     parser.add_argument("--smoke", action="store_true")
@@ -1372,6 +1432,9 @@ def main() -> None:
         eval_episodes=2 if args.smoke else args.eval_episodes,
         checkpoint_interval_updates=10 if args.smoke else 10_000,
         log_interval_updates=5 if args.smoke else 1_000,
+        offline_eval_interval_updates=(
+            10 if args.smoke else args.offline_eval_interval_updates
+        ),
     )
     run(
         config,

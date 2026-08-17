@@ -1,4 +1,4 @@
-"""Resumable, fail-fast orchestration for the five-method O2O matrix.
+"""Resumable, fail-fast orchestration for the O2O method matrix.
 
 This module deliberately does not import the trainer, evaluator, learner, or
 environment.  Every expensive operation is an explicit child process whose
@@ -148,6 +148,7 @@ class MatrixSpec:
     device: str = "cuda"
     eval_device: str = "cpu"
     offline_updates: int = 500_000
+    offline_eval_interval_updates: int = 10_000
     online_steps: int = 50_000
     extend_online_steps: int | None = None
     # None preserves each MethodSpec's official/official-style defaults.
@@ -199,6 +200,12 @@ class MatrixSpec:
             raise ValueError("eval_device must be cpu, cuda, or auto")
         if self.max_parallel < 1:
             raise ValueError("max_parallel must be positive")
+        if (
+            isinstance(self.offline_eval_interval_updates, bool)
+            or not isinstance(self.offline_eval_interval_updates, int)
+            or self.offline_eval_interval_updates < 1
+        ):
+            raise ValueError("offline_eval_interval_updates must be positive")
         if self.online_steps < 5_000 or self.online_steps % 5_000:
             raise ValueError(
                 "Formal matrix online_steps must be a multiple of 5k and at least 5k"
@@ -228,6 +235,7 @@ class MatrixSpec:
             seed=seed,
             device=self.device,
             offline_updates=self.offline_updates,
+            offline_eval_interval_updates=self.offline_eval_interval_updates,
             online_steps=self.online_steps,
             cql_weight=self.cql_weight,
             eval_episodes=self.eval_episodes,
@@ -604,7 +612,7 @@ def _check_extension_run_identity(
             koopman=koopman,
         )
         raise ValueError(
-            "Matrix-wide extension requires a complete five-method source "
+            "Matrix-wide extension requires a complete method-matrix source "
             f"matrix; {run_dir} is {mode}"
         )
 
@@ -712,6 +720,8 @@ def _train_argv(
         spec.device,
         "--offline-updates",
         str(spec.offline_updates),
+        "--offline-eval-interval-updates",
+        str(spec.offline_eval_interval_updates),
         "--online-steps",
         str(spec.online_steps),
         "--cql-weight",
@@ -911,6 +921,7 @@ def _manifest(
         "device": spec.device,
         "eval_device": spec.eval_device,
         "offline_updates": spec.offline_updates,
+        "offline_eval_interval_updates": spec.offline_eval_interval_updates,
         "online_steps": spec.online_steps,
         "extend_online_steps": spec.extend_online_steps,
         "online_utd": spec.online_utd,
@@ -1028,6 +1039,7 @@ def _archive_completed_source_matrix_for_extension(
         "device",
         "eval_device",
         "offline_updates",
+        "offline_eval_interval_updates",
         "online_steps",
         "online_utd",
         "num_envs",
@@ -1656,6 +1668,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--eval-device", choices=("cpu", "cuda", "auto"), default="cpu"
     )
     parser.add_argument("--offline-updates", type=int, default=500_000)
+    parser.add_argument(
+        "--offline-eval-interval-updates", type=int, default=10_000
+    )
     parser.add_argument("--online-steps", type=int, default=50_000)
     parser.add_argument("--extend-online-steps", type=int)
     parser.add_argument("--online-utd", type=int)
@@ -1681,6 +1696,7 @@ def main() -> None:
         device=args.device,
         eval_device=args.eval_device,
         offline_updates=args.offline_updates,
+        offline_eval_interval_updates=args.offline_eval_interval_updates,
         online_steps=args.online_steps,
         extend_online_steps=args.extend_online_steps,
         online_utd=args.online_utd,
