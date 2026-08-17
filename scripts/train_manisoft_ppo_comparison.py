@@ -43,7 +43,7 @@ TIP_INDICES = (30, 31, 32)
 METHOD = "manisoft_ppo_from_scratch"
 FORMAT_VERSION = 1
 TRAINING_SPEC_VERSION = (
-    "manisoft_three_waypoint_reward_5mm_normalized_delta_kmpc_v5"
+    "manisoft_three_waypoint_reward_5mm_normalized_delta_kmpc_v6"
 )
 
 
@@ -143,12 +143,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tip-weight", type=float, default=1.0)
     parser.add_argument(
         "--kmpc-cost-parameterization",
-        choices=("full", "structured"),
+        choices=("full", "structured", "structured_v2"),
         default="full",
         help=(
             "PPO-KMPC cost map: 'full' learns every horizon cost term; "
             "'structured' learns only five bounded positive reference-cost "
-            "multipliers."
+            "multipliers; 'structured_v2' uses eleven compact grouped "
+            "outputs including positive delta curvature."
         ),
     )
     parser.add_argument(
@@ -158,6 +159,32 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Log-range of each structured cost multiplier. The default "
             "constrains individual multipliers to [0.5, 2.0]."
+        ),
+    )
+    parser.add_argument(
+        "--structured-shape-weight",
+        type=float,
+        default=1e-3,
+        help="Structured-v2 base weight for positions and rotation-6D.",
+    )
+    parser.add_argument(
+        "--structured-linear-velocity-weight",
+        type=float,
+        default=1e-2,
+        help="Structured-v2 base weight for all linear velocities.",
+    )
+    parser.add_argument(
+        "--structured-angular-velocity-weight",
+        type=float,
+        default=1e-2,
+        help="Structured-v2 base weight for all angular velocities.",
+    )
+    parser.add_argument(
+        "--structured-normalized-delta-weight",
+        type=float,
+        default=1e-4,
+        help=(
+            "Structured-v2 base curvature on normalized action increments."
         ),
     )
     parser.add_argument(
@@ -186,7 +213,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "Enable the learned final-tip multiplier. Disabling it keeps the "
-            "fifth output head but fixes its multiplier to one."
+            "corresponding output head but fixes its multiplier to one."
         ),
     )
     parser.add_argument(
@@ -290,6 +317,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.action_quadratic_scale,
         args.tip_weight,
         args.structured_log_scale,
+        args.structured_shape_weight,
+        args.structured_linear_velocity_weight,
+        args.structured_angular_velocity_weight,
+        args.structured_normalized_delta_weight,
         args.learning_rate,
         args.std_learning_rate,
         args.gamma,
@@ -345,7 +376,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if (
         not args.structured_terminal_multiplier
-        and args.kmpc_cost_parameterization != "structured"
+        and args.kmpc_cost_parameterization
+        not in ("structured", "structured_v2")
     ):
         raise ValueError(
             "The terminal-multiplier ablation requires structured cost"
@@ -369,6 +401,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     ):
         raise ValueError(
             "--normalized-delta-curvature is invalid in absolute decision space"
+        )
+    if (
+        args.kmpc_cost_parameterization == "structured_v2"
+        and args.kmpc_decision_space != "normalized_delta"
+    ):
+        raise ValueError(
+            "Structured-v2 includes learned normalized-delta curvature and "
+            "requires normalized_delta decision space"
         )
     if (
         args.actor == "ppo_kmpc"
@@ -417,7 +457,7 @@ def main() -> None:
         actor_learning_rate = float(args.actor_learning_rate)
     elif args.actor == "ppo_mlp":
         actor_learning_rate = 3e-4
-    elif args.kmpc_cost_parameterization == "structured":
+    elif args.kmpc_cost_parameterization in ("structured", "structured_v2"):
         # A real-environment one-update smoke test kept KL at 8.2e-4 with
         # this rate.  The legacy full map remains far more sensitive.
         actor_learning_rate = 1e-5
@@ -466,6 +506,16 @@ def main() -> None:
         normalized_delta_curvature=args.normalized_delta_curvature,
         kmpc_cost_parameterization=args.kmpc_cost_parameterization,
         structured_log_scale=args.structured_log_scale,
+        structured_shape_weight=args.structured_shape_weight,
+        structured_linear_velocity_weight=(
+            args.structured_linear_velocity_weight
+        ),
+        structured_angular_velocity_weight=(
+            args.structured_angular_velocity_weight
+        ),
+        structured_normalized_delta_weight=(
+            args.structured_normalized_delta_weight
+        ),
         kmpc_reference_mode=args.kmpc_reference_mode,
         structured_terminal_multiplier=args.structured_terminal_multiplier,
     )
@@ -522,14 +572,39 @@ def main() -> None:
         "structured_log_scale": (
             None
             if args.actor == "ppo_mlp"
-            or args.kmpc_cost_parameterization != "structured"
+            or args.kmpc_cost_parameterization
+            not in ("structured", "structured_v2")
             else args.structured_log_scale
+        ),
+        "structured_shape_weight": (
+            args.structured_shape_weight
+            if args.actor == "ppo_kmpc"
+            and args.kmpc_cost_parameterization == "structured_v2"
+            else None
+        ),
+        "structured_linear_velocity_weight": (
+            args.structured_linear_velocity_weight
+            if args.actor == "ppo_kmpc"
+            and args.kmpc_cost_parameterization == "structured_v2"
+            else None
+        ),
+        "structured_angular_velocity_weight": (
+            args.structured_angular_velocity_weight
+            if args.actor == "ppo_kmpc"
+            and args.kmpc_cost_parameterization == "structured_v2"
+            else None
+        ),
+        "structured_normalized_delta_weight": (
+            args.structured_normalized_delta_weight
+            if args.actor == "ppo_kmpc"
+            and args.kmpc_cost_parameterization == "structured_v2"
+            else None
         ),
         "solver": (
             None
             if args.actor == "ppo_mlp"
             else (
-                "normalized_delta_box_fista_v1"
+                "normalized_delta_exact_projection_fista_v2"
                 if normalized_delta_policy
                 else "absolute_action_box_fista_v1"
             )

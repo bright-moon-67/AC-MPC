@@ -328,6 +328,77 @@ def test_structured_kmpc_policy_reduces_cost_map_and_backpropagates(tmp_path):
     assert structured.cost_initialization == "structured_reference_weights_v1"
 
 
+def test_structured_v2_uses_eleven_outputs_and_zero_velocity_reference(tmp_path):
+    checkpoint = _checkpoint(tmp_path)
+    policy = _make(
+        "ppo_kmpc",
+        checkpoint,
+        cost_parameterization="structured_v2",
+    )
+    observations = torch.zeros(5, policy.observation_dim)
+    observations[:, :45] = torch.arange(45, dtype=torch.float32)
+    observations[:, -12:-9] = torch.tensor([1.0, 2.0, 3.0])
+    observations[:, -3] = 1.0
+    (
+        _,
+        _,
+        _,
+        physical_reference,
+        action_reference,
+    ) = policy.features(observations)
+    velocity_indices = torch.tensor(
+        [
+            *range(9, 15),
+            *range(24, 30),
+            *range(39, 45),
+        ]
+    )
+    shape_indices = torch.tensor(
+        [
+            *range(0, 9),
+            *range(15, 24),
+            *range(33, 39),
+        ]
+    )
+    torch.testing.assert_close(
+        physical_reference[:, velocity_indices],
+        torch.zeros(5, 18),
+    )
+    torch.testing.assert_close(
+        physical_reference[:, shape_indices],
+        observations[:, shape_indices],
+    )
+    torch.testing.assert_close(
+        physical_reference[:, 30:33],
+        torch.tensor([1.0, 2.0, 3.0]).expand(5, 3),
+    )
+    torch.testing.assert_close(
+        action_reference,
+        torch.zeros_like(action_reference),
+    )
+
+    output = policy(observations)
+    assert policy.actor.network[-1].out_features == 11
+    assert output.mpc.quadratic_diagonal.shape == (5, 2, 48)
+    assert policy.cost_initialization == "structured_reference_groups_v2"
+    actions = output.distribution.sample().detach()
+    log_prob, entropy, values, _ = policy.evaluate_actions(
+        observations,
+        actions,
+    )
+    (
+        -log_prob.mean()
+        - 1e-4 * entropy.mean()
+        + values.square().mean()
+        + 1e-3 * output.mpc.quadratic_diagonal.mean()
+    ).backward()
+    assert any(
+        parameter.grad is not None
+        and float(parameter.grad.abs().sum()) > 0
+        for parameter in policy.actor.parameters()
+    )
+
+
 def test_source_style_ablation_axes_are_independent(tmp_path):
     checkpoint = _checkpoint(tmp_path)
     observations = torch.zeros(5, 45 + 2 * (45 + 3) + 12)
@@ -397,6 +468,7 @@ def test_comparison_checkpoint_round_trip(tmp_path):
         ("ppo_mlp", "full"),
         ("ppo_kmpc", "full"),
         ("ppo_kmpc", "structured"),
+        ("ppo_kmpc", "structured_v2"),
     )
     for actor_name, cost_parameterization in cases:
         policy = _make(
@@ -423,6 +495,10 @@ def test_comparison_checkpoint_round_trip(tmp_path):
             "max_delta": 0.001 if actor_name == "ppo_kmpc" else None,
             "kmpc_cost_parameterization": cost_parameterization,
             "structured_log_scale": math.log(2.0),
+            "structured_shape_weight": 1e-3,
+            "structured_linear_velocity_weight": 1e-2,
+            "structured_angular_velocity_weight": 1e-2,
+            "structured_normalized_delta_weight": 1e-4,
         }
         path = tmp_path / f"{actor_name}_{cost_parameterization}.pt"
         torch.save(

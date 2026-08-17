@@ -15,10 +15,30 @@ from antmaze_ac.koopman.history_model import HistoryDeepKoopman
 
 from .critic import Critic
 from .history_koopman_mpc_policy import HistoryKoopmanMPCPolicy
-from .koopman_mpc_actor import KoopmanMPCActor, StructuredKoopmanMPCActor
+from .koopman_mpc_actor import (
+    KoopmanMPCActor,
+    StructuredKoopmanMPCActor,
+    StructuredKoopmanMPCActorV2,
+)
 
 
 PPO_ACTOR_NAMES = ("ppo_mlp", "ppo_kmpc")
+MANISOFT_TIP_POSITION_INDICES = (30, 31, 32)
+MANISOFT_SHAPE_INDICES = (
+    *range(0, 9),
+    *range(15, 24),
+    *range(33, 39),
+)
+MANISOFT_LINEAR_VELOCITY_INDICES = (
+    *range(9, 12),
+    *range(24, 27),
+    *range(39, 42),
+)
+MANISOFT_ANGULAR_VELOCITY_INDICES = (
+    *range(12, 15),
+    *range(27, 30),
+    *range(42, 45),
+)
 
 
 def _orthogonal(layer: nn.Linear, gain: float) -> None:
@@ -306,6 +326,10 @@ def make_manisoft_ppo_policy(
     normalized_delta_curvature: float = 0.0,
     kmpc_cost_parameterization: str = "full",
     structured_log_scale: float = math.log(2.0),
+    structured_shape_weight: float = 1e-3,
+    structured_linear_velocity_weight: float = 1e-2,
+    structured_angular_velocity_weight: float = 1e-2,
+    structured_normalized_delta_weight: float = 1e-4,
     kmpc_reference_mode: str = "explicit",
     structured_terminal_multiplier: bool = True,
 ) -> tuple[StandardHistoryPPOPolicy | HistoryKoopmanMPCPolicy, dict]:
@@ -321,9 +345,14 @@ def make_manisoft_ppo_policy(
         raise ValueError("Action limit and initial standard deviation must be positive")
     if max_delta is not None and max_delta <= 0:
         raise ValueError("max_delta must be positive when configured")
-    if kmpc_cost_parameterization not in ("full", "structured"):
+    if kmpc_cost_parameterization not in (
+        "full",
+        "structured",
+        "structured_v2",
+    ):
         raise ValueError(
-            "kmpc_cost_parameterization must be 'full' or 'structured'"
+            "kmpc_cost_parameterization must be full, structured, "
+            "or structured_v2"
         )
     if kmpc_reference_mode not in ("explicit", "implicit"):
         raise ValueError(
@@ -339,6 +368,13 @@ def make_manisoft_ppo_policy(
         )
     if structured_log_scale <= 0:
         raise ValueError("structured_log_scale must be positive")
+    if min(
+        structured_shape_weight,
+        structured_linear_velocity_weight,
+        structured_angular_velocity_weight,
+        structured_normalized_delta_weight,
+    ) <= 0:
+        raise ValueError("Structured-v2 base weights must be positive")
     checkpoint = Path(koopman_checkpoint).expanduser().resolve()
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     architecture = payload.get("architecture", {})
@@ -396,22 +432,68 @@ def make_manisoft_ppo_policy(
 
     context_dim = 4 * int(waypoint_count)
     physical_quadratic_scale = torch.full_like(state_std, 1e-8)
-    tip_indices = torch.as_tensor((30, 31, 32), dtype=torch.long)
-    # Tip-only initialization: the only non-negligible state penalty is the
-    # three-dimensional active-goal error available at deployment time.
-    physical_quadratic_scale[tip_indices] = float(tip_weight)
-    actor_class = (
-        StructuredKoopmanMPCActor
-        if kmpc_cost_parameterization == "structured"
-        else KoopmanMPCActor
+    tip_indices = torch.as_tensor(
+        MANISOFT_TIP_POSITION_INDICES,
+        dtype=torch.long,
     )
+    # V1/full retain the historical tip-only base scale.  V2 replaces the
+    # negligible non-tip entries below with conservative grouped weights.
+    physical_quadratic_scale[tip_indices] = float(tip_weight)
+    if kmpc_cost_parameterization == "structured_v2":
+        physical_quadratic_scale[
+            torch.as_tensor(MANISOFT_SHAPE_INDICES, dtype=torch.long)
+        ] = float(structured_shape_weight)
+        physical_quadratic_scale[
+            torch.as_tensor(
+                MANISOFT_LINEAR_VELOCITY_INDICES,
+                dtype=torch.long,
+            )
+        ] = float(structured_linear_velocity_weight)
+        physical_quadratic_scale[
+            torch.as_tensor(
+                MANISOFT_ANGULAR_VELOCITY_INDICES,
+                dtype=torch.long,
+            )
+        ] = float(structured_angular_velocity_weight)
+
+    actor_class: type[KoopmanMPCActor]
+    if kmpc_cost_parameterization == "structured":
+        actor_class = StructuredKoopmanMPCActor
+    elif kmpc_cost_parameterization == "structured_v2":
+        actor_class = StructuredKoopmanMPCActorV2
+    else:
+        actor_class = KoopmanMPCActor
     actor_kwargs = {}
     if kmpc_cost_parameterization == "structured":
         actor_kwargs["structured_log_scale"] = structured_log_scale
-        actor_kwargs["structured_tip_indices"] = (30, 31, 32)
+        actor_kwargs["structured_tip_indices"] = (
+            MANISOFT_TIP_POSITION_INDICES
+        )
         actor_kwargs["reference_mode"] = kmpc_reference_mode
         actor_kwargs["use_terminal_multiplier"] = bool(
             structured_terminal_multiplier
+        )
+    elif kmpc_cost_parameterization == "structured_v2":
+        actor_kwargs.update(
+            {
+                "structured_log_scale": structured_log_scale,
+                "structured_tip_indices": (
+                    MANISOFT_TIP_POSITION_INDICES
+                ),
+                "structured_shape_indices": MANISOFT_SHAPE_INDICES,
+                "structured_linear_velocity_indices": (
+                    MANISOFT_LINEAR_VELOCITY_INDICES
+                ),
+                "structured_angular_velocity_indices": (
+                    MANISOFT_ANGULAR_VELOCITY_INDICES
+                ),
+                "structured_normalized_delta_weight": (
+                    structured_normalized_delta_weight
+                ),
+                "use_terminal_multiplier": bool(
+                    structured_terminal_multiplier
+                ),
+            }
         )
 
     common_actor_kwargs = dict(
@@ -481,15 +563,16 @@ def make_manisoft_ppo_policy(
         waypoint_count=waypoint_count,
         log_std_init=log_std_init,
     )
-    policy.cost_initialization = (
-        (
+    if kmpc_cost_parameterization == "structured":
+        policy.cost_initialization = (
             "structured_reference_weights_v1"
             if kmpc_reference_mode == "explicit"
             else "structured_q_implicit_stage_linear_zero_v1"
         )
-        if kmpc_cost_parameterization == "structured"
-        else "active_waypoint_tip_only_v1"
-    )
+    elif kmpc_cost_parameterization == "structured_v2":
+        policy.cost_initialization = "structured_reference_groups_v2"
+    else:
+        policy.cost_initialization = "active_waypoint_tip_only_v1"
     return policy.to(device), loaded_payload
 
 
@@ -536,6 +619,18 @@ def load_manisoft_ppo_checkpoint(
         ),
         structured_log_scale=float(
             runtime.get("structured_log_scale") or math.log(2.0)
+        ),
+        structured_shape_weight=float(
+            runtime.get("structured_shape_weight", 1e-3)
+        ),
+        structured_linear_velocity_weight=float(
+            runtime.get("structured_linear_velocity_weight", 1e-2)
+        ),
+        structured_angular_velocity_weight=float(
+            runtime.get("structured_angular_velocity_weight", 1e-2)
+        ),
+        structured_normalized_delta_weight=float(
+            runtime.get("structured_normalized_delta_weight", 1e-4)
         ),
         kmpc_reference_mode=str(
             runtime.get("kmpc_reference_mode", "explicit")

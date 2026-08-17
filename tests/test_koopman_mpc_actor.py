@@ -1,11 +1,14 @@
 import math
 
+import numpy as np
 import pytest
 import torch
+from scipy.optimize import Bounds, LinearConstraint, minimize
 
 from antmaze_ac.rl.koopman_mpc_actor import (
     KoopmanMPCActor,
     StructuredKoopmanMPCActor,
+    StructuredKoopmanMPCActorV2,
 )
 
 
@@ -267,6 +270,166 @@ def test_normalized_delta_qp_matches_absolute_cost_and_rate_limits():
     assert bool((physical_delta.abs() <= 0.001 + 1e-12).all())
 
 
+def _scipy_bounded_cumulative_projection(
+    candidate: np.ndarray,
+    previous_action: float,
+    *,
+    max_delta: float,
+    action_low: float,
+    action_high: float,
+) -> np.ndarray:
+    horizon = int(candidate.shape[0])
+    cumulative = np.tril(np.ones((horizon, horizon), dtype=np.float64))
+    lower = np.full(
+        horizon,
+        (action_low - previous_action) / max_delta,
+        dtype=np.float64,
+    )
+    upper = np.full(
+        horizon,
+        (action_high - previous_action) / max_delta,
+        dtype=np.float64,
+    )
+    result = minimize(
+        lambda value: 0.5 * np.sum((value - candidate) ** 2),
+        np.zeros(horizon, dtype=np.float64),
+        jac=lambda value: value - candidate,
+        bounds=Bounds(-np.ones(horizon), np.ones(horizon)),
+        constraints=LinearConstraint(cumulative, lower, upper),
+        method="SLSQP",
+        options={"ftol": 1e-12, "maxiter": 500},
+    )
+    assert result.success, result.message
+    return np.asarray(result.x, dtype=np.float64)
+
+
+def test_normalized_delta_projection_fixes_greedy_boundary_counterexample():
+    dtype = torch.float64
+    actor = KoopmanMPCActor(
+        torch.eye(1, dtype=dtype),
+        torch.ones(1, 1, dtype=dtype),
+        torch.eye(1, dtype=dtype),
+        horizon=2,
+        hidden_dims=(),
+        action_low=-0.3,
+        action_high=0.3,
+        max_delta=0.015,
+    )
+    candidate = torch.tensor([[2.0, 2.0]], dtype=dtype)
+    previous = torch.tensor([[0.29]], dtype=dtype)
+    projected = actor._project_decision(candidate, previous)
+    expected = torch.full((1, 2), 1.0 / 3.0, dtype=dtype)
+    torch.testing.assert_close(projected, expected, atol=1e-12, rtol=0.0)
+    greedy = torch.tensor([[2.0 / 3.0, 0.0]], dtype=dtype)
+    exact_distance = (projected - candidate).square().sum()
+    greedy_distance = (greedy - candidate).square().sum()
+    assert float(exact_distance) < float(greedy_distance)
+
+
+def test_normalized_delta_projection_matches_random_scipy_oracle():
+    dtype = torch.float64
+    horizon = 6
+    action_dim = 2
+    actor = KoopmanMPCActor(
+        torch.eye(1, dtype=dtype),
+        torch.ones(1, action_dim, dtype=dtype),
+        torch.eye(1, dtype=dtype),
+        horizon=horizon,
+        hidden_dims=(),
+        action_low=-0.3,
+        action_high=0.3,
+        max_delta=0.015,
+    )
+    generator = torch.Generator().manual_seed(1907)
+    candidate_sequence = 3.0 * torch.randn(
+        12,
+        horizon,
+        action_dim,
+        generator=generator,
+        dtype=dtype,
+    )
+    previous = 0.6 * torch.rand(
+        12,
+        action_dim,
+        generator=generator,
+        dtype=dtype,
+    ) - 0.3
+    projected = actor._project_decision(
+        candidate_sequence.flatten(start_dim=-2),
+        previous,
+    ).reshape_as(candidate_sequence)
+
+    for batch in range(candidate_sequence.shape[0]):
+        for actuator in range(action_dim):
+            oracle = _scipy_bounded_cumulative_projection(
+                candidate_sequence[batch, :, actuator].numpy(),
+                float(previous[batch, actuator]),
+                max_delta=0.015,
+                action_low=-0.3,
+                action_high=0.3,
+            )
+            np.testing.assert_allclose(
+                projected[batch, :, actuator].detach().numpy(),
+                oracle,
+                atol=2e-7,
+                rtol=0.0,
+            )
+
+    absolute = previous.unsqueeze(-2) + 0.015 * torch.cumsum(
+        projected,
+        dim=-2,
+    )
+    assert bool((projected.abs() <= 1.0 + 1e-10).all())
+    assert bool((absolute >= -0.3 - 1e-10).all())
+    assert bool((absolute <= 0.3 + 1e-10).all())
+
+
+def test_exact_normalized_delta_projection_gradient_matches_finite_difference():
+    dtype = torch.float64
+    actor = KoopmanMPCActor(
+        torch.eye(1, dtype=dtype),
+        torch.ones(1, 1, dtype=dtype),
+        torch.eye(1, dtype=dtype),
+        horizon=2,
+        hidden_dims=(),
+        action_low=-0.3,
+        action_high=0.3,
+        max_delta=0.015,
+    )
+    candidate = torch.tensor(
+        [[1.8, 1.4]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    previous = torch.tensor([[0.29]], dtype=dtype)
+    weights = torch.tensor([[0.7, -0.2]], dtype=dtype)
+    value = (actor._project_decision(candidate, previous) * weights).sum()
+    analytic = torch.autograd.grad(value, candidate)[0]
+
+    epsilon = 1e-6
+    finite_difference = torch.zeros_like(candidate)
+    for index in range(candidate.shape[-1]):
+        positive = candidate.detach().clone()
+        negative = candidate.detach().clone()
+        positive[0, index] += epsilon
+        negative[0, index] -= epsilon
+        positive_value = (
+            actor._project_decision(positive, previous) * weights
+        ).sum()
+        negative_value = (
+            actor._project_decision(negative, previous) * weights
+        ).sum()
+        finite_difference[0, index] = (
+            positive_value - negative_value
+        ) / (2.0 * epsilon)
+    torch.testing.assert_close(
+        analytic,
+        finite_difference,
+        atol=2e-7,
+        rtol=2e-6,
+    )
+
+
 def test_normalized_delta_curvature_shifts_only_decision_hessian():
     dtype = torch.float64
     common = dict(
@@ -479,3 +642,129 @@ def test_structured_terminal_multiplier_can_be_disabled_without_shape_change():
     )
     assert terminal_on.network[-1].out_features == 5
     assert terminal_off.network[-1].out_features == 5
+
+
+def test_structured_v2_groups_all_physical_and_action_dimensions():
+    dtype = torch.float64
+    physical_scale = torch.tensor(
+        [1.0, 1.0, 1.0, 1e-3, 1e-3, 1e-2, 2e-2, 2e-2],
+        dtype=dtype,
+    )
+    actor = StructuredKoopmanMPCActorV2(
+        torch.eye(8, dtype=dtype) * 0.9,
+        torch.ones(8, 6, dtype=dtype) * 0.02,
+        torch.eye(8, dtype=dtype),
+        horizon=3,
+        context_dim=2,
+        hidden_dims=(7,),
+        physical_quadratic_scale=physical_scale,
+        action_quadratic_scale=2.0,
+        structured_log_scale=math.log(2.0),
+        structured_tip_indices=(0, 1, 2),
+        structured_shape_indices=(3, 4),
+        structured_linear_velocity_indices=(5,),
+        structured_angular_velocity_indices=(6, 7),
+        structured_normalized_delta_weight=1e-4,
+        max_delta=0.015,
+    )
+    assert actor.network[-1].out_features == 11
+    assert actor.cost_parameterization == "structured_reference_groups_v2"
+    torch.testing.assert_close(
+        actor.zero_physical_reference_indices,
+        torch.tensor([5, 6, 7]),
+    )
+
+    with torch.no_grad():
+        actor.network[-1].bias.copy_(
+            torch.tensor(
+                [
+                    0.2,
+                    -0.2,
+                    0.4,
+                    -0.4,
+                    0.3,
+                    -0.3,
+                    0.1,
+                    0.2,
+                    0.3,
+                    0.5,
+                    -0.25,
+                ],
+                dtype=dtype,
+            )
+        )
+    lifted = torch.randn(4, 8, dtype=dtype)
+    context = torch.randn(4, 2, dtype=dtype)
+    reference = torch.randn(4, 8, dtype=dtype)
+    action_reference = torch.randn(4, 6, dtype=dtype)
+    quadratic, linear = actor.cost_terms(
+        lifted,
+        context,
+        reference,
+        action_reference,
+    )
+    logs = math.log(2.0) * torch.tanh(actor.network[-1].bias)
+    expected_state = physical_scale.clone()
+    expected_state[0:3] *= torch.exp(logs[0:3])
+    expected_state[3:5] *= torch.exp(logs[3])
+    expected_state[5] *= torch.exp(logs[4])
+    expected_state[6:8] *= torch.exp(logs[5])
+    torch.testing.assert_close(
+        quadratic[:, 0, :8],
+        expected_state.expand(4, 8),
+    )
+    torch.testing.assert_close(
+        quadratic[:, 1, :8],
+        expected_state.expand(4, 8),
+    )
+    terminal_state = expected_state.clone()
+    terminal_state[0:3] *= torch.exp(logs[9])
+    torch.testing.assert_close(
+        quadratic[:, -1, :8],
+        terminal_state.expand(4, 8),
+    )
+    expected_action = 2.0 * torch.exp(logs[6:9]).repeat(2)
+    torch.testing.assert_close(
+        quadratic[..., 8:],
+        expected_action.expand(4, 3, 6),
+    )
+    torch.testing.assert_close(
+        linear[..., :8],
+        -quadratic[..., :8] * reference.unsqueeze(-2),
+    )
+    torch.testing.assert_close(
+        linear[..., 8:],
+        -quadratic[..., 8:] * action_reference.unsqueeze(-2),
+    )
+    expected_curvature = 1e-4 * torch.exp(logs[10])
+    torch.testing.assert_close(
+        actor.additional_normalized_delta_curvature(lifted, context),
+        expected_curvature.expand(4),
+    )
+    output = actor(
+        lifted,
+        context,
+        reference,
+        action_reference,
+        previous_action=torch.zeros(4, 6, dtype=dtype),
+    )
+    absolute_hessian, absolute_linear = actor.condensed_quadratic(
+        lifted,
+        quadratic,
+        linear,
+    )
+    base_hessian, _ = actor.normalized_delta_quadratic(
+        absolute_hessian,
+        absolute_linear,
+        torch.zeros(4, 6, dtype=dtype),
+    )
+    identity = torch.eye(18, dtype=dtype)
+    torch.testing.assert_close(
+        output.qp_hessian,
+        base_hessian + expected_curvature * identity,
+    )
+
+    loss = quadratic.mean() + 0.01 * linear.square().mean()
+    gradients = torch.autograd.grad(loss, tuple(actor.parameters()))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(float(gradient.abs().sum()) > 0 for gradient in gradients)

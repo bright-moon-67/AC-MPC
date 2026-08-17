@@ -172,6 +172,25 @@ class KoopmanMPCActor(nn.Module):
             delta_to_action,
             persistent=False,
         )
+        increment_identity = torch.eye(
+            self.horizon,
+            dtype=A.dtype,
+            device=A.device,
+        )
+        cumulative = torch.tril(torch.ones_like(increment_identity))
+        self.register_buffer(
+            "normalized_delta_constraint_matrix",
+            torch.cat(
+                (
+                    increment_identity,
+                    -increment_identity,
+                    cumulative,
+                    -cumulative,
+                ),
+                dim=0,
+            ),
+            persistent=False,
+        )
         physical_scale = torch.as_tensor(
             physical_quadratic_scale,
             dtype=A.dtype,
@@ -377,6 +396,7 @@ class KoopmanMPCActor(nn.Module):
         hessian: torch.Tensor,
         linear: torch.Tensor,
         previous_action: torch.Tensor,
+        additional_curvature: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Substitute normalized increments into an absolute-action QP."""
 
@@ -401,7 +421,7 @@ class KoopmanMPCActor(nn.Module):
         transformed_linear = (
             absolute_gradient_at_offset.unsqueeze(-2) @ transform
         ).squeeze(-2)
-        if self.normalized_delta_curvature:
+        if self.normalized_delta_curvature or additional_curvature is not None:
             identity = torch.eye(
                 transformed_hessian.shape[-1],
                 dtype=transformed_hessian.dtype,
@@ -410,7 +430,29 @@ class KoopmanMPCActor(nn.Module):
             transformed_hessian = transformed_hessian + (
                 self.normalized_delta_curvature * identity
             )
+            if additional_curvature is not None:
+                expected_curvature = transformed_hessian.shape[:-2]
+                if additional_curvature.shape != expected_curvature:
+                    raise ValueError(
+                        "additional_curvature must have shape "
+                        f"{expected_curvature}, got "
+                        f"{tuple(additional_curvature.shape)}"
+                    )
+                if bool((additional_curvature <= 0).any()):
+                    raise ValueError("additional_curvature must be positive")
+                transformed_hessian = transformed_hessian + (
+                    additional_curvature[..., None, None] * identity
+                )
         return transformed_hessian, transformed_linear
+
+    def additional_normalized_delta_curvature(
+        self,
+        lifted_state: torch.Tensor,
+        context: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Return optional state-conditioned positive D-space curvature."""
+
+        return None
 
     def normalized_delta_bounds(
         self,
@@ -440,32 +482,219 @@ class KoopmanMPCActor(nn.Module):
         flat_delta: torch.Tensor,
         previous_action: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project and integrate a normalized increment plan."""
+        """Exactly project and integrate a normalized increment plan."""
 
         if self.max_delta is None:
             raise RuntimeError("Normalized delta integration requires max_delta")
+        expected_previous = (*flat_delta.shape[:-1], self.action_dim)
+        if previous_action.shape != expected_previous:
+            raise ValueError(
+                "previous_action must have shape "
+                f"{expected_previous}, got {tuple(previous_action.shape)}"
+            )
         sequence = flat_delta.reshape(
-            *flat_delta.shape[:-1], self.horizon, self.action_dim
+            *flat_delta.shape[:-1],
+            self.horizon,
+            self.action_dim,
         )
         previous = torch.clamp(
             previous_action,
             min=self.action_low,
             max=self.action_high,
         )
-        applied_deltas: list[torch.Tensor] = []
-        absolute_actions: list[torch.Tensor] = []
-        for step in range(self.horizon):
-            requested_delta = torch.clamp(sequence[..., step, :], -1.0, 1.0)
-            following = torch.clamp(
-                previous + self.max_delta * requested_delta,
-                min=self.action_low,
-                max=self.action_high,
+        projected = self._project_normalized_delta_sequence(
+            sequence,
+            previous,
+        )
+        absolute = previous.unsqueeze(-2) + self.max_delta * torch.cumsum(
+            projected,
+            dim=-2,
+        )
+        return projected, absolute
+
+    def _project_normalized_delta_sequence(
+        self,
+        sequence: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the Euclidean projection onto rate and action constraints.
+
+        The constraints decouple by actuator.  For one actuator the method
+        solves
+
+            min_d 0.5 * ||d-v||^2
+            subject to |d_k| <= 1
+                       action_low <= u_previous
+                           + max_delta * cumsum(d)_k <= action_high.
+
+        Box projection is an exact fast path whenever its cumulative action
+        sequence is feasible.  Only sequences that approach an absolute
+        action boundary enter the small active-set QP.
+        """
+
+        if self.max_delta is None:
+            raise RuntimeError("Normalized delta projection requires max_delta")
+        expected = (
+            *previous_action.shape[:-1],
+            self.horizon,
+            self.action_dim,
+        )
+        if sequence.shape != expected:
+            raise ValueError(
+                f"sequence must have shape {expected}, got {tuple(sequence.shape)}"
             )
-            applied_deltas.append((following - previous) / self.max_delta)
-            absolute_actions.append(following)
-            previous = following
-        return torch.stack(applied_deltas, dim=-2), torch.stack(
-            absolute_actions, dim=-2
+
+        clamped = torch.clamp(sequence, -1.0, 1.0)
+        absolute = previous_action.unsqueeze(-2) + self.max_delta * torch.cumsum(
+            clamped,
+            dim=-2,
+        )
+        within_absolute_box = (
+            (absolute >= self.action_low)
+            & (absolute <= self.action_high)
+        ).all(dim=-2)
+        if bool(within_absolute_box.all()):
+            return clamped
+
+        candidate_by_actuator = sequence.movedim(-1, -2).reshape(
+            -1,
+            self.horizon,
+        )
+        projected_by_actuator = clamped.movedim(-1, -2).reshape(
+            -1,
+            self.horizon,
+        ).clone()
+        previous_by_actuator = previous_action.reshape(
+            -1,
+            self.action_dim,
+        ).reshape(-1)
+        low_by_actuator = self.action_low.expand_as(previous_action).reshape(-1)
+        high_by_actuator = self.action_high.expand_as(previous_action).reshape(-1)
+        requires_exact = ~within_absolute_box.reshape(-1)
+        exact_indices = torch.nonzero(
+            requires_exact,
+            as_tuple=False,
+        ).flatten()
+        for flat_index_tensor in exact_indices.unbind():
+            flat_index = int(flat_index_tensor.detach())
+            previous = previous_by_actuator[flat_index]
+            lower_cumulative = (
+                low_by_actuator[flat_index] - previous
+            ) / self.max_delta
+            upper_cumulative = (
+                high_by_actuator[flat_index] - previous
+            ) / self.max_delta
+            projected_by_actuator[flat_index] = (
+                self._project_bounded_cumulative_single(
+                    candidate_by_actuator[flat_index],
+                    lower_cumulative,
+                    upper_cumulative,
+                )
+            )
+        return projected_by_actuator.reshape(
+            *sequence.shape[:-2],
+            self.action_dim,
+            self.horizon,
+        ).movedim(-1, -2)
+
+    def _project_bounded_cumulative_single(
+        self,
+        candidate: torch.Tensor,
+        lower_cumulative: torch.Tensor,
+        upper_cumulative: torch.Tensor,
+    ) -> torch.Tensor:
+        """Solve one small Euclidean projection QP by a primal active set."""
+
+        if candidate.shape != (self.horizon,):
+            raise ValueError("candidate must contain one actuator horizon")
+        original_dtype = candidate.dtype
+        solve_dtype = (
+            torch.float64
+            if original_dtype in (torch.float16, torch.bfloat16, torch.float32)
+            else original_dtype
+        )
+        value = candidate.to(dtype=solve_dtype)
+        matrix = self.normalized_delta_constraint_matrix.to(dtype=solve_dtype)
+        one = value.new_ones(self.horizon)
+        lower = lower_cumulative.to(dtype=solve_dtype)
+        upper = upper_cumulative.to(dtype=solve_dtype)
+        bounds = torch.cat(
+            (
+                one,
+                one,
+                upper.expand(self.horizon),
+                (-lower).expand(self.horizon),
+            )
+        )
+        point = torch.zeros_like(value)
+        working: list[int] = []
+        tolerance = 1e-10
+        maximum_iterations = 8 * self.horizon + 8
+
+        for _ in range(maximum_iterations):
+            gradient = point - value
+            if working:
+                active = matrix[working]
+                gram = active @ active.mT
+                correction = torch.linalg.solve(
+                    gram,
+                    active @ gradient,
+                )
+                direction = -gradient + active.mT @ correction
+            else:
+                active = None
+                gram = None
+                direction = -gradient
+
+            if float(direction.abs().amax().detach()) <= tolerance:
+                if not working:
+                    return point.to(dtype=original_dtype)
+                assert active is not None and gram is not None
+                multipliers = torch.linalg.solve(
+                    gram,
+                    -(active @ gradient),
+                )
+                smallest, remove_at = torch.min(multipliers, dim=0)
+                if float(smallest.detach()) >= -tolerance:
+                    return point.to(dtype=original_dtype)
+                del working[int(remove_at.detach())]
+                continue
+
+            slack = bounds - matrix @ point
+            directional_change = matrix @ direction
+            can_block = directional_change > tolerance
+            if working:
+                can_block[working] = False
+            ratios = torch.where(
+                can_block,
+                slack / directional_change,
+                torch.full_like(slack, torch.inf),
+            )
+            blocking_ratio, blocking_index = torch.min(ratios, dim=0)
+            if float(blocking_ratio.detach()) >= 1.0:
+                step = value.new_tensor(1.0)
+                add_constraint = False
+            else:
+                step = torch.clamp(blocking_ratio, min=0.0, max=1.0)
+                add_constraint = True
+            point = point + step * direction
+
+            if add_constraint:
+                index = int(blocking_index.detach())
+                proposed = [*working, index]
+                proposed_rank = int(
+                    torch.linalg.matrix_rank(
+                        matrix[proposed],
+                        tol=tolerance,
+                    ).detach()
+                )
+                if proposed_rank > len(working):
+                    working.append(index)
+
+        violation = torch.clamp(matrix @ point - bounds, min=0.0).amax()
+        raise RuntimeError(
+            "Exact normalized-delta projection did not converge; "
+            f"maximum constraint violation={float(violation.detach()):.3e}"
         )
 
     def _project_decision(
@@ -619,10 +848,17 @@ class KoopmanMPCActor(nn.Module):
                     "previous_action is required when max_delta is configured"
                 )
             previous_output = previous_action
+            additional_curvature = (
+                self.additional_normalized_delta_curvature(
+                    lifted_state,
+                    context,
+                )
+            )
             hessian, qp_linear = self.normalized_delta_quadratic(
                 absolute_hessian,
                 absolute_linear,
                 previous_action,
+                additional_curvature=additional_curvature,
             )
             flat_delta, residual = self._solve_box_qp(
                 hessian,
@@ -826,3 +1062,226 @@ class StructuredKoopmanMPCActor(KoopmanMPCActor):
                 )
             linear_action = -q_action * action_reference.unsqueeze(-2)
         return quadratic, torch.cat((linear_state, linear_action), dim=-1)
+
+
+class StructuredKoopmanMPCActorV2(KoopmanMPCActor):
+    """Eleven-output grouped reference cost for the 45-D ManiSoft state.
+
+    The outputs are three tip-position multipliers, one shape/orientation
+    multiplier, one linear-velocity multiplier, one angular-velocity
+    multiplier, three activation-axis multipliers, and one final-tip
+    multiplier, plus one positive normalized-delta curvature multiplier.
+    The signed terms remain tied to explicit references.
+    """
+
+    STRUCTURED_OUTPUT_DIM = 11
+    ACTION_AXIS_COUNT = 3
+
+    def __init__(
+        self,
+        *args,
+        structured_log_scale: float = math.log(2.0),
+        structured_tip_indices: tuple[int, int, int] = (30, 31, 32),
+        structured_shape_indices: Sequence[int] = (),
+        structured_linear_velocity_indices: Sequence[int] = (),
+        structured_angular_velocity_indices: Sequence[int] = (),
+        structured_normalized_delta_weight: float = 1e-4,
+        use_terminal_multiplier: bool = True,
+        **kwargs,
+    ) -> None:
+        if structured_log_scale <= 0:
+            raise ValueError("structured_log_scale must be positive")
+        if structured_normalized_delta_weight <= 0:
+            raise ValueError(
+                "structured_normalized_delta_weight must be positive"
+            )
+        super().__init__(*args, **kwargs)
+        if self.max_delta is None:
+            raise ValueError("Structured-v2 requires normalized-delta MPC")
+        groups = {
+            "tip": tuple(map(int, structured_tip_indices)),
+            "shape": tuple(map(int, structured_shape_indices)),
+            "linear_velocity": tuple(
+                map(int, structured_linear_velocity_indices)
+            ),
+            "angular_velocity": tuple(
+                map(int, structured_angular_velocity_indices)
+            ),
+        }
+        if len(groups["tip"]) != 3:
+            raise ValueError("structured_tip_indices must contain three indices")
+        if any(not indices for indices in groups.values()):
+            raise ValueError("Every structured-v2 physical group must be non-empty")
+        flattened = [index for indices in groups.values() for index in indices]
+        if min(flattened) < 0 or max(flattened) >= self.physical_dim:
+            raise ValueError("Structured-v2 indices are outside physical state")
+        if len(set(flattened)) != len(flattened):
+            raise ValueError("Structured-v2 physical groups must be disjoint")
+        if set(flattened) != set(range(self.physical_dim)):
+            raise ValueError(
+                "Structured-v2 physical groups must partition the physical state"
+            )
+        if self.action_dim % self.ACTION_AXIS_COUNT:
+            raise ValueError(
+                "Structured-v2 action dimension must be divisible by three"
+            )
+
+        self.structured_log_scale = float(structured_log_scale)
+        self.structured_normalized_delta_weight = float(
+            structured_normalized_delta_weight
+        )
+        self.use_terminal_multiplier = bool(use_terminal_multiplier)
+        self.reference_mode = "explicit"
+        for name, indices in groups.items():
+            self.register_buffer(
+                f"structured_{name}_indices",
+                torch.as_tensor(
+                    indices,
+                    dtype=torch.long,
+                    device=self.A.device,
+                ),
+                persistent=False,
+            )
+        self.register_buffer(
+            "structured_action_axis",
+            torch.arange(
+                self.action_dim,
+                dtype=torch.long,
+                device=self.A.device,
+            )
+            % self.ACTION_AXIS_COUNT,
+            persistent=False,
+        )
+        self.register_buffer(
+            "zero_physical_reference_indices",
+            torch.cat(
+                (
+                    self.structured_linear_velocity_indices,
+                    self.structured_angular_velocity_indices,
+                )
+            ),
+            persistent=False,
+        )
+
+        self.network = _mlp(
+            self.lifted_dim + self.context_dim,
+            kwargs.get("hidden_dims", (256, 256)),
+            self.STRUCTURED_OUTPUT_DIM,
+            kwargs.get("activation", "gelu"),
+        ).to(dtype=self.A.dtype, device=self.A.device)
+        final = self.network[-1]
+        if not isinstance(final, nn.Linear):
+            raise TypeError("Expected a linear final structured-v2 cost layer")
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+        self.cost_parameterization = "structured_reference_groups_v2"
+
+    def cost_terms(
+        self,
+        lifted_state: torch.Tensor,
+        context: torch.Tensor | None = None,
+        physical_reference: torch.Tensor | None = None,
+        action_reference: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if lifted_state.shape[-1] != self.lifted_dim:
+            raise ValueError("Wrong lifted-state dimension")
+        batch_shape = lifted_state.shape[:-1]
+        network_input = lifted_state
+        if self.context_dim:
+            if context is None or context.shape[-1] != self.context_dim:
+                raise ValueError("Wrong or missing actor context dimension")
+            if context.shape[:-1] != batch_shape:
+                raise ValueError("Actor context batch shape does not match lifted state")
+            network_input = torch.cat((lifted_state, context), dim=-1)
+        elif context is not None:
+            raise ValueError("This actor was constructed without context")
+
+        raw = self.network(network_input)
+        log_multipliers = self.structured_log_scale * torch.tanh(raw)
+        tip_log = log_multipliers[..., 0:3]
+        shape_log = log_multipliers[..., 3]
+        linear_velocity_log = log_multipliers[..., 4]
+        angular_velocity_log = log_multipliers[..., 5]
+        action_axis_log = log_multipliers[..., 6:9]
+        terminal_log = (
+            log_multipliers[..., 9]
+            if self.use_terminal_multiplier
+            else torch.zeros_like(log_multipliers[..., 9])
+        )
+
+        state_log = lifted_state.new_zeros(
+            *batch_shape,
+            self.horizon,
+            self.physical_dim,
+        )
+        state_log[..., :, self.structured_tip_indices] = tip_log.unsqueeze(-2)
+        state_log[..., :, self.structured_shape_indices] = (
+            shape_log[..., None, None]
+        )
+        state_log[..., :, self.structured_linear_velocity_indices] = (
+            linear_velocity_log[..., None, None]
+        )
+        state_log[..., :, self.structured_angular_velocity_indices] = (
+            angular_velocity_log[..., None, None]
+        )
+        state_log[..., -1, self.structured_tip_indices] = (
+            tip_log + terminal_log.unsqueeze(-1)
+        )
+        q_state = self.physical_quadratic_scale * torch.exp(state_log)
+
+        selected_action_log = action_axis_log.index_select(
+            -1,
+            self.structured_action_axis,
+        )
+        q_action = self.action_quadratic_scale * torch.exp(
+            selected_action_log.unsqueeze(-2)
+        )
+        q_action = q_action.expand(
+            *batch_shape,
+            self.horizon,
+            self.action_dim,
+        )
+
+        linear_state = torch.zeros_like(q_state)
+        linear_action = torch.zeros_like(q_action)
+        if physical_reference is not None:
+            expected_reference = (*batch_shape, self.physical_dim)
+            if physical_reference.shape != expected_reference:
+                raise ValueError(
+                    "physical_reference must have shape "
+                    f"{expected_reference}, got {tuple(physical_reference.shape)}"
+                )
+            linear_state = -q_state * physical_reference.unsqueeze(-2)
+        if action_reference is not None:
+            expected_action_reference = (*batch_shape, self.action_dim)
+            if action_reference.shape != expected_action_reference:
+                raise ValueError(
+                    "action_reference must have shape "
+                    f"{expected_action_reference}, got "
+                    f"{tuple(action_reference.shape)}"
+                )
+            linear_action = -q_action * action_reference.unsqueeze(-2)
+        return torch.cat((q_state, q_action), dim=-1), torch.cat(
+            (linear_state, linear_action),
+            dim=-1,
+        )
+
+    def additional_normalized_delta_curvature(
+        self,
+        lifted_state: torch.Tensor,
+        context: torch.Tensor | None,
+    ) -> torch.Tensor:
+        network_input = lifted_state
+        if self.context_dim:
+            if context is None or context.shape[-1] != self.context_dim:
+                raise ValueError("Wrong or missing actor context dimension")
+            if context.shape[:-1] != lifted_state.shape[:-1]:
+                raise ValueError("Actor context batch shape does not match lifted state")
+            network_input = torch.cat((lifted_state, context), dim=-1)
+        elif context is not None:
+            raise ValueError("This actor was constructed without context")
+        raw_curvature = self.network(network_input)[..., 10]
+        multiplier = torch.exp(
+            self.structured_log_scale * torch.tanh(raw_curvature)
+        )
+        return self.structured_normalized_delta_weight * multiplier

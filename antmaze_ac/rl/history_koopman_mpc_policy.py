@@ -286,6 +286,19 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         # cost map remains free to reshape this reference cost during PPO.
         physical_reference = normalized_state.clone()
         physical_reference[..., self.tip_indices] = active_target
+        zero_reference_indices = getattr(
+            self.actor,
+            "zero_physical_reference_indices",
+            None,
+        )
+        if zero_reference_indices is not None:
+            normalized_physical_zero = (
+                -self.state_mean[zero_reference_indices]
+                / self.state_std[zero_reference_indices]
+            )
+            physical_reference[..., zero_reference_indices] = (
+                normalized_physical_zero
+            )
         return (
             split,
             lifted,
