@@ -21,7 +21,7 @@ TemperatureObjective = Literal["calql_log_alpha", "rlpd"]
 CriticHeadReduction = Literal["sum", "mean"]
 OnlineCQLMode = Literal["all_valid_mc", "off"]
 NetworkProfile = Literal["exorl_cql", "rlpd"]
-MPVEScope = Literal["off", "offline_only", "online_only"]
+MPVEScope = Literal["off", "offline_only", "online_only", "both"]
 
 
 @dataclass(frozen=True)
@@ -192,7 +192,9 @@ METHOD_SPECS: dict[str, MethodSpec] = {
         name="Cal-RLPD-AC-KMPC-MPVE",
         representation="koopman_lifted",
         actor="ac_kmpc",
-        mpve_scope="online_only",
+        # MPVE is part of both phases: offline critic pretraining and online
+        # value expansion use the same detached Koopman target construction.
+        mpve_scope="both",
         **_CAL_RLPD,
     ),
 }
@@ -204,7 +206,9 @@ STANDALONE_METHOD_SPECS: dict[str, MethodSpec] = {
         name="Cal-RLPD-AC-KMPC-Offline-MPVE",
         representation="koopman_lifted",
         actor="ac_kmpc",
-        mpve_scope="offline_only",
+        # Standalone variant is also a complete offline-to-online MPVE
+        # method; it is not a different actor, only a different MPVE scope.
+        mpve_scope="both",
         profile="calql_regularized_rlpd_offline_mpve_auxiliary_v1",
         **{key: value for key, value in _CAL_RLPD.items() if key != "profile"},
     ),
@@ -451,15 +455,19 @@ class O2OConfig:
 
     @property
     def uses_offline_mpve(self) -> bool:
-        return self.method_spec.mpve_scope == "offline_only"
+        return self.method_spec.mpve_scope in ("offline_only", "both")
 
     @property
     def uses_online_mpve(self) -> bool:
-        return self.method_spec.mpve_scope == "online_only"
+        return self.method_spec.mpve_scope in ("online_only", "both")
 
     @property
     def requires_offline_fork(self) -> bool:
-        return self.uses_online_mpve
+        # A unified MPVE method must learn the offline critic with MPVE too;
+        # it therefore owns its offline pretraining rather than forking a
+        # non-MPVE AC-KMPC snapshot.  Legacy online-only fork checkpoints are
+        # intentionally not accepted under the new method identity.
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
