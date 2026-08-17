@@ -4,6 +4,9 @@
 
 本页冻结 CartpoleSwingup 当前阶段的可复查结论。模型 checkpoint、训练日志和逐 episode 评估 JSON 保留在本机 `runs/playground/`，不纳入 Git；Git 仅保存实现、配置、测试和本摘要。
 
+下一任务从数据、Koopman、Cal-QL/RLPD baseline 到 KMPC/MPVE 的端到端迁移规则，见
+[`offline_to_online_benchmark_playbook.md`](offline_to_online_benchmark_playbook.md)。
+
 ## 四方法主实验
 
 以下为 seed `20260812` 的 latest checkpoint、128 episodes 确定性评估。数值是单训练 seed 的描述统计，不应解释为跨 seed 置信区间。
