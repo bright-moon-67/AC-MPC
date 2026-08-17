@@ -24,6 +24,7 @@ d4rl-data = ["h5py>=3.10"]
 vision = ["h5py>=3.10", "torchvision>=0.16"]
 maniskill = ["mani_skill>=3.0,<4"]
 modern-env = ["gymnasium-robotics>=1.4", "mujoco>=3.2"]
+dmc = ["dm-control==1.0.44", "mujoco==3.11.0"]
 tracking = ["wandb>=0.24"]
 
 [tool.setuptools.packages.find]

@@ -18,7 +18,7 @@ data/processed/
 .data/
 runs/
 .cleanup_trash/
-.venv/
+.venv*/
 .references/
 wandb/
 *.log
