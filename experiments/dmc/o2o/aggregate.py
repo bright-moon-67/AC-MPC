@@ -830,34 +830,6 @@ def aggregate_runs(
             "per_seed": method_runs,
         }
 
-    # Validate pairing after the common seed-set check so a malformed matrix
-    # reports its primary design error before inspecting method-specific files.
-    if require_complete:
-        source_runs = {
-            int(run["training_seed"]): run
-            for run in grouped["Cal-RLPD-AC-KMPC"]
-        }
-        for mpve_run in grouped["Cal-RLPD-AC-KMPC-MPVE"]:
-            seed = int(mpve_run["training_seed"])
-            source_run = source_runs.get(seed)
-            if source_run is None:
-                raise ValueError("MPVE has no paired same-seed AC-KMPC run")
-            source_path = (Path(source_run["run_dir"]) / "offline.pt").resolve()
-            if not source_path.is_file():
-                raise FileNotFoundError(
-                    f"Paired AC-KMPC offline snapshot is missing: {source_path}"
-                )
-            initialization = mpve_run.get("initialization")
-            if not isinstance(initialization, Mapping):
-                raise ValueError("MPVE run is missing offline-fork lineage")
-            if (
-                initialization.get("source_path") != str(source_path)
-                or initialization.get("source_sha256") != file_sha256(source_path)
-            ):
-                raise ValueError(
-                    "MPVE lineage does not match the included same-seed AC-KMPC run"
-                )
-
     if common_eval_grid is None or common_training_seeds is None:
         raise AssertionError("Aggregate common protocol identity was not resolved")
     structured_koopman_sha256 = (

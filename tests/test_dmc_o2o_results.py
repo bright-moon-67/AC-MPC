@@ -337,41 +337,28 @@ def _write_formal_matrix(
     dataset: OfflineDataset,
     koopman_path: Path,
     seeds: tuple[int, ...] = (11, 12),
-) -> tuple[list[Path], dict[int, dict[str, Any]]]:
+) -> list[Path]:
+    """Write the complete method x training-seed matrix without fork lineage.
+
+    Unified MPVE methods own their offline pretraining; they no longer fork a
+    non-MPVE AC-KMPC offline snapshot.
+    """
+
     from experiments.dmc.o2o.config import METHODS
 
     run_dirs: list[Path] = []
-    initializations: dict[int, dict[str, Any]] = {}
     for seed in seeds:
         for method in METHODS:
-            if method == "Cal-RLPD-AC-KMPC-MPVE":
-                continue
-            run_dir = _write_run(
-                root / method / f"seed_{seed}",
-                config=_config(method, seed),
-                dataset=dataset,
-                koopman_path=koopman_path,
-                eval_values=(100.0, 500.0, 900.0),
-            )
-            run_dirs.append(run_dir)
-            if method == "Cal-RLPD-AC-KMPC":
-                initializations[seed] = _write_offline_fork_source(
-                    run_dir / "offline.pt",
-                    seed=seed,
+            run_dirs.append(
+                _write_run(
+                    root / method / f"seed_{seed}",
+                    config=_config(method, seed),
                     dataset=dataset,
                     koopman_path=koopman_path,
+                    eval_values=(100.0, 500.0, 900.0),
                 )
-        run_dirs.append(
-            _write_run(
-                root / "Cal-RLPD-AC-KMPC-MPVE" / f"seed_{seed}",
-                config=_config("Cal-RLPD-AC-KMPC-MPVE", seed),
-                dataset=dataset,
-                koopman_path=koopman_path,
-                eval_values=(100.0, 500.0, 900.0),
-                initialization=initializations[seed],
             )
-        )
-    return run_dirs, initializations
+    return run_dirs
 
 
 def _write_matrix_manifest(
@@ -708,7 +695,7 @@ def test_formal_aggregate_records_and_verifies_matrix_source_identity(
 ) -> None:
     dataset = _write_dataset(tmp_path / "dataset.npz")
     koopman_path = _write_koopman(tmp_path / "koopman.npz")
-    run_dirs, _initializations = _write_formal_matrix(
+    run_dirs = _write_formal_matrix(
         tmp_path / "matrix_runs",
         dataset=dataset,
         koopman_path=koopman_path,
@@ -757,15 +744,6 @@ def test_formal_aggregate_requires_full_matrix_and_identical_seed_sets(
     run_dirs = []
     from experiments.dmc.o2o.config import METHODS
 
-    mpve_initializations = {
-        seed: _write_offline_fork_source(
-            tmp_path / "mpve_sources" / f"seed_{seed}" / "offline.pt",
-            seed=seed,
-            dataset=dataset,
-            koopman_path=koopman_path,
-        )
-        for seed in (11, 13)
-    }
     for method in METHODS:
         seeds = (11, 13) if method == METHODS[-1] else (11, 12)
         for seed in seeds:
@@ -776,23 +754,20 @@ def test_formal_aggregate_requires_full_matrix_and_identical_seed_sets(
                     dataset=dataset,
                     koopman_path=koopman_path,
                     eval_values=(100.0, 500.0, 900.0),
-                    initialization=(
-                        mpve_initializations[seed]
-                        if method == "Cal-RLPD-AC-KMPC-MPVE"
-                        else None
-                    ),
                 )
             )
     with pytest.raises(ValueError, match="same ordered training-seed set"):
         aggregate_runs(run_dirs)
 
 
-def test_formal_aggregate_requires_each_mpve_fork_from_included_same_seed_ac_run(
+def test_formal_aggregate_rejects_legacy_mpve_fork_lineage(
     tmp_path: Path,
 ) -> None:
+    """Unified MPVE owns its offline pretraining and rejects fork lineage."""
+
     dataset = _write_dataset(tmp_path / "dataset.npz")
     koopman_path = _write_koopman(tmp_path / "koopman.npz")
-    run_dirs, initializations = _write_formal_matrix(
+    run_dirs = _write_formal_matrix(
         tmp_path / "matrix",
         dataset=dataset,
         koopman_path=koopman_path,
@@ -802,26 +777,14 @@ def test_formal_aggregate_requires_each_mpve_fork_from_included_same_seed_ac_run
     assert result["protocol"]["common_training_seeds"] == [11, 12]
 
     mpve_run = tmp_path / "matrix" / "Cal-RLPD-AC-KMPC-MPVE" / "seed_12"
-    tampered_sha = dict(initializations[12])
-    tampered_sha["source_sha256"] = "0" * 64
-    _replace_initialization(mpve_run, tampered_sha)
-    with pytest.raises(ValueError, match="fork lineage"):
-        aggregate_runs(run_dirs)
-
-    missing_path = dict(initializations[12])
-    missing_path["source_path"] = str(
-        (tmp_path / "missing" / "seed_12" / "offline.pt").resolve()
-    )
-    _replace_initialization(mpve_run, missing_path)
-    with pytest.raises(FileNotFoundError, match="fork source is missing"):
-        aggregate_runs(run_dirs)
-
-    alternate = _write_offline_fork_source(
-        tmp_path / "alternate" / "seed_12" / "offline.pt",
+    legacy = _write_offline_fork_source(
+        tmp_path / "legacy_fork" / "seed_12" / "offline.pt",
         seed=12,
         dataset=dataset,
         koopman_path=koopman_path,
     )
-    _replace_initialization(mpve_run, alternate)
-    with pytest.raises(ValueError, match="included same-seed AC-KMPC run"):
+    _replace_initialization(mpve_run, legacy)
+    with pytest.raises(
+        ValueError, match="Non-forking checkpoint contains fork lineage"
+    ):
         aggregate_runs(run_dirs)
