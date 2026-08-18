@@ -363,8 +363,19 @@ def evaluate_checkpoint(
     dataset_override: Path | None = None,
     koopman_override: Path | None = None,
     device_name: str = "cpu",
+    episodes_per_seed: int = 1,
 ) -> dict[str, Any]:
-    """Evaluate exactly ten deterministic episodes under fixed reset seeds."""
+    """Evaluate ten fixed reset seeds, optionally repeating each seed.
+
+    ``episodes_per_seed=1`` is the inexpensive reference protocol used by
+    training checkpoints.  ``episodes_per_seed=10`` is the robustness
+    protocol (100 total episodes) and is deliberately kept out of training
+    budgets.
+    """
+    if isinstance(episodes_per_seed, bool) or not isinstance(episodes_per_seed, int):
+        raise TypeError("episodes_per_seed must be an integer")
+    if episodes_per_seed < 1:
+        raise ValueError("episodes_per_seed must be positive")
 
     validated = validate_run_identity(
         run_dir,
@@ -391,36 +402,47 @@ def evaluate_checkpoint(
     expected_protocol = validated.checkpoint["environment_protocol"]
     returns: list[float] = []
     lengths: list[int] = []
-    for index in range(EVALUATION_EPISODES):
-        reset_seed = EVALUATION_SEED_BASE + index
-        env = make_dmc_adapter(validated.config.task, seed=reset_seed)
-        try:
-            runtime_protocol = env.protocol_metadata()
-            if runtime_protocol != expected_protocol:
-                raise ValueError("Live DMC protocol differs from checkpoint")
-            observation = env.reset(seed=reset_seed)
-            episode_return = 0.0
-            finished = False
-            for step in range(int(env.step_limit)):
-                action = np.asarray(
-                    learner.act(observation, deterministic=True)[0],
-                    dtype=np.float32,
-                )
-                if action.shape != (1,) or not np.isfinite(action).all():
-                    raise RuntimeError("Policy emitted an invalid Cartpole action")
-                observation, reward, done, _info = env.step(action)
-                if not math.isfinite(float(reward)):
-                    raise RuntimeError("DMC emitted a non-finite reward")
-                episode_return += float(reward)
-                if done:
-                    lengths.append(step + 1)
-                    finished = True
-                    break
-            if not finished:
-                raise RuntimeError("DMC episode did not finish at its saved step limit")
-            returns.append(episode_return)
-        finally:
-            env.close()
+    episode_seeds: list[int] = []
+    for seed_index in range(EVALUATION_EPISODES):
+        # Derive independent deterministic episode resets while retaining a
+        # stable ten-seed grouping for reference/robustness summaries.
+        for episode_index in range(episodes_per_seed):
+            reset_seed = (
+                EVALUATION_SEED_BASE
+                + seed_index * episodes_per_seed
+                + episode_index
+            )
+            episode_seeds.append(reset_seed)
+            env = make_dmc_adapter(validated.config.task, seed=reset_seed)
+            try:
+                runtime_protocol = env.protocol_metadata()
+                if runtime_protocol != expected_protocol:
+                    raise ValueError("Live DMC protocol differs from checkpoint")
+                observation = env.reset(seed=reset_seed)
+                episode_return = 0.0
+                finished = False
+                for step in range(int(env.step_limit)):
+                    action = np.asarray(
+                        learner.act(observation, deterministic=True)[0],
+                        dtype=np.float32,
+                    )
+                    if action.shape != (1,) or not np.isfinite(action).all():
+                        raise RuntimeError("Policy emitted an invalid Cartpole action")
+                    observation, reward, done, _info = env.step(action)
+                    if not math.isfinite(float(reward)):
+                        raise RuntimeError("DMC emitted a non-finite reward")
+                    episode_return += float(reward)
+                    if done:
+                        lengths.append(step + 1)
+                        finished = True
+                        break
+                if not finished:
+                    raise RuntimeError(
+                        "DMC episode did not finish at its saved step limit"
+                    )
+                returns.append(episode_return)
+            finally:
+                env.close()
 
     values = np.asarray(returns, dtype=np.float64)
     result = {
@@ -456,11 +478,11 @@ def evaluate_checkpoint(
         "initialization": validated.checkpoint.get("initialization"),
         "evaluation_protocol": {
             "deterministic": True,
-            "episodes": EVALUATION_EPISODES,
+            "evaluation_seeds": EVALUATION_EPISODES,
+            "episodes_per_seed": episodes_per_seed,
+            "episodes": len(returns),
             "seed_base": EVALUATION_SEED_BASE,
-            "episode_seeds": list(
-                range(EVALUATION_SEED_BASE, EVALUATION_SEED_BASE + EVALUATION_EPISODES)
-            ),
+            "episode_seeds": episode_seeds,
             "device": str(device),
         },
         "returns": returns,
@@ -493,6 +515,12 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--koopman", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
+    parser.add_argument(
+        "--episodes-per-seed",
+        type=int,
+        default=1,
+        help="repeat each of the 10 fixed evaluation seeds (10 gives 100 episodes)",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     result = evaluate_checkpoint(
@@ -501,6 +529,7 @@ def main() -> None:
         dataset_override=args.dataset,
         koopman_override=args.koopman,
         device_name=args.device,
+        episodes_per_seed=args.episodes_per_seed,
     )
     output = args.output or (
         args.run_dir / f"evaluation_{args.checkpoint}_{EVALUATION_EPISODES}.json"

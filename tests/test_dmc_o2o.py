@@ -559,6 +559,12 @@ def _small_calql_config() -> O2OConfig:
     )
 
 
+def _small_calql_kmpc_config() -> O2OConfig:
+    return dataclasses.replace(
+        _small_config("Cal-QL-AC-KMPC"), critic_hidden_layers=2
+    )
+
+
 def test_method_specs_freeze_raw_and_structured_algorithm_profiles() -> None:
     calql = O2OConfig(method="Cal-QL-Raw")
     assert not calql.requires_koopman
@@ -580,6 +586,23 @@ def test_method_specs_freeze_raw_and_structured_algorithm_profiles() -> None:
     )
     assert calql.uses_calql_in_phase("offline")
     assert calql.uses_calql_in_phase("online")
+
+    calql_kmpc = O2OConfig(method="Cal-QL-AC-KMPC")
+    assert calql_kmpc.requires_koopman and calql_kmpc.uses_kmpc
+    assert calql_kmpc.requires_completed_online_returns
+    assert calql_kmpc.method_spec.profile == (
+        "exorl_cql_backbone_calql_ac_kmpc_lifted_v1"
+    )
+    # This pair is the controlled Cal-QL comparison: the representation,
+    # actor, method name and label differ; all optimization semantics match.
+    excluded = {"name", "representation", "actor", "profile"}
+    raw_spec = dataclasses.asdict(calql.method_spec)
+    kmpc_spec = dataclasses.asdict(calql_kmpc.method_spec)
+    assert {
+        key: value for key, value in raw_spec.items() if key not in excluded
+    } == {
+        key: value for key, value in kmpc_spec.items() if key not in excluded
+    }
 
     rlpd = O2OConfig(method="RLPD-Raw")
     assert not rlpd.requires_koopman
@@ -692,6 +715,22 @@ def test_calql_uses_exorl_network_layout_and_orthogonal_initialization() -> None
         torch.zeros(1, 5), deterministic=True
     )
     torch.testing.assert_close(action, torch.tanh(torch.tensor([[2.0]])))
+
+
+def test_calql_ac_kmpc_changes_only_the_structured_actor_and_input(
+    koopman: FrozenKoopman,
+) -> None:
+    config = _small_calql_kmpc_config()
+    learner = O2OLearner(config, koopman, torch.device("cpu"))
+    assert isinstance(learner.actor, KMPCTanhGaussianActor)
+    assert isinstance(learner.critic, ExORLCQLQEnsemble)
+    assert learner.state_dim == koopman.lifted_dim
+    assert learner.actor.log_std_min == pytest.approx(-10.0)
+    assert learner.critic.q_nets[0][0].in_features == koopman.lifted_dim + 1
+    assert config.critic_ensemble_size == 2
+    assert config.online_utd == 1
+    assert config.actor_q_reduction == "min"
+    assert config.backup_entropy is False
 
 
 def test_method_specific_q_entropy_and_critic_reductions_match_formulas() -> None:
@@ -1573,7 +1612,7 @@ def test_online_collection_batches_five_envs_but_updates_once_per_transition(
         critic_hidden_layers=1,
         critic_ensemble_size=2,
         target_critic_subset=2,
-        offline_updates=1,
+        offline_updates=2,
         cql_actions=2,
         online_steps=10,
         online_utd=20,
@@ -1589,6 +1628,7 @@ def test_online_collection_batches_five_envs_but_updates_once_per_transition(
         eval_episodes=10,
         checkpoint_interval_updates=1,
         log_interval_updates=1,
+        offline_eval_interval_updates=1,
     )
 
     train_module.run(config, Path("unused.npz"), koopman_path, tmp_path / "run")
@@ -1599,13 +1639,15 @@ def test_online_collection_batches_five_envs_but_updates_once_per_transition(
     assert learner.act_batch_shapes == [(5, 5), (5, 5)]
     offline_calls = [call for call in learner.update_calls if call[1] == "offline"]
     online_calls = [call for call in learner.update_calls if call[1] == "online"]
-    assert offline_calls == [(2, "offline", 1)]
+    assert offline_calls == [(2, "offline", 1)] * 2
     assert online_calls == [(40, "online", 20)] * 10
 
     rows = [
         json.loads(line)
         for line in (tmp_path / "run" / "metrics.jsonl").read_text().splitlines()
     ]
+    diagnostics = [row for row in rows if row["phase"] == "offline_diagnostic"]
+    assert [row["offline_update"] for row in diagnostics] == [1]
     episodes = [row for row in rows if row["phase"] == "online_episode"]
     assert [row["online_step"] for row in episodes] == [6, 7, 8, 9, 10]
     assert [row["episode"] for row in episodes] == [0, 1, 2, 3, 4]

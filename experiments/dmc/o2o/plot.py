@@ -16,6 +16,7 @@ from experiments.dmc.o2o.aggregate import AGGREGATE_KIND, MAX_EPISODE_RETURN
 
 COLORS = {
     "Cal-QL-Raw": "#4c78a8",
+    "Cal-QL-AC-KMPC": "#b279a2",
     "RLPD-Raw": "#72b7b2",
     "Cal-RLPD-Raw": "#54a24b",
     "Cal-QL-KMPC": "#f58518",

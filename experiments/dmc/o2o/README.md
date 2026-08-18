@@ -1,6 +1,6 @@
 # DMC Cartpole offline-to-online AC-KMPC
 
-本目录在 DMC `cartpole_swingup` 上比较三条不含 Koopman 的标准 MLP baseline，与两条
+本目录在 DMC `cartpole_swingup` 上比较三条不含 Koopman 的标准 MLP baseline，与三条
 包含冻结 Koopman/AC-KMPC 先验的方法。主协议先使用 **50,000 个在线真实环境步**；每个
 episode 固定 1,000 步，return 范围为 `[0, 1000]`。
 
@@ -9,18 +9,19 @@ episode 固定 1,000 步，return 范围为 `[0, 1000]`。
 > **official-implementation-derived / official-style port**，不是官方分数或逐行复现。
 > `Cal-RLPD-*` 是本项目的组合方法，更不能写成 Cal-QL 或 RLPD 官方算法结果。
 
-## 五方法协议
+## 六方法协议
 
 | 运行名 | 离线阶段 | 在线阶段 | actor/critic 输入 | actor | MPVE |
 | --- | --- | --- | --- | --- | --- |
 | `Cal-QL-Raw` | Cal-QL | Cal-QL（继续 calibration/CQL） | 标准化 raw observation | MLP | 无 |
+| `Cal-QL-AC-KMPC` | Cal-QL | Cal-QL（继续 calibration/CQL） | frozen lifted state | differentiable AC-KMPC | 无 |
 | `RLPD-Raw` | 无 | RLPD，offline/online replay 混合 | 标准化 raw observation | MLP | 无 |
 | `Cal-RLPD-Raw` | Cal-QL-regularized RLPD | pure RLPD，offline/online replay 混合 | 标准化 raw observation | MLP | 无 |
 | `Cal-RLPD-AC-KMPC` | Cal-QL-regularized RLPD | pure RLPD，offline/online replay 混合 | frozen lifted state | differentiable AC-KMPC | 无 |
 | `Cal-RLPD-AC-KMPC-MPVE` | 配对 AC-KMPC `offline.pt` 的精确 fork | pure RLPD + MPVE | frozen lifted state | differentiable AC-KMPC | 有 |
 
-前三个 baseline 的 `koopman` 身份必须为 JSON `null`，actor 和 critic 都只接收由离线
-数据统计量标准化的 5 维原始 observation；命令行传入 `--koopman` 会被拒绝。后两种方法
+三个 `*-Raw` baseline 的 `koopman` 身份必须为 JSON `null`，actor 和 critic 都只接收由离线
+数据统计量标准化的 5 维原始 observation；命令行传入 `--koopman` 会被拒绝。三个 AC-KMPC 方法
 共享一个冻结的 Koopman，当前 lifted state 为 5 维标准化 observation 加 10 维 learned
 lift。正式 aggregate 会验证这个边界，防止把含 Koopman 的 MLP 错当作标准 baseline。
 
@@ -48,17 +49,21 @@ transition 预算和 deterministic evaluation grid。完整解析参数与出处
   return-to-go。在线 transition 必须等完整 1,000-step episode 结束、RTG 可确定后才写入
   replay 并补做对应更新；此时 50:50 mixed batch 的 offline/online 每一行都有有效 MC
   target，在线阶段继续 calibrated CQL，而不是切换到 RLPD。
+- `Cal-QL-AC-KMPC` 是 `Cal-QL-Raw` 的严格结构对照：2-Q、两层1024、batch1024、
+  UTD1、学习率、temperature、CQL/calibration、target backup 和60k离线预算完全一致；
+  唯一有意改变的是 frozen lifted representation 与 differentiable AC-KMPC actor。其
+  KMPC exploration log-std 也沿用 Cal-QL profile 的 `[-10,2]` 截断。
 - `RLPD-Raw` 完全不做离线梯度预训练；先收集 5,000 个随机在线 transition，再按 50:50
   混合 offline/online replay。它使用 raw-5、10-Q ensemble、随机 2-Q target subset、
   两层 256-unit 网络、batch 256、`tau=0.005`、三组 learning rate 均为 `3e-4`、online
   `UTD=20`、entropy backup、ensemble-mean actor objective、target entropy `-0.5` 和
   RLPD temperature objective。
 - 三个 `Cal-RLPD-*` 的 profile 是
-  `calql_regularized_rlpd_offline_then_rlpd_online_v1`：500k 离线更新阶段才加入 K=10、
+  `calql_regularized_rlpd_offline_then_rlpd_online_v1`：60k 离线更新阶段才加入 K=10、
   weight `0.01` 的 calibrated CQL regularizer；进入在线阶段后 **CQL/calibration loss 为
   零，使用 pure RLPD 更新**。它们在线均使用上述 RLPD 10-Q/UTD20/50:50 replay 语义；
   差别仅是 raw MLP、AC-KMPC structured actor，以及是否增加 MPVE auxiliary loss。离线
-  500k 是 gradient-update 数量且每次取一个 batch，不应误读成 `500k × UTD20`。
+  60k 是 gradient-update 数量且每次取一个 batch，不应误读成 `60k × UTD20`。
 
 AC-KMPC 规划 horizon `H=20`（`0.20 s`）。MPVE 总 TD horizon 为 10：一个 replay 中的
 真实 transition 加九个 Koopman transition（总计 `0.10 s`）；model rollout reward 由
@@ -72,22 +77,23 @@ critic、target critic、temperature、optimizers 和 RNG state，保证在线�
 `0, 1k, 2.5k, 5k, 10k, ..., 50k`，每点使用同一组 10 个 deterministic reset seeds。
 25k 的 return/AUC 是预先注册的中期诊断点，**不是选择性停止某个方法的依据**。
 
-当前唯一允许启动的 development 配置是：training seed `20260821`；root
-`runs/o2o/matrix/cartpole_stratified1m_raw_dev1_v2`；上述
-Proto-Stratified-1M dataset 和 lift10 Koopman SHA；Cal-QL/Cal-RLPD 离线预算 500k
-gradient updates（`RLPD-Raw` 为 0，MPVE 精确 fork 而不重复计算）；五方法在线预算均为
+当前 development 配置是：training seed `20260822`；root
+`runs/o2o/matrix/cartpole_stratified1m_sixmethod_seed20260822_offline60k_v1`；上述
+Proto-Stratified-1M dataset 和 lift10 Koopman SHA；Cal-QL/Cal-RLPD 离线预算 60k
+gradient updates（`RLPD-Raw` 为 0，MPVE 精确 fork 而不重复计算），每10k离线更新做一次
+固定10-episode诊断；六方法在线预算均为
 50k transition；train device `cuda`、独立 final evaluation device `cpu`、
-`max_parallel=4`。`Cal-QL-Raw` collector 为 1 env/1 worker，其余四种为 5 env/5 worker；
+`max_parallel=5`。两个 Cal-QL 方法 collector 为 1 env/1 worker，RLPD系为 5 env/5 worker；
 这些差异属于 method-specific recipe，不改变以单条真实 transition 计数的公共预算。三 seed
 `20260821,20260822,20260823` 只用于 development 通过后的独立正式复验，不是当前矩阵。
 
 - 允许因数值崩坏或基础设施故障终止异常 run，但不能把它报告成性能早停结果。
-- 性能早停只能在相同 online step 对五方法和全部 seed 使用同一预注册准则，并同时停止；
+- 性能早停只能在相同 online step 对六方法和全部 seed 使用同一预注册准则，并同时停止；
   当前 50k 开发矩阵默认不自动性能早停。
-- 若 50k 时学习曲线仍持续上升，只能把五方法和全部 seed 统一扩展到同一个新预算；不得
+- 若 50k 时学习曲线仍持续上升，只能把六方法和全部 seed 统一扩展到同一个新预算；不得
   只延长较弱或较强的方法。扩展后的正式 aggregate 从 run config 读取新终点，不硬编码
   100k，并重新要求完整公共 evaluation grid。源矩阵完整结束后，以原始 `--online-steps
-  50000` 命令加 `--extend-online-steps N` 重新调用 runner；它会先校验五方法×全部 seed
+  50000` 命令加 `--extend-online-steps N` 重新调用 runner；它会先校验六方法×全部 seed
   的 base run，先复制归档原 matrix manifest/status，再统一迁移。扩展调度可幂等重试，
   能识别同一矩阵中 base-complete、target-partial 与 target-complete 的混合中断状态；它
   不会覆盖第一次归档，也不会重复扩展已到目标预算的 run。身份缺失、目标预算不统一或
@@ -195,7 +201,7 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false \
   --seed 20260821
 ```
 
-正式五组实验必须共享同一个通过验证的
+正式六组实验中的三个 structured 方法必须共享同一个通过验证的
 `runs/o2o/koopman/CartpoleSwingup/proto_stratified_1m_lift10/best.npz`，训练期间保持
 冻结。当前 artifact SHA256 为
 `7d61b4b13417b70a9b51d55638d4437e05a018e1888af3ab19cbb0e2093e9edc`，best epoch 为
@@ -222,12 +228,12 @@ python -m experiments.dmc.o2o.evaluate_koopman \
   --output runs/o2o/evaluation/koopman/cartpole_proto_stratified1m_lift10.recomputed.json
 ```
 
-## 3. 可恢复的五方法矩阵 runner（推荐）
+## 3. 可恢复的六方法矩阵 runner（推荐）
 
-当前先运行 `seed=20260821` 的完整五方法 **development matrix**，用于确认算法趋势和
+当前先运行 `seed=20260822` 的完整六方法 **development matrix**，用于确认算法趋势和
 50k 预算是否合适；它不是多 seed 统计结论。三 seed
 `20260821,20260822,20260823` 仅在 development 通过后作为正式复验。矩阵 runner 通过
-`--max-parallel` 可以让前四种初始方法并发，MPVE 的依赖就绪后也进入同一个并发池。
+`--max-parallel` 可以让前五种初始方法并发，MPVE 的依赖就绪后也进入同一个并发池。
 MPVE 只会在**同一 seed** 的
 `Cal-RLPD-AC-KMPC/offline.pt` 已经原子写出后启动，因此不必等待该 AC-KMPC 分支完成
 online phase。任一子进程失败后 runner 不再派发新任务，但不会杀死已启动任务。
@@ -238,12 +244,13 @@ online phase。任一子进程失败后 runner 不再派发新任务，但不会
 python -m experiments.dmc.o2o.runner \
   --dataset runs/o2o/data/exorl/cartpole/proto_stratified_1m/transitions.npz \
   --koopman runs/o2o/koopman/CartpoleSwingup/proto_stratified_1m_lift10/best.npz \
-  --root runs/o2o/matrix/cartpole_stratified1m_raw_dev1_v2 \
-  --seeds 20260821 \
+  --root runs/o2o/matrix/cartpole_stratified1m_sixmethod_seed20260822_offline60k_v1 \
+  --seeds 20260822 \
   --device cuda \
-  --offline-updates 500000 \
+  --offline-updates 60000 \
+  --offline-eval-interval-updates 10000 \
   --online-steps 50000 \
-  --max-parallel 4 \
+  --max-parallel 5 \
   --dry-run
 ```
 
@@ -252,16 +259,18 @@ python -m experiments.dmc.o2o.runner \
 `matrix_status.json`：
 
 ```bash
-ROOT=runs/o2o/matrix/cartpole_stratified1m_raw_dev1_v2
+ROOT=runs/o2o/matrix/cartpole_stratified1m_sixmethod_seed20260822_offline60k_v1
 mkdir -p "$ROOT"
 nohup python -m experiments.dmc.o2o.runner \
   --dataset runs/o2o/data/exorl/cartpole/proto_stratified_1m/transitions.npz \
   --koopman runs/o2o/koopman/CartpoleSwingup/proto_stratified_1m_lift10/best.npz \
   --root "$ROOT" \
-  --seeds 20260821 \
+  --seeds 20260822 \
   --device cuda \
+  --offline-updates 60000 \
+  --offline-eval-interval-updates 10000 \
   --online-steps 50000 \
-  --max-parallel 4 \
+  --max-parallel 5 \
   >"$ROOT/runner.log" 2>&1 &
 ```
 
@@ -270,7 +279,7 @@ nohup python -m experiments.dmc.o2o.runner \
 `runs/o2o/matrix/cartpole_stratified1m_raw_v1` 只是三 seed dry-run 审计，不是当前启动
 目标。重复同一命令会严格检查 config/dataset/Koopman
 身份：完成的 run 跳过，未完成且有
-`latest.pt` 的 run 交给 `train.py` 精确恢复。五组全部完成后，runner 顺序评估各自
+`latest.pt` 的 run 交给 `train.py` 精确恢复。六组全部完成后，runner 顺序评估各自
 `latest.pt`，然后自动运行严格 aggregate 和 PNG/PDF plot。启动时的 git commit、分支、
 dirty 摘要、训练源码逐文件 SHA、Python/Torch/CUDA 和子进程线程环境都会写入 manifest；
 运行期间训练核心源码发生变化时，后续任务会 fail-fast。`CUDA_VISIBLE_DEVICES` 原样继承，
@@ -284,18 +293,18 @@ checkpoint”的半成品。
 `--max-parallel=1` 是保守默认值。提高并发数前应按模型显存实测；runner 不会修改或终止
 机器上已有的 GPU 进程。
 
-## 4. 手工训练五组方法
+## 4. 手工训练六组方法
 
-下面是一套单 seed 的完整受控运行。重复实验时只改 `SEED`，并让五组方法共享它；
+下面是一套单 seed 的完整受控运行。重复实验时只改 `SEED`，并让六组方法共享它；
 每个目录存在 `latest.pt` 时命令会从完整 learner/replay/RNG checkpoint 恢复。
 
 ```bash
 cd /root/autodl-tmp/AC-MPC
 
-SEED=20260821
+SEED=20260822
 DATASET=runs/o2o/data/exorl/cartpole/proto_stratified_1m/transitions.npz
 KOOPMAN=runs/o2o/koopman/CartpoleSwingup/proto_stratified_1m_lift10/best.npz
-RUN_ROOT="runs/o2o/matrix/cartpole_stratified1m_raw_dev1_v2/seed_${SEED}"
+RUN_ROOT="runs/o2o/matrix/cartpole_stratified1m_sixmethod_seed20260822_offline60k_v1/seed_${SEED}"
 
 for METHOD in Cal-QL-Raw RLPD-Raw Cal-RLPD-Raw; do
   python -m experiments.dmc.o2o.train \
@@ -304,25 +313,29 @@ for METHOD in Cal-QL-Raw RLPD-Raw Cal-RLPD-Raw; do
     --output-dir "$RUN_ROOT/$METHOD" \
     --seed "$SEED" \
     --device cuda \
-    --offline-updates 500000 \
+    --offline-updates 60000 \
+    --offline-eval-interval-updates 10000 \
     --online-steps 50000 \
     --cql-weight 0.01 \
     --eval-episodes 10
 done
 
-python -m experiments.dmc.o2o.train \
-  --method Cal-RLPD-AC-KMPC \
-  --dataset "$DATASET" \
-  --koopman "$KOOPMAN" \
-  --output-dir "$RUN_ROOT/Cal-RLPD-AC-KMPC" \
-  --seed "$SEED" \
-  --device cuda \
-  --offline-updates 500000 \
-  --online-steps 50000 \
-  --eval-episodes 10
+for METHOD in Cal-QL-AC-KMPC Cal-RLPD-AC-KMPC; do
+  python -m experiments.dmc.o2o.train \
+    --method "$METHOD" \
+    --dataset "$DATASET" \
+    --koopman "$KOOPMAN" \
+    --output-dir "$RUN_ROOT/$METHOD" \
+    --seed "$SEED" \
+    --device cuda \
+    --offline-updates 60000 \
+    --offline-eval-interval-updates 10000 \
+    --online-steps 50000 \
+    --eval-episodes 10
+done
 ```
 
-`Cal-RLPD-AC-KMPC` 完成自己的 500k 离线阶段时会保存专用 `offline.pt`。MPVE 从该文件
+`Cal-RLPD-AC-KMPC` 完成自己的 60k 离线阶段时会保存专用 `offline.pt`。MPVE 从该文件
 精确分叉；不要给它另行做一次随机初始化的离线预训练：
 
 ```bash
@@ -333,7 +346,8 @@ python -m experiments.dmc.o2o.train \
   --output-dir "$RUN_ROOT/Cal-RLPD-AC-KMPC-MPVE" \
   --seed "$SEED" \
   --device cuda \
-  --offline-updates 500000 \
+  --offline-updates 60000 \
+  --offline-eval-interval-updates 10000 \
   --online-steps 50000 \
   --cql-weight 0.01 \
   --eval-episodes 10 \
@@ -353,7 +367,7 @@ Koopman SHA 和当前 DMC protocol 都写入 run/checkpoint；恢复时任何身
 10-episode 独立评估：
 
 ```bash
-for METHOD in Cal-QL-Raw RLPD-Raw Cal-RLPD-Raw Cal-RLPD-AC-KMPC Cal-RLPD-AC-KMPC-MPVE; do
+for METHOD in Cal-QL-Raw Cal-QL-AC-KMPC RLPD-Raw Cal-RLPD-Raw Cal-RLPD-AC-KMPC Cal-RLPD-AC-KMPC-MPVE; do
   python -m experiments.dmc.o2o.evaluate \
     --run-dir "$RUN_ROOT/$METHOD" \
     --checkpoint latest \
@@ -366,7 +380,7 @@ runner 的真实结果命名是每个 run 下的 `evaluation_latest_10.json`，�
 `results/cartpole_o2o.pdf`。手工重建同一结果时也应显式传入该矩阵的 manifest：
 
 ```bash
-ROOT=runs/o2o/matrix/cartpole_stratified1m_raw_dev1_v2
+ROOT=runs/o2o/matrix/cartpole_stratified1m_sixmethod_seed20260822_offline60k_v1
 
 python -m experiments.dmc.o2o.aggregate \
   --matrix-manifest "$ROOT/matrix_manifest.json" \
@@ -378,10 +392,10 @@ python -m experiments.dmc.o2o.plot \
   --output-prefix "$ROOT/results/cartpole_o2o"
 ```
 
-严格聚合要求每条曲线到达其共同配置预算，五组使用相同 dataset/DMC/seed set/evaluation
-grid，三个 raw baseline 的 Koopman 为 null，两个 structured 方法共享同一个 Koopman。
+严格聚合要求每条曲线到达其共同配置预算，六组使用相同 dataset/DMC/seed set/evaluation
+grid，三个 raw baseline 的 Koopman 为 null，三个 structured 方法共享同一个 Koopman。
 算法特定超参数可以跨方法不同；同一方法跨 training seed 则必须除 `seed` 外完全一致。
-aggregate 还会用 `matrix_manifest.json` 核对五方法的精确 run directory、resolved config、
+aggregate 还会用 `matrix_manifest.json` 核对六方法的精确 run directory、resolved config、
 dataset/Koopman、预算和 training/result/runner 源码逐文件 SHA，并把 source identity 写回
 结果。未提供 `--matrix-manifest` 时仍可生成诊断 JSON，但会明确写
 `source_verified=false, formal_complete=false`，不得作为正式 complete aggregate。

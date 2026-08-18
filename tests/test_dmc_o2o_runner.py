@@ -136,19 +136,24 @@ def test_parse_seeds_and_plan_has_exact_mpve_fork(tmp_path: Path) -> None:
     jobs = matrix.build_jobs(spec, dataset=dataset, koopman=koopman)
     training = [job for job in jobs if job.stage == "train"]
     assert [job.method for job in training] == list(matrix.MATRIX_METHODS)
-    for job in training[:3]:
-        assert "--koopman" not in job.argv
-    for job in training[3:]:
-        assert job.argv[job.argv.index("--koopman") + 1] == str(spec.koopman)
+    for job in training:
+        if job.method in matrix.RAW_METHODS:
+            assert "--koopman" not in job.argv
+        else:
+            assert job.argv[job.argv.index("--koopman") + 1] == str(spec.koopman)
     mpve = training[-1]
     source = spec.offline_source(11)
     assert mpve.artifact_dependency == source
     index = mpve.argv.index("--initialize-from-offline")
     assert mpve.argv[index + 1] == str(source)
     evaluations = [job for job in jobs if job.stage == "evaluate"]
-    assert len(evaluations) == 5
-    assert all("--koopman" not in job.argv for job in evaluations[:3])
-    assert all("--koopman" in job.argv for job in evaluations[3:])
+    assert len(evaluations) == len(matrix.MATRIX_METHODS)
+    assert all(
+        ("--koopman" not in job.argv)
+        if job.method in matrix.RAW_METHODS
+        else ("--koopman" in job.argv)
+        for job in evaluations
+    )
     assert all(job.depends_on for job in evaluations)
     assert jobs[-2].stage == "aggregate"
     aggregate = jobs[-2]
@@ -189,7 +194,7 @@ def test_dry_run_writes_atomic_audit_without_spawning(
         2_500,
         5_000,
     ]
-    assert len(manifest["jobs"]) == 12
+    assert len(manifest["jobs"]) == 2 * len(matrix.MATRIX_METHODS) + 2
     assert status["state"] == "dry_run"
     assert {job["state"] for job in status["jobs"].values()} == {"planned"}
 
@@ -262,7 +267,7 @@ def test_matrix_extension_requires_every_completed_source_and_is_common(
         extension, dataset=dataset, koopman=shared_koopman
     )
     training = [job for job in jobs if job.stage == "train"]
-    assert len(training) == 5
+    assert len(training) == len(matrix.MATRIX_METHODS)
     assert all(job.mode_at_plan == "extend" for job in training)
     assert all(
         job.argv[job.argv.index("--extend-online-steps") + 1] == "10000"
