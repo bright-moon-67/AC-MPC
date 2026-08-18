@@ -1,4 +1,4 @@
-"""Strict common-scale evaluation of Cartpole Koopman exports on ExORL Proto."""
+"""Strict common-scale evaluation of DMC Koopman exports on ExORL Proto."""
 
 from __future__ import annotations
 
@@ -21,10 +21,13 @@ from experiments.dmc.o2o.dataset import (
     _episode_index_identity,
     temporal_stratified_episode_indices,
 )
+from experiments.dmc.reward_oracle import walker_run_exact_reward_numpy
 
 
 EVALUATION_KIND = "acmpc_exorl_cartpole_koopman_test_evaluation_v1"
+WALKER_EVALUATION_KIND = "acmpc_exorl_walker_run_koopman_test_evaluation_v1"
 DATA_MANIFEST_KIND = "exorl_cartpole_koopman_adapter_v1"
+WALKER_DATA_MANIFEST_KIND = "exorl_walker_run_koopman_adapter_v1"
 MODEL_KIND = "playground_koopman_export_v1"
 TASK = "CartpoleSwingup"
 REWARD_IDENTITY = "dm_control_cartpole_swingup_dense_observation_oracle_v1"
@@ -36,6 +39,28 @@ STATE_NAMES = (
     "angular_velocity",
 )
 STANDARD_REPORT_HORIZONS = (1, 5, 10, 20, 50)
+WALKER_STATE_NAMES = tuple(
+    [f"orientation_{index}" for index in range(14)]
+    + ["height"]
+    + [f"velocity_{index}" for index in range(9)]
+)
+TASK_CONFIGS = {
+    "CartpoleSwingup": {
+        "state_dim": 5, "action_dim": 1, "control_timestep": 0.01,
+        "horizon_steps": 50, "state_names": STATE_NAMES,
+        "reward": REWARD_IDENTITY, "manifest_kind": DATA_MANIFEST_KIND,
+        "report_horizons": STANDARD_REPORT_HORIZONS,
+    },
+    "WalkerRun": {
+        "state_dim": 24, "action_dim": 6, "control_timestep": 0.025,
+        "horizon_steps": 20, "state_names": WALKER_STATE_NAMES,
+        "reward": "dm_control_walker_run_exact_observation_oracle_v1",
+        "manifest_kind": WALKER_DATA_MANIFEST_KIND,
+        # Includes the playbook K=1/5/10 gate, Walker MPVE H=4, KMPC H=8,
+        # an additional contact-drift diagnostic at 12, and full train K=20.
+        "report_horizons": (1, 4, 5, 8, 10, 12, 20),
+    },
+}
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -54,6 +79,8 @@ class EvaluationProtocol:
     test_residue: int = 9
     rollout_discount: float = 0.99
     control_timestep: float = 0.01
+    task: str = TASK
+    state_names: tuple[str, ...] = STATE_NAMES
 
     def validate(self) -> None:
         if not self.stage_ranges:
@@ -69,8 +96,18 @@ class EvaluationProtocol:
             cursor = right
         if self.episode_steps < 1 or not 1 <= self.horizon_steps <= self.episode_steps:
             raise ValueError("Invalid episode or rollout horizon")
-        if self.state_dim != len(STATE_NAMES) or self.action_dim != 1:
-            raise ValueError("The Cartpole evaluator requires state/action dimensions 5/1")
+        config = TASK_CONFIGS.get(self.task)
+        if config is None:
+            raise ValueError(f"Unsupported Koopman evaluation task: {self.task}")
+        if (
+            self.state_dim != config["state_dim"]
+            or self.action_dim != config["action_dim"]
+            or self.state_dim != len(self.state_names)
+        ):
+            raise ValueError(
+                f"{self.task} evaluator requires state/action dimensions "
+                f"{config['state_dim']}/{config['action_dim']}"
+            )
         residues = (*self.train_residues, self.validation_residue, self.test_residue)
         if len(set(residues)) != len(residues) or any(
             residue < 0 or residue >= self.split_modulus for residue in residues
@@ -139,10 +176,19 @@ def protocol_from_data_manifest(data_dir: Path) -> EvaluationProtocol:
     episode_steps = manifest.get("episode_steps")
     if isinstance(episode_steps, bool) or not isinstance(episode_steps, int):
         raise ValueError("Manifest episode_steps must be an integer")
+    task = manifest.get("task")
+    if task not in TASK_CONFIGS:
+        raise ValueError(f"Unsupported manifest task: {task!r}")
+    config = TASK_CONFIGS[task]
     return EvaluationProtocol(
         stage_ranges=tuple(rows),
         episode_steps=episode_steps,
-        horizon_steps=50,
+        horizon_steps=config["horizon_steps"],
+        state_dim=config["state_dim"],
+        action_dim=config["action_dim"],
+        control_timestep=config["control_timestep"],
+        task=task,
+        state_names=config["state_names"],
     )
 
 
@@ -168,7 +214,7 @@ class LoadedData:
     reference_center: np.ndarray
     reference_scale: np.ndarray
     reference_samples: int
-    reward_parity_max_abs_error: float
+    reward_parity_max_abs_error: float | None
 
 
 @dataclass(frozen=True)
@@ -262,8 +308,8 @@ def _validate_manifest_header(
     manifest: Mapping[str, Any], protocol: EvaluationProtocol
 ) -> None:
     expected = {
-        "kind": DATA_MANIFEST_KIND,
-        "task": TASK,
+        "kind": TASK_CONFIGS[protocol.task]["manifest_kind"],
+        "task": protocol.task,
         "total_transitions": protocol.total_transitions,
         "episodes": protocol.episodes,
         "stage_episode_counts": protocol.stage_counts,
@@ -272,7 +318,7 @@ def _validate_manifest_header(
         "action_dim": protocol.action_dim,
         "trainer_episode_split": "per_stage_modulo_10_8_1_1",
         "trainer_split_episode_counts": protocol.split_counts(),
-        "reward": REWARD_IDENTITY,
+        "reward": TASK_CONFIGS[protocol.task]["reward"],
     }
     mismatches = {
         key: {"actual": manifest.get(key), "expected": value}
@@ -427,7 +473,10 @@ def load_proto_data(
     if set(manifest_stages) != expected_stage_names:
         raise ValueError("Manifest stage names differ from the formal protocol")
     stages: list[StageData] = []
-    reward_parity_max = 0.0
+    reward_parity_max: float | None = None
+    reward_source = manifest.get("reward_source", "oracle")
+    if reward_source not in {"oracle", "recorded", "zero"}:
+        raise ValueError(f"Unsupported staged reward source: {reward_source!r}")
     training_states: list[np.ndarray] = []
     all_source_episode_indices = manifest.get("source_episode_indices")
     for name, left, right in protocol.stage_ranges:
@@ -456,16 +505,26 @@ def load_proto_data(
             expected_episodes=right - left,
             protocol=protocol,
         )
-        exact_reward = _cartpole_reward(states[:, 1:], actions)
-        stage_reward_error = float(
-            np.max(np.abs(exact_reward.astype(np.float64) - rewards.astype(np.float64)))
-        )
-        reward_parity_max = max(reward_parity_max, stage_reward_error)
-        if stage_reward_error > 2e-7:
-            raise ValueError(
-                f"{name} stored reward differs from the exact Cartpole oracle: "
-                f"max_abs_error={stage_reward_error}"
+        if reward_source == "oracle":
+            exact_reward = (
+                _cartpole_reward(states[:, 1:], actions)
+                if protocol.task == "CartpoleSwingup"
+                else walker_run_exact_reward_numpy(states[:, 1:], actions)
             )
+            stage_reward_error = float(
+                np.max(
+                    np.abs(
+                        exact_reward.astype(np.float64)
+                        - rewards.astype(np.float64)
+                    )
+                )
+            )
+            reward_parity_max = max(reward_parity_max or 0.0, stage_reward_error)
+            if stage_reward_error > 2e-7:
+                raise ValueError(
+                    f"{name} stored reward differs from the exact {protocol.task} oracle: "
+                    f"max_abs_error={stage_reward_error}"
+                )
         local_episode = np.arange(right - left)
         train_mask = np.isin(local_episode % protocol.split_modulus, protocol.train_residues)
         training_states.append(states[train_mask, :-1].reshape(-1, protocol.state_dim))
@@ -577,8 +636,8 @@ def load_model(
     try:
         with np.load(path, allow_pickle=False) as archive:
             metadata = _metadata_from_archive(archive, path)
-            if metadata.get("kind") != MODEL_KIND or metadata.get("task") != TASK:
-                raise ValueError(f"{path} is not a Cartpole Playground Koopman export")
+            if metadata.get("kind") != MODEL_KIND or metadata.get("task") != protocol.task:
+                raise ValueError(f"{path} is not a {protocol.task} Playground Koopman export")
             architecture = _require_mapping(
                 metadata.get("architecture"), field=f"{path}.metadata.architecture"
             )
@@ -589,7 +648,9 @@ def load_model(
                 "activation": "silu",
             }
             if any(architecture.get(key) != value for key, value in expected_architecture.items()):
-                raise ValueError(f"{path} architecture is incompatible with Cartpole O2O")
+                raise ValueError(
+                    f"{path} architecture is incompatible with {protocol.task} O2O"
+                )
             lift_dim = architecture.get("lift_dim")
             if isinstance(lift_dim, bool) or not isinstance(lift_dim, int) or lift_dim < 1:
                 raise ValueError(f"{path} architecture lift_dim must be positive")
@@ -812,13 +873,13 @@ def _finalize_metrics(
             ),
             "by_dimension": {
                 name: float(value)
-                for name, value in zip(STATE_NAMES, physical_rmse, strict=True)
+        for name, value in zip(protocol.state_names, physical_rmse, strict=True)
             },
         },
         "exact_reward_prediction": {
             "contract": (
                 "oracle(predicted_next_observation, dataset_action)"
-                "_vs_stored_exact_reward"
+                "_vs_oracle(true_next_observation, dataset_action)"
             ),
             "uses_learned_reward_model": False,
             "predictions": reward_predictions,
@@ -855,7 +916,7 @@ def _evaluate_model(
     )
     report_horizons = tuple(
         horizon
-        for horizon in STANDARD_REPORT_HORIZONS
+        for horizon in TASK_CONFIGS[protocol.task]["report_horizons"]
         if horizon <= protocol.horizon_steps
     )
     if protocol.horizon_steps not in report_horizons:
@@ -896,9 +957,12 @@ def _evaluate_model(
             true_state = stage.states[
                 episode_index[:, None], time_index + 1
             ].astype(np.float64, copy=False)
-            true_reward = stage.rewards[
-                episode_index[:, None], time_index
-            ].astype(np.float64, copy=False)
+            true_state_for_reward = true_state
+            true_reward = (
+                _cartpole_reward(true_state_for_reward, actions)
+                if protocol.task == "CartpoleSwingup"
+                else walker_run_exact_reward_numpy(true_state_for_reward, actions)
+            ).astype(np.float64, copy=False)
             initial = stage.states[episode_index, start_index].astype(
                 np.float64, copy=False
             )
@@ -920,9 +984,11 @@ def _evaluate_model(
                 (initial[:, None, :] - true_state)
                 / data.reference_scale[None, None, :]
             ) ** 2
-            predicted_reward = _cartpole_reward(predicted, actions).astype(
-                np.float64, copy=False
-            )
+            predicted_reward = (
+                _cartpole_reward(predicted, actions)
+                if protocol.task == "CartpoleSwingup"
+                else walker_run_exact_reward_numpy(predicted, actions)
+            ).astype(np.float64, copy=False)
             reward_error = predicted_reward - true_reward
             for horizon in report_horizons:
                 prefix = slice(0, horizon)
@@ -1049,8 +1115,12 @@ def evaluate_models(
     if sum(common_window_counts.values()) != expected_windows:
         raise AssertionError("Episode-safe window count drifted")
     return {
-        "kind": EVALUATION_KIND,
-        "task": TASK,
+        "kind": (
+            EVALUATION_KIND
+            if protocol.task == "CartpoleSwingup"
+            else WALKER_EVALUATION_KIND
+        ),
+        "task": protocol.task,
         "device": "cpu_numpy_float64",
         "protocol": {
             "split": "per_stage_local_episode_index_mod_10_equals_9",
@@ -1092,7 +1162,10 @@ def evaluate_models(
                 "source_episode_identity_sha256"
             ],
             "stage_sha256": {stage.name: stage.sha256 for stage in data.stages},
-            "stored_exact_reward_max_abs_error": data.reward_parity_max_abs_error,
+            "stored_reward_source": data.manifest.get("reward_source", "oracle"),
+            "stored_reward_oracle_parity_max_abs_error": (
+                data.reward_parity_max_abs_error
+            ),
         },
         "common_train_reference": {
             "split": "per_stage_local_episode_index_mod_10_in_0_to_7",
@@ -1111,11 +1184,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     model_paths = [path.resolve() for _name, path in args.model]
     if output in model_paths:
         raise ValueError("--output must not overwrite an input model")
-    result = evaluate_models(
-        args.data_dir,
-        args.model,
-        batch_size=args.batch_size,
-    )
+    requested_task = getattr(args, "task", None)
+    if requested_task is None:
+        result = evaluate_models(
+            args.data_dir, args.model, batch_size=args.batch_size
+        )
+    else:
+        protocol = protocol_from_data_manifest(args.data_dir)
+        if requested_task != protocol.task:
+            raise ValueError(
+                f"--task {requested_task} does not match manifest task {protocol.task}"
+            )
+        result = evaluate_models(
+            args.data_dir, args.model, batch_size=args.batch_size, protocol=protocol
+        )
     _atomic_json(output, result)
     return result
 
@@ -1137,6 +1219,7 @@ def main() -> None:
         help="Named Koopman export; repeat to compare models",
     )
     parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--task", choices=tuple(TASK_CONFIGS), default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = run(args)

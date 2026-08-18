@@ -16,12 +16,13 @@ from torch.nn import functional as F
 
 from experiments.dmc.o2o.config import O2OConfig
 from experiments.dmc.o2o.koopman import FrozenKoopman
+from experiments.dmc.tasks.registry import get_task_spec
 from experiments.dmc.o2o.networks import (
     FrozenObservationNormalizer,
     build_actor,
     build_critic,
 )
-from experiments.dmc.reward_oracle import cartpole_swingup_official_reward
+from experiments.dmc.reward_oracle import official_reward_for_task
 
 
 RNG_SUBSTREAM_VERSION = "o2o_torch_rng_substreams_v1"
@@ -227,7 +228,7 @@ class O2OLearner:
             self.koopman = None
             self.observation_normalizer = observation_normalizer.to(device).eval()
             self.state_dim = observation_normalizer.observation_dim
-            self.action_dim = 1
+            self.action_dim = get_task_spec(config.task).action_dim
         self.rng_substream_seeds = {
             name: _substream_seed(config.seed, name)
             for name in _RNG_SUBSTREAM_NAMES
@@ -592,7 +593,7 @@ class O2OLearner:
         *,
         next_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Total H=10 target: one real transition followed by nine model steps."""
+        """Total H target: one real transition followed by H-1 model steps."""
 
         if not self.config.uses_mpve:
             return real_target.detach()
@@ -614,7 +615,8 @@ class O2OLearner:
                 )
                 following = self.koopman.step(current, action)
                 normalized_following = self.koopman.reconstruct_normalized(following)
-                reward = cartpole_swingup_official_reward(
+                reward_oracle = official_reward_for_task(self.config.task)
+                reward = reward_oracle(
                     self.koopman.denormalize(normalized_following), action
                 )
                 total = total + continuation * (

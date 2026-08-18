@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from experiments.dmc.o2o.dataset import OfflineDataset
+from experiments.dmc.tasks.registry import get_task_spec
 
 
 LEGACY_STAGE_RANGES = {
@@ -105,6 +106,8 @@ def _write_stage(
 
 def prepare(dataset_path: Path, output_dir: Path) -> dict:
     dataset = OfflineDataset.load(dataset_path)
+    task_name = str(dataset.metadata.get("task", "cartpole_swingup"))
+    spec = get_task_spec(task_name)
     episode_count = int(dataset.metadata["episodes"])
     if episode_count != 1000 or len(dataset) != 1_000_000:
         raise ValueError("Primary ExORL Koopman fit requires exactly 1000x1000 transitions")
@@ -120,18 +123,22 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
     )
     if not np.array_equal(episode_step, expected_episode_step):
         raise ValueError("Dataset episode steps are not canonical")
-    observation = dataset.arrays["observation"].reshape(episode_count, 1000, 5)
+    observation = dataset.arrays["observation"].reshape(
+        episode_count, 1000, spec.obs_dim
+    )
     next_observation = dataset.arrays["next_observation"].reshape(
-        episode_count, 1000, 5
+        episode_count, 1000, spec.obs_dim
     )
     if not np.array_equal(observation[:, 1:], next_observation[:, :-1]):
         raise ValueError("Dataset transitions are not contiguous within episodes")
     states = np.concatenate((observation[:, :1], next_observation), axis=1)
-    actions = dataset.arrays["action"].reshape(episode_count, 1000, 1)
+    actions = dataset.arrays["action"].reshape(
+        episode_count, 1000, spec.action_dim
+    )
     rewards = dataset.arrays["reward"].reshape(episode_count, 1000)
     discounts = dataset.arrays["discount"].reshape(episode_count, 1000)
     if not np.array_equal(discounts, np.ones_like(discounts)):
-        raise ValueError("Canonical ExORL Cartpole episodes must retain discount one")
+        raise ValueError("Canonical ExORL episodes must retain discount one")
 
     stages = _adapter_stages(dataset)
 
@@ -162,8 +169,12 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
             "source_episode_index_last": source_episode_ids[-1],
         }
     manifest = {
-        "kind": "exorl_cartpole_koopman_adapter_v1",
-        "task": "CartpoleSwingup",
+        "kind": (
+            "exorl_cartpole_koopman_adapter_v1"
+            if task_name == "cartpole_swingup"
+            else "exorl_walker_run_koopman_adapter_v1"
+        ),
+        "task": "CartpoleSwingup" if task_name == "cartpole_swingup" else "WalkerRun",
         "policy": "ExORL ProtoRL exploratory data",
         "source_dataset": str(dataset.path),
         "source_dataset_sha256": dataset.sha256,
@@ -175,8 +186,8 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
         "stage_order": [name for name, _left, _right, _source_ids in stages],
         "stages": stage_metadata,
         "episode_steps": 1000,
-        "observation_dim": 5,
-        "action_dim": 1,
+        "observation_dim": spec.obs_dim,
+        "action_dim": spec.action_dim,
         "trainer_episode_split": "per_stage_modulo_10_8_1_1",
         "trainer_split_episode_counts": {
             "train": 800,
@@ -200,6 +211,8 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
         "recorded_reward_max_abs_error": dataset.metadata.get(
             "recorded_reward_max_abs_error"
         ),
+        "reward_source": dataset.metadata.get("reward_source", "oracle"),
+        "reward_training": "outside_koopman_contract",
         "note": (
             "Each decile stage is a deterministic source-time stratum; local "
             "episode index modulo 10 gives an 80/10/10 train/validation/test split."

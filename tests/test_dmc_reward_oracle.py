@@ -10,6 +10,8 @@ from experiments.dmc.reward_oracle import (
     ExactObservationRewardOracle,
     cartpole_swingup_official_reward,
     exact_reward_oracle_metadata,
+    walker_run_exact_reward_numpy,
+    walker_run_official_reward,
 )
 from experiments.dmc.tasks.adapter import make_dmc_adapter
 
@@ -33,6 +35,40 @@ def test_cartpole_exact_reward_matches_live_dmc_transitions() -> None:
     finally:
         env.close()
     assert max_error <= ORACLE_PARITY_MAX_ABS_ERROR
+
+
+def test_walker_exact_reward_matches_live_dmc_transitions() -> None:
+    env = make_dmc_adapter("walker_run", seed=654)
+    rng = np.random.default_rng(20260818)
+    observations: list[np.ndarray] = []
+    actions: list[np.ndarray] = []
+    rewards: list[float] = []
+    try:
+        env.reset(seed=654)
+        for _ in range(200):
+            action = rng.uniform(-1.0, 1.0, size=6).astype(np.float32)
+            next_observation, reward, done, info = env.step(action)
+            observations.append(next_observation)
+            actions.append(info["applied_action"])
+            rewards.append(reward)
+            if done:
+                env.reset(seed=654)
+    finally:
+        env.close()
+
+    observation_batch = np.asarray(observations, dtype=np.float32)
+    action_batch = np.asarray(actions, dtype=np.float32)
+    live_reward = np.asarray(rewards, dtype=np.float32)
+    numpy_reward = walker_run_exact_reward_numpy(observation_batch, action_batch)
+    torch_reward = walker_run_official_reward(
+        torch.from_numpy(observation_batch), torch.from_numpy(action_batch)
+    ).numpy()
+    np.testing.assert_allclose(
+        numpy_reward, live_reward, rtol=0.0, atol=ORACLE_PARITY_MAX_ABS_ERROR
+    )
+    np.testing.assert_allclose(
+        torch_reward, live_reward, rtol=0.0, atol=ORACLE_PARITY_MAX_ABS_ERROR
+    )
 
 
 def test_exact_oracle_undoes_koopman_normalization() -> None:

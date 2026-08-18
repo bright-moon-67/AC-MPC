@@ -20,6 +20,7 @@ from experiments.dmc.o2o.evaluate import (
 )
 from experiments.dmc.o2o.learner import O2OLearner
 from experiments.dmc.tasks.adapter import make_dmc_adapter
+from experiments.dmc.tasks.registry import get_task_spec
 
 
 FINAL_EVAL_KIND = "acmpc_dmc_o2o_final_evaluation_10x10_v1"
@@ -62,6 +63,7 @@ def evaluate_10x10(
     )
     learner.load_state_dict(validated.checkpoint["learner"], restore_sampling_rng=False)
     expected_protocol = validated.checkpoint["environment_protocol"]
+    action_dim = get_task_spec(validated.config.task).action_dim
 
     per_seed: list[dict[str, Any]] = []
     all_returns: list[float] = []
@@ -86,8 +88,10 @@ def evaluate_10x10(
                         learner.act(observation, deterministic=True)[0],
                         dtype=np.float32,
                     )
-                    if action.shape != (1,) or not np.isfinite(action).all():
-                        raise RuntimeError("Policy emitted an invalid Cartpole action")
+                    if action.shape != (action_dim,) or not np.isfinite(action).all():
+                        raise RuntimeError(
+                            f"Policy emitted an invalid {validated.config.task} action"
+                        )
                     observation, reward, done, _info = env.step(action)
                     if not math.isfinite(float(reward)):
                         raise RuntimeError("DMC emitted a non-finite reward")

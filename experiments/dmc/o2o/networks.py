@@ -40,8 +40,8 @@ class FrozenObservationNormalizer(nn.Module):
         scale_tensor = torch.as_tensor(scale, dtype=torch.float32)
         if center_tensor.ndim != 1 or scale_tensor.shape != center_tensor.shape:
             raise ValueError("Raw observation center/scale shapes disagree")
-        if center_tensor.numel() != 5:
-            raise ValueError("Cartpole raw normalizer must have dimension five")
+        if center_tensor.numel() < 1:
+            raise ValueError("Raw observation normalizer must have a positive dimension")
         if not torch.isfinite(center_tensor).all() or not torch.isfinite(scale_tensor).all():
             raise FloatingPointError("Raw observation normalizer is non-finite")
         if torch.any(scale_tensor <= 0):
@@ -57,8 +57,8 @@ class FrozenObservationNormalizer(nn.Module):
         cls, observations: np.ndarray, *, dataset_sha256: str
     ) -> "FrozenObservationNormalizer":
         observations = np.asarray(observations)
-        if observations.ndim != 2 or observations.shape[1] != 5:
-            raise ValueError("Offline observations must have shape [N,5]")
+        if observations.ndim != 2 or observations.shape[1] < 1:
+            raise ValueError("Offline observations must have shape [N,D] with D>0")
         if observations.shape[0] < 1 or not np.isfinite(observations).all():
             raise ValueError("Offline observations must be non-empty and finite")
         # Accumulate in float64 for a stable, dataset-independent artifact;

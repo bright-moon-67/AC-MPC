@@ -20,6 +20,7 @@ from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner
 from experiments.dmc.o2o.networks import FrozenObservationNormalizer
 from experiments.dmc.tasks.adapter import make_dmc_adapter
+from experiments.dmc.tasks.registry import get_task_spec
 
 
 RUN_KIND = "acmpc_dmc_o2o_run_v1"
@@ -318,8 +319,15 @@ def validate_run_identity(
             ):
                 if checkpoint_koopman.get(key) != actual_koopman.get(key):
                     raise ValueError(f"Koopman identity field {key!r} differs")
-            if (koopman.state_dim, koopman.action_dim) != (5, 1):
-                raise ValueError("Cartpole O2O evaluation requires Koopman dimensions 5/1")
+            task_spec = get_task_spec(config.task)
+            if (koopman.state_dim, koopman.action_dim) != (
+                task_spec.obs_dim,
+                task_spec.action_dim,
+            ):
+                raise ValueError(
+                    f"{config.task} O2O evaluation requires Koopman dimensions "
+                    f"{task_spec.obs_dim}/{task_spec.action_dim}"
+                )
     else:
         if not dataset_path.is_file() or file_sha256(dataset_path) != expected_dataset_sha:
             raise ValueError("Offline dataset SHA256 differs from checkpoint")
@@ -400,6 +408,7 @@ def evaluate_checkpoint(
     )
 
     expected_protocol = validated.checkpoint["environment_protocol"]
+    action_dim = get_task_spec(validated.config.task).action_dim
     returns: list[float] = []
     lengths: list[int] = []
     episode_seeds: list[int] = []
@@ -426,8 +435,10 @@ def evaluate_checkpoint(
                         learner.act(observation, deterministic=True)[0],
                         dtype=np.float32,
                     )
-                    if action.shape != (1,) or not np.isfinite(action).all():
-                        raise RuntimeError("Policy emitted an invalid Cartpole action")
+                    if action.shape != (action_dim,) or not np.isfinite(action).all():
+                        raise RuntimeError(
+                            f"Policy emitted an invalid {validated.config.task} action"
+                        )
                     observation, reward, done, _info = env.step(action)
                     if not math.isfinite(float(reward)):
                         raise RuntimeError("DMC emitted a non-finite reward")

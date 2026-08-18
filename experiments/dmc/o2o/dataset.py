@@ -15,8 +15,12 @@ from typing import Any
 
 import numpy as np
 
+from experiments.dmc.reward_oracle import walker_run_exact_reward_numpy
+from experiments.dmc.tasks.registry import get_task_spec
+
 
 DATASET_KIND = "acmpc_exorl_cartpole_transitions_v1"
+WALKER_DATASET_KIND = "acmpc_exorl_walker_run_transitions_v1"
 DATASET_KEYS = (
     "observation",
     "action",
@@ -25,6 +29,18 @@ DATASET_KEYS = (
     "next_observation",
     "episode_id",
     "episode_step",
+    "mc_return",
+)
+BOUNDARY_KEYS = ("terminated", "truncated")
+CANONICAL_DATASET_KEYS = (
+    "observation",
+    "action",
+    "reward",
+    "discount",
+    "next_observation",
+    "episode_id",
+    "episode_step",
+    *BOUNDARY_KEYS,
     "mc_return",
 )
 
@@ -146,7 +162,9 @@ def _episode_files(root: Path) -> list[_EpisodeSource]:
     return episodes
 
 
-def _load_official_episode(source: _EpisodeSource) -> dict[str, np.ndarray]:
+def _load_official_episode(
+    source: _EpisodeSource, *, task: str = "cartpole_swingup"
+) -> dict[str, np.ndarray]:
     path = source.path
     with np.load(path, allow_pickle=False) as archive:
         missing = {"observation", "action", "reward", "discount"} - set(archive.files)
@@ -164,9 +182,10 @@ def _load_official_episode(source: _EpisodeSource) -> dict[str, np.ndarray]:
             f"{path} filename declares {source.transitions} transitions but "
             f"contains {length - 1}"
         )
-    if episode["action"].shape != (length, 1):
+    spec = get_task_spec(task)
+    if episode["action"].shape != (length, spec.action_dim):
         raise ValueError(f"{path} has an invalid action array")
-    if episode["observation"].shape != (length, 5):
+    if episode["observation"].shape != (length, spec.obs_dim):
         raise ValueError(f"{path} has an invalid observation array")
     if episode["discount"].shape not in {(length,), (length, 1)}:
         raise ValueError(f"{path} has an invalid discount array")
@@ -189,30 +208,35 @@ def _load_official_episode(source: _EpisodeSource) -> dict[str, np.ndarray]:
         ):
             raise ValueError(f"{path} has non-canonical ExORL dtypes")
         physics = episode.get("physics")
-        if physics is None or physics.shape != (length, 4) or physics.dtype != np.float64:
+        if task == "cartpole_swingup" and (
+            physics is None or physics.shape != (length, 4) or physics.dtype != np.float64
+        ):
             raise ValueError(f"{path} is missing canonical float64 physics state")
         if (
-            not np.array_equal(episode["action"][0], np.zeros(1, np.float32))
+            not np.array_equal(
+                episode["action"][0], np.zeros(spec.action_dim, np.float32)
+            )
             or float(np.asarray(episode["reward"][0]).item()) != 0.0
             or float(np.asarray(episode["discount"][0]).item()) != 1.0
         ):
             raise ValueError(f"{path} has an invalid dummy reset record")
-        physics_observation = np.column_stack(
-            (
-                physics[:, 0],
-                np.cos(physics[:, 1]),
-                np.sin(physics[:, 1]),
-                physics[:, 2],
-                physics[:, 3],
+        if task == "cartpole_swingup":
+            physics_observation = np.column_stack(
+                (
+                    physics[:, 0],
+                    np.cos(physics[:, 1]),
+                    np.sin(physics[:, 1]),
+                    physics[:, 2],
+                    physics[:, 3],
+                )
+            ).astype(np.float32)
+            np.testing.assert_allclose(
+                episode["observation"],
+                physics_observation,
+                rtol=0.0,
+                atol=5e-6,
+                err_msg=f"Observation/physics parity failed for {path}",
             )
-        ).astype(np.float32)
-        np.testing.assert_allclose(
-            episode["observation"],
-            physics_observation,
-            rtol=0.0,
-            atol=5e-6,
-            err_msg=f"Observation/physics parity failed for {path}",
-        )
     # Index zero is a dummy reset record.  ExORL's own replay buffer samples
     # (obs[i-1], action[i], reward[i], discount[i], obs[i]) for i >= 1.
     return episode
@@ -237,7 +261,7 @@ def _mc_returns(
     return result
 
 
-def convert_exorl_cartpole(
+def convert_exorl(
     source_dir: Path,
     output_path: Path,
     *,
@@ -246,10 +270,17 @@ def convert_exorl_cartpole(
     selected_episode_indices: Sequence[int] | None = None,
     selection_metadata: dict[str, Any] | None = None,
     source_archive: Path | None = None,
+    task: str = "cartpole_swingup",
+    reward_source: str = "oracle",
 ) -> dict[str, Any]:
     """Convert official ExORL episodes to one strict transition archive."""
 
     source_dir = source_dir.resolve()
+    spec = get_task_spec(task)
+    if task not in {"cartpole_swingup", "walker_run"}:
+        raise ValueError(f"Unsupported ExORL O2O conversion task: {task}")
+    if reward_source not in {"oracle", "recorded", "zero"}:
+        raise ValueError("reward_source must be oracle, recorded, or zero")
     output_path = output_path.resolve()
     if max_transitions < 1:
         raise ValueError("max_transitions must be positive")
@@ -294,7 +325,9 @@ def convert_exorl_cartpole(
                 "ExORL release episodes must be the contiguous prefix starting at zero"
             )
 
-    parts: dict[str, list[np.ndarray]] = {key: [] for key in DATASET_KEYS}
+    parts: dict[str, list[np.ndarray]] = {
+        key: [] for key in CANONICAL_DATASET_KEYS
+    }
     source_hash = hashlib.sha256()
     total = 0
     episode_count = 0
@@ -303,7 +336,7 @@ def convert_exorl_cartpole(
         if total >= max_transitions:
             break
         path = source.path
-        episode = _load_official_episode(source)
+        episode = _load_official_episode(source, task=task)
         available = episode["observation"].shape[0] - 1
         remaining = max_transitions - total
         if available > remaining:
@@ -320,16 +353,38 @@ def convert_exorl_cartpole(
         discount = np.asarray(episode["discount"][1 : take + 1]).reshape(-1).astype(
             np.float32, copy=False
         )
-        reward = _cartpole_reward(next_observation, action)
         recorded_reward = np.asarray(episode["reward"][1 : take + 1]).reshape(-1)
-        episode_reward_error = float(
-            np.max(np.abs(recorded_reward.astype(np.float64) - reward.astype(np.float64)))
-        )
+        oracle_reward = None
+        if reward_source == "oracle":
+            oracle_reward = (
+                _cartpole_reward(next_observation, action)
+                if task == "cartpole_swingup"
+                else walker_run_exact_reward_numpy(next_observation, action)
+            )
+        reward = {
+            "oracle": oracle_reward,
+            "recorded": recorded_reward.astype(np.float32),
+            "zero": np.zeros(take, dtype=np.float32),
+        }[reward_source]
+        episode_reward_error = 0.0
+        if oracle_reward is not None:
+            episode_reward_error = float(
+                np.max(
+                    np.abs(
+                        recorded_reward.astype(np.float64)
+                        - oracle_reward.astype(np.float64)
+                    )
+                )
+            )
         reward_max_abs_error = max(reward_max_abs_error, episode_reward_error)
-        np.testing.assert_allclose(
-            recorded_reward, reward, rtol=0.0, atol=2e-7,
-            err_msg=f"Official reward parity failed for {path}",
-        )
+        if task == "cartpole_swingup" and reward_source == "oracle":
+            np.testing.assert_allclose(
+                recorded_reward,
+                reward,
+                rtol=0.0,
+                atol=2e-7,
+                err_msg=f"Official reward parity failed for {path}",
+            )
         mc_return = _mc_returns(reward, discount, gamma)
         parts["observation"].append(observation)
         parts["action"].append(action)
@@ -340,6 +395,11 @@ def convert_exorl_cartpole(
             np.full(take, episode_count, dtype=np.int64)
         )
         parts["episode_step"].append(np.arange(take, dtype=np.int32))
+        terminated = discount == 0.0
+        truncated = np.zeros(take, dtype=np.bool_)
+        truncated[-1] = not bool(terminated[-1])
+        parts["terminated"].append(terminated.astype(np.bool_, copy=False))
+        parts["truncated"].append(truncated)
         parts["mc_return"].append(mc_return)
         identity = {
             "index": source.index,
@@ -367,11 +427,15 @@ def convert_exorl_cartpole(
         arrays,
         gamma_for_mc_return=gamma,
         expected_episode_count=episode_count,
+        task=task,
+        reward_source=reward_source,
     )
     metadata = {
-        "kind": DATASET_KIND,
-        "task": "cartpole_swingup",
-        "source": "ExORL cartpole exploratory dataset",
+        "kind": DATASET_KIND if task == "cartpole_swingup" else WALKER_DATASET_KIND,
+        "task": task,
+        "source": f"ExORL {task} exploratory dataset",
+        "observation_dim": spec.obs_dim,
+        "action_dim": spec.action_dim,
         "source_directory": str(source_dir),
         "source_episode_identity_sha256": source_hash.hexdigest(),
         "source_schema": (
@@ -387,10 +451,25 @@ def convert_exorl_cartpole(
         "dummy_records_skipped": episode_count,
         "gamma_for_mc_return": gamma,
         "alignment": "obs[i-1],action[i],official_reward(obs[i],action[i]),discount[i],obs[i]",
-        "reward": "dm_control_cartpole_swingup_dense_observation_oracle_v1",
+        "reward": (
+            "dm_control_cartpole_swingup_dense_observation_oracle_v1"
+            if task == "cartpole_swingup"
+            else "dm_control_walker_run_exact_observation_oracle_v1"
+        ),
+        "reward_oracle": (
+            "dm_control_cartpole_swingup_dense_observation_oracle_v1"
+            if task == "cartpole_swingup"
+            else "dm_control_walker_run_exact_observation_oracle_v1"
+        ),
         "recorded_reward_max_abs_error": reward_max_abs_error,
         "recorded_reward_parity_atol": 2e-7,
+        "recorded_reward_is_training_target": task == "cartpole_swingup",
+        "reward_source": reward_source,
         "timeout_bootstrap": "preserve_environment_discount",
+        "boundary_semantics": (
+            "terminated iff environment discount is zero; otherwise the final "
+            "transition of each complete 1000-step episode is truncated"
+        ),
         "environment_discount_values": sorted(
             float(value) for value in np.unique(arrays["discount"])
         ),
@@ -436,24 +515,36 @@ def convert_exorl_cartpole(
     return metadata
 
 
+def convert_exorl_cartpole(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Backward-compatible Cartpole conversion entry point."""
+
+    kwargs.setdefault("task", "cartpole_swingup")
+    return convert_exorl(*args, **kwargs)
+
+
 def validate_dataset_arrays(
     arrays: dict[str, np.ndarray],
     *,
     gamma_for_mc_return: float | None = None,
     expected_episode_count: int | None = None,
+    task: str = "cartpole_swingup",
+    reward_source: str = "oracle",
 ) -> None:
-    missing = set(DATASET_KEYS) - set(arrays)
+    missing = set(CANONICAL_DATASET_KEYS) - set(arrays)
     if missing:
         raise ValueError(f"Dataset is missing arrays {sorted(missing)}")
     count = arrays["reward"].shape[0]
+    spec = get_task_spec(task)
     expected_shapes = {
-        "observation": (count, 5),
-        "action": (count, 1),
+        "observation": (count, spec.obs_dim),
+        "action": (count, spec.action_dim),
         "reward": (count,),
         "discount": (count,),
-        "next_observation": (count, 5),
+        "next_observation": (count, spec.obs_dim),
         "episode_id": (count,),
         "episode_step": (count,),
+        "terminated": (count,),
+        "truncated": (count,),
         "mc_return": (count,),
     }
     for key, shape in expected_shapes.items():
@@ -469,8 +560,24 @@ def validate_dataset_arrays(
         raise ValueError("episode_id must have an integer dtype")
     if not np.issubdtype(arrays["episode_step"].dtype, np.integer):
         raise ValueError("episode_step must have an integer dtype")
-    recomputed = _cartpole_reward(arrays["next_observation"], arrays["action"])
-    np.testing.assert_allclose(arrays["reward"], recomputed, rtol=0.0, atol=2e-7)
+    for key in BOUNDARY_KEYS:
+        if arrays[key].dtype != np.bool_:
+            raise ValueError(f"{key} must have boolean dtype")
+    if np.any(arrays["terminated"] & arrays["truncated"]):
+        raise ValueError("A transition cannot be both terminated and truncated")
+    if reward_source == "oracle":
+        recomputed = (
+            _cartpole_reward(arrays["next_observation"], arrays["action"])
+            if task == "cartpole_swingup"
+            else walker_run_exact_reward_numpy(
+                arrays["next_observation"], arrays["action"]
+            )
+        )
+        np.testing.assert_allclose(
+            arrays["reward"], recomputed, rtol=0.0, atol=2e-7
+        )
+    elif reward_source not in {"recorded", "zero"}:
+        raise ValueError("Unsupported dataset reward_source")
     episode_id = arrays["episode_id"]
     episode_step = arrays["episode_step"]
     if count and (
@@ -509,6 +616,18 @@ def validate_dataset_arrays(
             arrays["observation"][left + 1 : right],
         ):
             raise ValueError("Observation transitions are discontinuous within an episode")
+        if np.any(arrays["terminated"][left : right - 1]) or np.any(
+            arrays["truncated"][left : right - 1]
+        ):
+            raise ValueError("Episode boundary flags may only appear on the final step")
+        if not bool(
+            arrays["terminated"][right - 1] or arrays["truncated"][right - 1]
+        ):
+            raise ValueError("Every complete episode must end in a boundary flag")
+        if bool(arrays["terminated"][right - 1]) != bool(
+            arrays["discount"][right - 1] == 0.0
+        ):
+            raise ValueError("Terminal flags disagree with environment discount")
         if gamma_for_mc_return is not None:
             expected_return = _mc_returns(
                 arrays["reward"][left:right],
@@ -539,7 +658,30 @@ class OfflineDataset:
                 raise ValueError("Dataset is missing metadata_json")
             metadata = json.loads(str(archive["metadata_json"].item()))
             arrays = {key: np.asarray(archive[key]) for key in DATASET_KEYS}
-        if metadata.get("kind") != DATASET_KIND:
+            if all(key in archive.files for key in BOUNDARY_KEYS):
+                arrays.update(
+                    {key: np.asarray(archive[key]) for key in BOUNDARY_KEYS}
+                )
+            elif any(key in archive.files for key in BOUNDARY_KEYS):
+                raise ValueError("Dataset contains only one episode boundary array")
+            else:
+                # Compatibility for the completed Cartpole artifact created
+                # before the canonical terminated/truncated fields were added.
+                episode_id = arrays["episode_id"]
+                count = episode_id.shape[0]
+                episode_end = np.r_[episode_id[1:] != episode_id[:-1], True]
+                terminated = arrays["discount"] == 0.0
+                if np.any(terminated & ~episode_end):
+                    raise ValueError("Legacy dataset terminates inside an episode")
+                arrays["terminated"] = terminated.astype(np.bool_, copy=False)
+                arrays["truncated"] = (
+                    episode_end & ~terminated
+                ).astype(np.bool_, copy=False)
+        task = str(metadata.get("task", "cartpole_swingup"))
+        expected_kind = (
+            DATASET_KIND if task == "cartpole_swingup" else WALKER_DATASET_KIND
+        )
+        if metadata.get("kind") != expected_kind:
             raise ValueError("Unsupported offline dataset kind")
         gamma = float(metadata.get("gamma_for_mc_return", float("nan")))
         if not math.isfinite(gamma) or not 0 < gamma <= 1:
@@ -551,6 +693,8 @@ class OfflineDataset:
             arrays,
             gamma_for_mc_return=gamma,
             expected_episode_count=episodes,
+            task=task,
+            reward_source=str(metadata.get("reward_source", "oracle")),
         )
         if int(metadata.get("transitions", -1)) != arrays["reward"].shape[0]:
             raise ValueError("Dataset transition count disagrees with metadata")
@@ -811,6 +955,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--task", choices=("cartpole_swingup", "walker_run"), default="cartpole_swingup"
+    )
+    parser.add_argument(
+        "--reward-source", choices=("oracle", "recorded", "zero"), default="oracle",
+        help="Reward target for the archive; Koopman training ignores this field.",
+    )
     parser.add_argument("--max-transitions", type=int, default=1_000_000)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument(
@@ -854,7 +1005,7 @@ def main() -> None:
             "microstratum_width_episodes": micro_width,
             "microstratum_offset": 0,
         }
-    metadata = convert_exorl_cartpole(
+    metadata = convert_exorl(
         args.source_dir,
         args.output,
         max_transitions=args.max_transitions,
@@ -862,6 +1013,8 @@ def main() -> None:
         selected_episode_indices=selected_indices,
         selection_metadata=selection_metadata,
         source_archive=args.source_archive,
+        task=args.task,
+        reward_source=args.reward_source,
     )
     manifest_path = (
         args.manifest.resolve()
@@ -881,6 +1034,8 @@ def main() -> None:
         "source_archive": (
             str(args.source_archive.resolve()) if args.source_archive is not None else None
         ),
+        "task": args.task,
+        "reward_source": args.reward_source,
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")

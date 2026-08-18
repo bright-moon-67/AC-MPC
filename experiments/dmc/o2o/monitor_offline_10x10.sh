@@ -6,6 +6,7 @@ DATASET="$2"
 KOOPMAN="$3"
 DEVICE="${4:-cuda}"
 OFFLINE_UPDATES="${5:-50000}"
+ONLY_METHOD="${6:-}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 METHODS=(Cal-QL-Raw Cal-RLPD-Raw Cal-QL-KMPC Cal-QL-MPVE Cal-RLPD-KMPC Cal-RLPD-MPVE)
@@ -17,6 +18,13 @@ declare -A TRAIN_METHODS=(
   [Cal-RLPD-KMPC]=Cal-RLPD-KMPC
   [Cal-RLPD-MPVE]=Cal-RLPD-MPVE
 )
+if [[ -n "$ONLY_METHOD" ]]; then
+  if [[ -z "${TRAIN_METHODS[$ONLY_METHOD]+present}" ]]; then
+    echo "unknown method filter: $ONLY_METHOD" >&2
+    exit 2
+  fi
+  METHODS=("$ONLY_METHOD")
+fi
 
 while :; do
   all_done=1

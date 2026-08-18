@@ -21,7 +21,7 @@ from experiments.dmc.o2o.checkpoint import (
     restore_rng,
     rng_state,
 )
-from experiments.dmc.o2o.config import O2OConfig, TRAIN_METHODS
+from experiments.dmc.o2o.config import O2OConfig, SUPPORTED_O2O_TASKS, TRAIN_METHODS
 from experiments.dmc.o2o.dataset import (
     OfflineDataset,
     OnlineReplay,
@@ -32,6 +32,7 @@ from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner, TensorBatch
 from experiments.dmc.o2o.networks import FrozenObservationNormalizer
 from experiments.dmc.tasks.adapter import make_dmc_adapter
+from experiments.dmc.tasks.registry import get_task_spec
 from experiments.dmc.ppo.vector_env import make_dmc_vector_env
 
 
@@ -255,9 +256,8 @@ def evaluate(
     # evaluate the policy as one batch.  This matters for AC-KMPC: ten scalar
     # GPU planner calls per control step are pure launch overhead.  A single
     # in-process vector worker avoids process-spawn cost at every 5k checkpoint.
-    env = make_dmc_vector_env(
-        "cartpole_swingup", episodes, seed=seed_base, workers=1
-    )
+    task = getattr(getattr(learner, "config", None), "task", "cartpole_swingup")
+    env = make_dmc_vector_env(task, episodes, seed=seed_base, workers=1)
     try:
         observation = env.reset()
         totals = np.zeros(episodes, dtype=np.float64)
@@ -277,7 +277,7 @@ def evaluate(
             if completed.all():
                 break
         if not completed.all() or np.any(lengths != step_limit):
-            raise RuntimeError("Canonical Cartpole evaluation did not end synchronously")
+            raise RuntimeError("Canonical evaluation did not end synchronously")
         returns = totals.tolist()
     finally:
         env.close()
@@ -727,6 +727,17 @@ def run(
     output.mkdir(parents=True, exist_ok=True)
     metrics_path = output / "metrics.jsonl"
     dataset = OfflineDataset.load(dataset_path)
+    dataset_task = dataset.metadata.get("task")
+    if dataset_task is not None and dataset_task != config.task:
+        raise ValueError(
+            f"Dataset task {dataset_task!r} does not match "
+            f"training task {config.task!r}"
+        )
+    if dataset.metadata.get("reward_source", "oracle") != "oracle":
+        raise ValueError(
+            "Offline O2O training requires an oracle reward dataset; "
+            "reward-free Koopman data is not a valid offline-RL target"
+        )
     if config.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but no CUDA device is available")
     device = torch.device(config.device)
@@ -735,8 +746,16 @@ def run(
         if koopman_path is None:
             raise ValueError(f"{config.method} requires --koopman")
         koopman: FrozenKoopman | None = FrozenKoopman(koopman_path)
-        if (koopman.state_dim, koopman.action_dim) != (5, 1):
-            raise ValueError("Cartpole O2O requires Koopman state/action dimensions 5/1")
+        expected_task = get_task_spec(config.task)
+        if (koopman.state_dim, koopman.action_dim) != (
+            expected_task.obs_dim,
+            expected_task.action_dim,
+        ):
+            raise ValueError(
+                f"{config.task} O2O requires Koopman state/action dimensions "
+                f"{expected_task.obs_dim}/{expected_task.action_dim}; got "
+                f"{koopman.state_dim}/{koopman.action_dim}"
+            )
         observation_normalizer: FrozenObservationNormalizer | None = None
     else:
         if koopman_path is not None:
@@ -776,7 +795,12 @@ def run(
         device,
         observation_normalizer=observation_normalizer,
     )
-    replay = OnlineReplay(config.replay_capacity)
+    task_spec = get_task_spec(config.task)
+    replay = OnlineReplay(
+        config.replay_capacity,
+        obs_dim=task_spec.obs_dim,
+        action_dim=task_spec.action_dim,
+    )
 
     offline_update = 0
     online_step = 0
@@ -891,7 +915,11 @@ def run(
                 1 if config.uses_online_mpve else 0
             ),
             "total_td_horizon": config.mpve_total_horizon if config.uses_mpve else None,
-            "composition": "one_real_plus_nine_model" if config.uses_mpve else None,
+            "composition": (
+                f"one_real_plus_{config.mpve_total_horizon - 1}_model"
+                if config.uses_mpve
+                else None
+            ),
         },
         "execution_scope": "offline_only" if stop_after_offline else "offline_to_online",
     }
@@ -1290,7 +1318,7 @@ def run(
             reset_boundary = np.asarray(vector_step.reset_boundary, dtype=np.bool_)
             if bool(reset_boundary.any()) != bool(reset_boundary.all()):
                 raise RuntimeError(
-                    "Cartpole vector environments lost synchronized episode boundaries"
+                    "DMC vector environments lost synchronized episode boundaries"
                 )
             completed_rows: list[dict[str, Any]] = []
             for environment_index in range(config.num_envs):
@@ -1471,6 +1499,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260821)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument(
+        "--task",
+        choices=sorted(SUPPORTED_O2O_TASKS),
+        default="cartpole_swingup",
+    )
+    parser.add_argument("--kmpc-horizon", type=int, default=20)
+    parser.add_argument("--mpve-total-horizon", type=int, default=10)
     parser.add_argument("--offline-updates", type=int, default=500_000)
     parser.add_argument("--online-steps", type=int, default=50_000)
     parser.add_argument("--online-utd", type=int)
@@ -1522,6 +1557,9 @@ def main() -> None:
         method=args.method,
         seed=args.seed,
         device=args.device,
+        task=args.task,
+        kmpc_horizon=args.kmpc_horizon,
+        mpve_total_horizon=args.mpve_total_horizon,
         offline_updates=20 if args.smoke else args.offline_updates,
         online_steps=smoke_online_steps if args.smoke else args.online_steps,
         online_utd=2 if args.smoke else online_utd,

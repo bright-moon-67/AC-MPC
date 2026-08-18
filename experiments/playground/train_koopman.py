@@ -1,4 +1,4 @@
-"""GPU-native K-step Koopman and reward-model training for Playground data."""
+"""GPU-native reward-free K-step Koopman training for staged trajectory data."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def _manifest_stage_order(manifest: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _load_data(directory: Path, task: str, manifest: dict[str, Any]):
-    states, actions, rewards, splits, stage_labels = [], [], [], [], []
+    states, actions, splits, stage_labels = [], [], [], []
     stage_order = _manifest_stage_order(manifest)
     manifest_stages = manifest["stages"]
     manifest_counts = manifest.get("stage_episode_counts")
@@ -73,7 +73,8 @@ def _load_data(directory: Path, task: str, manifest: dict[str, Any]):
         with np.load(path, allow_pickle=False) as archive:
             state = np.asarray(archive["states"], dtype=np.float32)
             action = np.asarray(archive["actions"], dtype=np.float32)
-            reward = np.asarray(archive["rewards"], dtype=np.float32)
+            # Reward is deliberately outside the Koopman training contract.
+            # It is owned by the optional MPVE/reward pipeline.
         expected = TASKS[task]
         if state.ndim != 3 or state.shape[1:] != (
             expected.episode_steps + 1,
@@ -82,9 +83,9 @@ def _load_data(directory: Path, task: str, manifest: dict[str, Any]):
             raise ValueError(f"{stage} states have the wrong shape {state.shape}")
         if action.shape != (
             state.shape[0], expected.episode_steps, expected.action_dim
-        ) or reward.shape != (state.shape[0], expected.episode_steps):
-            raise ValueError(f"{stage} action/reward shapes are inconsistent")
-        if not all(np.isfinite(x).all() for x in (state, action, reward)):
+        ):
+            raise ValueError(f"{stage} state/action shapes are inconsistent")
+        if not all(np.isfinite(x).all() for x in (state, action)):
             raise FloatingPointError(f"{stage} contains NaN or Inf")
         if state.shape[0] != manifest_counts[stage]:
             raise ValueError(f"{stage} episode count differs from the manifest")
@@ -92,13 +93,11 @@ def _load_data(directory: Path, task: str, manifest: dict[str, Any]):
         split = np.where(episode_mod < 8, 0, np.where(episode_mod == 8, 1, 2))
         states.append(state)
         actions.append(action)
-        rewards.append(reward)
         splits.append(split)
         stage_labels.extend([stage_index] * state.shape[0])
     return (
         np.concatenate(states),
         np.concatenate(actions),
-        np.concatenate(rewards),
         np.concatenate(splits),
         np.asarray(stage_labels, dtype=np.int32),
         stage_order,
@@ -137,16 +136,10 @@ def _init_params(key: Any, obs_dim: int, action_dim: int, lift_dim: int):
         _init_linear(keys[1], 256, 256),
         _init_linear(keys[2], lift_dim, 256),
     )
-    reward = (
-        _init_linear(keys[3], 256, 2 * obs_dim + action_dim),
-        _init_linear(keys[4], 256, 256),
-        _init_linear(keys[5], 1, 256),
-    )
     return {
         "encoder": encoder,
         "A": jp.eye(lifted_dim) + 0.001 * jax.random.normal(keys[6], (lifted_dim, lifted_dim)),
         "B": 0.01 * jax.random.normal(keys[7], (lifted_dim, action_dim)),
-        "reward": reward,
     }
 
 
@@ -170,7 +163,6 @@ def _loss(
     params: Any,
     states: Any,
     actions: Any,
-    rewards: Any,
     *,
     rollout_discount: float,
     spectral_radius_limit: float,
@@ -201,13 +193,6 @@ def _loss(
     eigenvalue_abs = jp.abs(jp.linalg.eigvals(params["A"]))
     stability = jp.mean(jp.maximum(0.0, eigenvalue_abs - spectral_radius_limit) ** 2)
     identity = jp.mean((params["A"] - jp.eye(params["A"].shape[0])) ** 2)
-    reward_features = jp.concatenate(
-        (states[:, 0], actions[:, 0], states[:, 1]), axis=-1
-    )
-    reward_prediction = _mlp(
-        params["reward"], reward_features, sigmoid_final=True
-    )[..., 0]
-    reward_mse = jp.mean((reward_prediction - rewards) ** 2)
     dynamics = (
         10.0 * linear
         + rollout
@@ -215,13 +200,12 @@ def _loss(
         + 0.1 * latent_std
         + 1e-4 * identity
     )
-    total = dynamics + reward_mse
+    total = dynamics
     return total, {
         "total": total,
         "dynamics": dynamics,
         "linear": linear,
         "rollout": rollout,
-        "reward_mse": reward_mse,
         "stability": stability,
         "latent_std": latent_std,
         "spectral_radius": jp.max(eigenvalue_abs),
@@ -253,9 +237,6 @@ def _atomic_export(
     for index, layer in enumerate(host["encoder"]):
         arrays[f"encoder_{index}_weight"] = layer["weight"].astype(np.float32)
         arrays[f"encoder_{index}_bias"] = layer["bias"].astype(np.float32)
-    for index, layer in enumerate(host["reward"]):
-        arrays[f"reward_{index}_weight"] = layer["weight"].astype(np.float32)
-        arrays[f"reward_{index}_bias"] = layer["bias"].astype(np.float32)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as handle:
         np.savez(handle, **arrays)
@@ -275,7 +256,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if data_manifest.get("task") != args.task:
         raise ValueError("Dataset manifest task does not match --task")
-    states_np, actions_np, rewards_np, split_np, stages_np, stage_order = _load_data(
+    states_np, actions_np, split_np, stages_np, stage_order = _load_data(
         args.data_dir, args.task, data_manifest
     )
     train_episode = np.flatnonzero(split_np == 0)
@@ -285,8 +266,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     scale = np.maximum(scale, 1e-6)
     states = jp.asarray((states_np - center) / scale)
     actions = jp.asarray(actions_np)
-    rewards = jp.asarray(rewards_np)
-    del states_np, actions_np, rewards_np
+    del states_np, actions_np
     train_episode_jax = jp.asarray(train_episode, dtype=jp.int32)
     max_start = task.episode_steps - args.k_step
     if max_start < 1:
@@ -310,8 +290,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         batch_actions = actions[
             episode_index[:, None], start_index[:, None] + offsets_action[None, :]
         ]
-        batch_rewards = rewards[episode_index, start_index]
-        return batch_states, batch_actions, batch_rewards
+        return batch_states, batch_actions
 
     spectral_limit = args.spectral_radius_limit ** (
         task.control_timestep / args.stability_reference_dt
@@ -406,13 +385,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "hidden_dims": [256, 256],
             "activation": "silu",
         },
-        "reward_model_architecture": {
-            "architecture": "dmc_transition_reward_mlp_v1",
-            "state_dim": task.observation_dim,
-            "action_dim": task.action_dim,
-            "hidden_dims": [256, 256],
-            "activation": "silu",
-        },
+        "reward_training": "disabled; reward is outside the Koopman contract",
         "k_step": args.k_step,
         "batch_size": args.batch_size,
         "max_windows_per_epoch": args.max_windows,
@@ -425,7 +398,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "effective_spectral_radius_limit": spectral_limit,
         "seed": args.seed,
         "encoder_layer_count": 3,
-        "reward_layer_count": 3,
+        "reward_layer_count": 0,
         "started_unix_seconds": time.time(),
     }
     _atomic_json(args.output_dir / "run.json", run_metadata)
@@ -443,7 +416,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             lambda value: float(np.asarray(value)),
             (train_metrics, validation_metrics),
         )
-        joint = validation_host["rollout"] + validation_host["reward_mse"]
+        joint = validation_host["rollout"]
         row = {
             "epoch": epoch,
             "elapsed_seconds": time.time() - started,
@@ -468,18 +441,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "best_epoch": best_epoch,
                 "best_validation_joint_objective": best,
                 "best_validation_rollout_normalized_mse": validation_host["rollout"],
-                "best_validation_reward_metrics": {
-                    "mse": validation_host["reward_mse"],
-                    "rmse": math.sqrt(validation_host["reward_mse"]),
-                },
                 "dataset_sha256": run_metadata["data_manifest_sha256"],
                 "source_protocol_fingerprint": None,
-                "reward_model_input_contract": {
-                    "state": "playground_train_split_normalized_state",
-                    "action": "applied_action",
-                    "next_state": "playground_train_split_normalized_next_state",
-                    "target": "official_task_reward",
-                },
             }
             _atomic_export(
                 args.output_dir / "best.npz", params, center, scale, export_metadata

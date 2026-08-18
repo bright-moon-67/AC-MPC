@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Literal
 
+from experiments.dmc.tasks.registry import get_task_spec
+
+
+SUPPORTED_O2O_TASKS = frozenset({"cartpole_swingup", "walker_run"})
+
 
 Representation = Literal["raw", "koopman_lifted"]
 ActorQReduction = Literal["min", "mean"]
@@ -346,7 +351,6 @@ class O2OConfig:
             "critic_learning_rate",
             "temperature_learning_rate",
             "cql_actions",
-            "target_entropy",
             "network_profile",
             "backup_entropy",
             "actor_q_reduction",
@@ -361,14 +365,37 @@ class O2OConfig:
         ):
             if getattr(self, name) is None:
                 object.__setattr__(self, name, getattr(spec, name))
+        # Target entropy follows the official task-dependent formula instead
+        # of a frozen constant.  The ExORL DMC CQL backbone uses
+        # ``-action_dim``; RLPD's SAC default when unspecified is
+        # ``-action_dim / 2``.  Cartpole (action_dim=1) reproduces the frozen
+        # values ``-1`` and ``-0.5`` exactly, so existing checkpoints are
+        # unaffected while Walker (action_dim=6) resolves to ``-6`` / ``-3``.
+        if self.target_entropy is None:
+            if self.task not in SUPPORTED_O2O_TASKS:
+                raise ValueError(
+                    f"Unsupported O2O task {self.task!r}; expected "
+                    f"{sorted(SUPPORTED_O2O_TASKS)}"
+                )
+            action_dim = get_task_spec(self.task).action_dim
+            if spec.temperature_objective == "calql_log_alpha":
+                resolved_entropy = -float(action_dim)
+            elif spec.temperature_objective == "rlpd":
+                resolved_entropy = -float(action_dim) / 2.0
+            else:
+                raise ValueError("Unknown temperature objective")
+            object.__setattr__(self, "target_entropy", resolved_entropy)
 
     @property
     def method_spec(self) -> MethodSpec:
         return TRAIN_METHOD_SPECS[self.method]
 
     def validate(self) -> None:
-        if self.task != "cartpole_swingup":
-            raise ValueError("The first O2O protocol is frozen to cartpole_swingup")
+        if self.task not in SUPPORTED_O2O_TASKS:
+            raise ValueError(
+                f"Unsupported O2O task {self.task!r}; expected "
+                f"{sorted(SUPPORTED_O2O_TASKS)}"
+            )
         if self.method not in TRAIN_METHODS:
             raise ValueError(f"Unknown method {self.method!r}; expected {TRAIN_METHODS}")
         integer_fields = (
@@ -431,7 +458,6 @@ class O2OConfig:
             "backup_entropy",
             "actor_q_reduction",
             "temperature_objective",
-            "target_entropy",
             "critic_head_reduction",
             "online_cql_mode",
             "calql_max_target_backup",
