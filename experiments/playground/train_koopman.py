@@ -27,10 +27,49 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_data(directory: Path, task: str):
-    states, actions, rewards, splits, stage_names = [], [], [], [], []
-    for stage_index, stage in enumerate(("early", "mid", "late")):
+def _manifest_stage_order(manifest: dict[str, Any]) -> tuple[str, ...]:
+    order = manifest.get("stage_order")
+    stages = manifest.get("stages")
+    if order is None and isinstance(stages, dict) and set(stages) == {
+        "early",
+        "mid",
+        "late",
+    }:
+        order = ["early", "mid", "late"]
+    if (
+        not isinstance(order, list)
+        or not order
+        or not all(isinstance(name, str) and name for name in order)
+        or len(order) != len(set(order))
+        or not isinstance(stages, dict)
+        or set(order) != set(stages)
+    ):
+        raise ValueError("Dataset manifest has an invalid stage_order/stages contract")
+    return tuple(order)
+
+
+def _load_data(directory: Path, task: str, manifest: dict[str, Any]):
+    states, actions, rewards, splits, stage_labels = [], [], [], [], []
+    stage_order = _manifest_stage_order(manifest)
+    manifest_stages = manifest["stages"]
+    manifest_counts = manifest.get("stage_episode_counts")
+    if manifest_counts is None:
+        manifest_counts = {
+            name: metadata.get("episodes")
+            for name, metadata in manifest_stages.items()
+            if isinstance(metadata, dict)
+        }
+    if not isinstance(manifest_counts, dict) or set(manifest_counts) != set(stage_order):
+        raise ValueError("Dataset stage episode counts are missing or inconsistent")
+    for stage_index, stage in enumerate(stage_order):
         path = directory / f"{stage}.npz"
+        stage_metadata = manifest_stages[stage]
+        if not isinstance(stage_metadata, dict):
+            raise ValueError(f"Dataset manifest stage {stage!r} is invalid")
+        if Path(stage_metadata.get("path", "")).resolve() != path.resolve():
+            raise ValueError(f"Dataset manifest path differs for stage {stage!r}")
+        if stage_metadata.get("sha256") != _sha256(path):
+            raise ValueError(f"Dataset stage SHA256 differs for {stage!r}")
         with np.load(path, allow_pickle=False) as archive:
             state = np.asarray(archive["states"], dtype=np.float32)
             action = np.asarray(archive["actions"], dtype=np.float32)
@@ -47,19 +86,22 @@ def _load_data(directory: Path, task: str):
             raise ValueError(f"{stage} action/reward shapes are inconsistent")
         if not all(np.isfinite(x).all() for x in (state, action, reward)):
             raise FloatingPointError(f"{stage} contains NaN or Inf")
+        if state.shape[0] != manifest_counts[stage]:
+            raise ValueError(f"{stage} episode count differs from the manifest")
         episode_mod = np.arange(state.shape[0]) % 10
         split = np.where(episode_mod < 8, 0, np.where(episode_mod == 8, 1, 2))
         states.append(state)
         actions.append(action)
         rewards.append(reward)
         splits.append(split)
-        stage_names.extend([stage_index] * state.shape[0])
+        stage_labels.extend([stage_index] * state.shape[0])
     return (
         np.concatenate(states),
         np.concatenate(actions),
         np.concatenate(rewards),
         np.concatenate(splits),
-        np.asarray(stage_names, dtype=np.int32),
+        np.asarray(stage_labels, dtype=np.int32),
+        stage_order,
     )
 
 
@@ -233,8 +275,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if data_manifest.get("task") != args.task:
         raise ValueError("Dataset manifest task does not match --task")
-    states_np, actions_np, rewards_np, split_np, stages_np = _load_data(
-        args.data_dir, args.task
+    states_np, actions_np, rewards_np, split_np, stages_np, stage_order = _load_data(
+        args.data_dir, args.task, data_manifest
     )
     train_episode = np.flatnonzero(split_np == 0)
     validation_episode = np.flatnonzero(split_np == 1)
@@ -353,8 +395,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "validation_episodes": int(len(validation_episode)),
         "stage_episode_counts": {
             name: int(np.sum(stages_np == index))
-            for index, name in enumerate(("early", "mid", "late"))
+            for index, name in enumerate(stage_order)
         },
+        "stage_order": list(stage_order),
         "architecture": {
             "architecture": "fullA_history_v2_adapted",
             "state_dim": task.observation_dim,
