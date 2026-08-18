@@ -278,23 +278,29 @@ class KMPCTanhGaussianActor(nn.Module):
         horizon: int = 20,
         solver_iterations: int = 20,
         hidden_dim: int = 128,
+        hidden_layers: int = 1,
         log_std_min: float = LOG_STD_MIN,
     ) -> None:
         super().__init__()
         self.koopman = koopman
         self.horizon = int(horizon)
         self.solver_iterations = int(solver_iterations)
+        self.hidden_layers = int(hidden_layers)
+        if self.hidden_layers < 1:
+            raise ValueError("KMPC actor hidden_layers must be positive")
         self.log_std_min = float(log_std_min)
         if not math.isfinite(self.log_std_min) or self.log_std_min >= LOG_STD_MAX:
             raise ValueError("KMPC log-std lower bound is invalid")
         physical_dim = koopman.state_dim
         action_dim = koopman.action_dim
         output_dim = 2 * horizon * (physical_dim + action_dim)
-        self.controller = nn.Sequential(
-            nn.Linear(koopman.lifted_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
+        controller_layers: list[nn.Module] = []
+        input_dim = koopman.lifted_dim
+        for _ in range(self.hidden_layers):
+            controller_layers.extend((nn.Linear(input_dim, hidden_dim), nn.GELU()))
+            input_dim = hidden_dim
+        controller_layers.append(nn.Linear(input_dim, output_dim))
+        self.controller = nn.Sequential(*controller_layers)
         # Zero cost head is the successful, neutral controller initialization.
         nn.init.zeros_(self.controller[-1].weight)
         nn.init.zeros_(self.controller[-1].bias)
@@ -497,8 +503,9 @@ def build_actor(
     controller_hidden_dim: int,
     kmpc_horizon: int,
     kmpc_solver_iterations: int,
+    controller_hidden_layers: int = 1,
 ) -> nn.Module:
-    if "AC-KMPC" in method:
+    if "KMPC" in method or method in {"Cal-QL-MPVE", "Cal-RLPD-MPVE"}:
         if koopman is None:
             raise ValueError("AC-KMPC actor requires a Koopman model")
         return KMPCTanhGaussianActor(
@@ -506,6 +513,7 @@ def build_actor(
             horizon=kmpc_horizon,
             solver_iterations=kmpc_solver_iterations,
             hidden_dim=controller_hidden_dim,
+            hidden_layers=controller_hidden_layers,
             log_std_min=(
                 EXORL_CQL_LOG_STD_MIN
                 if network_profile == "exorl_cql"

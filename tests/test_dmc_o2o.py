@@ -595,7 +595,15 @@ def test_method_specs_freeze_raw_and_structured_algorithm_profiles() -> None:
     )
     # This pair is the controlled Cal-QL comparison: the representation,
     # actor, method name and label differ; all optimization semantics match.
-    excluded = {"name", "representation", "actor", "profile"}
+    # The structured Cal-QL actor is deliberately capacity-matched to the
+    # raw Cal-QL actor, so its controller hidden topology is an intended
+    # method-specific difference rather than a shared optimization setting.
+    assert (calql.controller_hidden_dim, calql.controller_hidden_layers) == (128, 1)
+    assert (calql_kmpc.controller_hidden_dim, calql_kmpc.controller_hidden_layers) == (1024, 2)
+    excluded = {
+        "name", "representation", "actor", "profile",
+        "controller_hidden_dim", "controller_hidden_layers",
+    }
     raw_spec = dataclasses.asdict(calql.method_spec)
     kmpc_spec = dataclasses.asdict(calql_kmpc.method_spec)
     assert {
@@ -1068,19 +1076,17 @@ def test_kmpc_fused_cache_reduces_plan_calls_but_recomputes_every_q(
     offline_plan, offline_target_q, offline_current_q, offline_learner = run(
         "offline"
     )
-    # Two full-batch proposal plans plus one fresh differentiable actor plan;
-    # this is independent of UTD=20 (the uncached implementation used 61).
-    assert offline_plan == 3
-    assert offline_target_q == 20
-    # Per critic update: data Q + random/current/next CQL Q, then one actor Q.
+    # Offline MPVE uses the RLPD/CalQL proposals plus one detached nine-step
+    # rollout and one fresh differentiable actor plan.
+    assert offline_plan == 13
+    assert offline_target_q == 21
     assert offline_current_q == 20 * 4 + 1
     assert offline_learner.gradient_updates == 20
     assert offline_learner.actor_updates == 1
 
     online_plan, online_target_q, online_current_q, online_learner = run("online")
-    # Pure-RLPD online uses one target proposal plan (no CQL proposals).  MPVE
-    # adds nine rollout plans and one terminal-action plan exactly once, while
-    # the final actor update remains a fresh plan.
+    # Online MPVE uses one target proposal plan, nine rollout plans, one
+    # terminal-action plan, and a fresh actor plan exactly once.
     assert online_plan == 1 + 10 + 1
     assert online_target_q == 20 + 1  # twenty REDQ targets + MPVE bootstrap
     assert online_current_q == 20 + 1  # data Q per UTD step + actor Q
@@ -1088,7 +1094,7 @@ def test_kmpc_fused_cache_reduces_plan_calls_but_recomputes_every_q(
     assert online_learner.actor_updates == 1
 
 
-def test_mpve_runs_online_only_once_per_real_step_and_uses_nine_model_steps(
+def test_mpve_runs_in_both_phases_once_per_update_and_uses_nine_model_steps(
     koopman_path: Path,
 ) -> None:
     config = dataclasses.replace(
@@ -1112,13 +1118,13 @@ def test_mpve_runs_online_only_once_per_real_step_and_uses_nine_model_steps(
     offline_metrics = learner.update(
         _tensor_batch(size=8), utd=2, phase="offline"
     )
-    assert model_steps == 0
-    assert offline_metrics["mpve_applied"] == 0.0
+    assert model_steps == 9
+    assert offline_metrics["mpve_applied"] == 1.0
 
     online_metrics = learner.update(
         _tensor_batch(size=8), utd=2, phase="online"
     )
-    assert model_steps == 9
+    assert model_steps == 18
     assert online_metrics["mpve_applied"] == 1.0
     assert online_metrics["mpve_loss"] > 0.0
     assert learner.gradient_updates == 4
@@ -1126,6 +1132,45 @@ def test_mpve_runs_online_only_once_per_real_step_and_uses_nine_model_steps(
 
     with pytest.raises(ValueError, match="phase"):
         learner.update(_tensor_batch(), utd=1, phase="typo")  # type: ignore[arg-type]
+
+
+def test_standalone_mpve_runs_during_offline_and_online_updates(
+    koopman_path: Path,
+) -> None:
+    config = dataclasses.replace(
+        _small_config("Cal-RLPD-AC-KMPC-Offline-MPVE"),
+        kmpc_horizon=10,
+        mpve_total_horizon=10,
+    )
+    assert config.uses_offline_mpve
+    assert config.uses_online_mpve
+    assert not config.requires_offline_fork
+    assert config.requires_own_offline_pretraining
+
+    learner = O2OLearner(
+        config, FrozenKoopman(koopman_path), torch.device("cpu")
+    )
+    model_steps = 0
+    original_step = learner.koopman.step
+
+    def counted_step(lifted_state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        nonlocal model_steps
+        model_steps += 1
+        return original_step(lifted_state, action)
+
+    learner.koopman.step = counted_step  # type: ignore[method-assign]
+    offline_metrics = learner.update(
+        _tensor_batch(size=8), utd=2, phase="offline"
+    )
+    assert model_steps == 9
+    assert offline_metrics["mpve_applied"] == 1.0
+    assert offline_metrics["mpve_loss"] > 0.0
+
+    online_metrics = learner.update(
+        _tensor_batch(size=8), utd=2, phase="online"
+    )
+    assert model_steps == 18
+    assert online_metrics["mpve_applied"] == 1.0
 
 
 def test_checkpoint_round_trip_restores_learner_replay_and_rng(
@@ -1258,11 +1303,14 @@ def test_checkpoint_rejects_an_unrelated_payload(tmp_path: Path) -> None:
         load_checkpoint(path)
 
 
-def test_mpve_offline_fork_accepts_only_completed_paired_ac_kmpc_checkpoint(
+def test_unified_mpve_owns_offline_pretraining_and_rejects_forks(
     tmp_path: Path, koopman_path: Path
 ) -> None:
-    source_config = _small_config("Cal-RLPD-AC-KMPC")
     target_config = _small_config("Cal-RLPD-AC-KMPC-MPVE")
+    assert target_config.uses_offline_mpve
+    assert target_config.uses_online_mpve
+    assert not target_config.requires_offline_fork
+    assert target_config.requires_own_offline_pretraining
     dataset = _offline_dataset_for_mixing()
     koopman = FrozenKoopman(koopman_path)
     environment_protocol = {
@@ -1273,13 +1321,13 @@ def test_mpve_offline_fork_accepts_only_completed_paired_ac_kmpc_checkpoint(
     }
     checkpoint = {
         "kind": CHECKPOINT_KIND,
-        "config": source_config.to_dict(),
-        "config_fingerprint": source_config.fingerprint,
+        "config": target_config.to_dict(),
+        "config_fingerprint": target_config.fingerprint,
         "dataset": {"sha256": dataset.sha256},
         "koopman": koopman.identity(),
         "environment_protocol": environment_protocol,
         "phase": "offline",
-        "offline_update": source_config.offline_updates,
+        "offline_update": target_config.offline_updates,
         "online_step": 0,
         "online_episode": 0,
         "raw_observation_normalizer": None,
@@ -1289,76 +1337,24 @@ def test_mpve_offline_fork_accepts_only_completed_paired_ac_kmpc_checkpoint(
             "arrays": {},
         },
     }
-    path = tmp_path / "offline.pt"
-
-    def write_and_load(payload: dict[str, object]):
-        atomic_torch_save(path, payload)
-        return _load_offline_fork(
-            path,
-            target_config=target_config,
-            dataset=dataset,
-            koopman=koopman,
-            environment_protocol=environment_protocol,
-        )
-
-    loaded, identity = write_and_load(checkpoint)
-    assert loaded["phase"] == "offline"
-    assert identity["kind"] == "acmpc_o2o_offline_fork_v1"
-    assert identity["source_method"] == "Cal-RLPD-AC-KMPC"
-    assert identity["source_sha256"] == file_sha256(path)
-
-    mpve_resume = copy.deepcopy(checkpoint)
-    mpve_resume["config"] = target_config.to_dict()
-    mpve_resume["config_fingerprint"] = target_config.fingerprint
-    mpve_resume["initialization"] = identity
     _validate_resume(
-        mpve_resume,
+        checkpoint,
         target_config,
         dataset,
         koopman,
         environment_protocol,
     )
-    missing_lineage = copy.deepcopy(mpve_resume)
-    missing_lineage["initialization"] = None
-    with pytest.raises(ValueError, match="missing its offline-fork lineage"):
+    forked = copy.deepcopy(checkpoint)
+    forked["initialization"] = {"kind": "acmpc_o2o_offline_fork_v1"}
+    with pytest.raises(ValueError, match="Non-forking method"):
         _validate_resume(
-            missing_lineage,
+            forked,
             target_config,
             dataset,
             koopman,
             environment_protocol,
         )
 
-    invalid_phase = copy.deepcopy(checkpoint)
-    invalid_phase["phase"] = "online"
-    with pytest.raises(ValueError, match="completed pre-online"):
-        write_and_load(invalid_phase)
-
-    invalid_count = copy.deepcopy(checkpoint)
-    invalid_count["offline_update"] = source_config.offline_updates - 1
-    with pytest.raises(ValueError, match="completed pre-online"):
-        write_and_load(invalid_count)
-
-    invalid_online_step = copy.deepcopy(checkpoint)
-    invalid_online_step["online_step"] = 1
-    with pytest.raises(ValueError, match="completed pre-online"):
-        write_and_load(invalid_online_step)
-
-    invalid_online_episode = copy.deepcopy(checkpoint)
-    invalid_online_episode["online_episode"] = 1
-    with pytest.raises(ValueError, match="completed pre-online"):
-        write_and_load(invalid_online_episode)
-
-    changed_seed = dataclasses.replace(target_config, seed=target_config.seed + 1)
-    atomic_torch_save(path, checkpoint)
-    with pytest.raises(ValueError, match="config differs"):
-        _load_offline_fork(
-            path,
-            target_config=changed_seed,
-            dataset=dataset,
-            koopman=koopman,
-            environment_protocol=environment_protocol,
-        )
 
 
 def test_metrics_resume_truncation_uses_latest_checkpoint_counters(

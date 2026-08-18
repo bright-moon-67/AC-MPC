@@ -21,7 +21,7 @@ from experiments.dmc.o2o.checkpoint import (
     restore_rng,
     rng_state,
 )
-from experiments.dmc.o2o.config import METHODS, O2OConfig
+from experiments.dmc.o2o.config import O2OConfig, TRAIN_METHODS
 from experiments.dmc.o2o.dataset import (
     OfflineDataset,
     OnlineReplay,
@@ -110,6 +110,39 @@ def _has_metric_row(path: Path, *, phase: str, offline_update: int, online_step:
             f"metrics.jsonl repeats {phase!r} at offline={offline_update}, online={online_step}"
         )
     return matches == 1
+
+
+def _read_metric_row(
+    path: Path, *, phase: str, offline_update: int, online_step: int
+) -> dict[str, Any]:
+    """Return the unique durable metric row for a completed milestone."""
+
+    rows = []
+    if path.is_file():
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON in metrics.jsonl line {line_number}"
+                ) from exc
+            if (
+                isinstance(row, dict)
+                and row.get("phase") == phase
+                and row.get("offline_update") == offline_update
+                and row.get("online_step") == online_step
+            ):
+                rows.append(row)
+    if len(rows) != 1:
+        raise ValueError(
+            f"Expected exactly one {phase!r} metric at "
+            f"offline={offline_update}, online={online_step}; got {len(rows)}"
+        )
+    return rows[0]
 
 
 def _checkpoint_counter(payload: dict[str, Any], key: str) -> int:
@@ -348,7 +381,7 @@ def _validate_resume(
     if pending.get("count") != 0 or pending.get("arrays") != {}:
         raise ValueError("Resumable checkpoint contains an unfinished trajectory")
     initialization = payload.get("initialization")
-    if config.uses_mpve and require_initialization:
+    if config.requires_offline_fork and require_initialization:
         if not isinstance(initialization, dict):
             raise ValueError("MPVE resume is missing its offline-fork lineage")
         source_path = initialization.get("source_path")
@@ -366,8 +399,8 @@ def _validate_resume(
             raise ValueError(
                 "MPVE offline-fork lineage no longer matches the immutable source"
             )
-    elif not config.uses_mpve and initialization is not None:
-        raise ValueError("Non-MPVE resume unexpectedly contains fork lineage")
+    elif not config.requires_offline_fork and initialization is not None:
+        raise ValueError("Non-forking method unexpectedly contains fork lineage")
 
 
 def _validated_offline_fork_source(
@@ -687,6 +720,7 @@ def run(
     *,
     initialize_from_offline: Path | None = None,
     extend_online_steps: int | None = None,
+    stop_after_offline: bool = False,
 ) -> None:
     config.validate()
     output = output.resolve()
@@ -752,12 +786,16 @@ def run(
     resumed = latest_path.is_file()
     if resumed and initialize_from_offline is not None:
         raise ValueError("Cannot combine --initialize-from-offline with resume")
-    if config.uses_mpve and not resumed and initialize_from_offline is None:
+    # ``--stop-after-offline`` is useful for any method when the caller wants
+    # to inspect/freeze the offline checkpoint before launching online
+    # fine-tuning.  Methods without offline pretraining (plain RLPD) are
+    # recorded as an explicit offline=N/A boundary and never enter the env.
+    if config.requires_offline_fork and not resumed and initialize_from_offline is None:
         raise ValueError(
             "AC-KMPC-MPVE requires --initialize-from-offline from the paired "
             "Cal-RLPD-AC-KMPC offline.pt"
         )
-    if not config.uses_mpve and initialize_from_offline is not None:
+    if not config.requires_offline_fork and initialize_from_offline is not None:
         raise ValueError("--initialize-from-offline is only valid for AC-KMPC-MPVE")
     initialization: dict[str, Any] | None = None
     if resumed:
@@ -845,11 +883,17 @@ def run(
         "online_extension": extension_metadata,
         "mpve": {
             "enabled": config.uses_mpve,
-            "scope": "online_only",
-            "updates_per_real_environment_step": 1 if config.uses_mpve else 0,
+            "scope": config.method_spec.mpve_scope,
+            "updates_per_offline_gradient_step": (
+                1 if config.uses_offline_mpve else 0
+            ),
+            "updates_per_real_environment_step": (
+                1 if config.uses_online_mpve else 0
+            ),
             "total_td_horizon": config.mpve_total_horizon if config.uses_mpve else None,
             "composition": "one_real_plus_nine_model" if config.uses_mpve else None,
         },
+        "execution_scope": "offline_only" if stop_after_offline else "offline_to_online",
     }
     _atomic_json(output / "run.json", run_metadata)
 
@@ -1105,6 +1149,63 @@ def run(
                 raise ValueError(
                     "Online AC-KMPC resume is missing its immutable offline.pt"
                 )
+
+    if stop_after_offline:
+        if config.uses_offline_pretraining:
+            offline_result = _read_metric_row(
+                metrics_path,
+                phase="offline_evaluation",
+                offline_update=config.offline_updates,
+                online_step=0,
+            )
+        else:
+            # RLPD starts from random initialization and has no offline
+            # gradient phase.  Its step-zero evaluation is the only valid
+            # offline boundary; do not fabricate a 60k offline checkpoint.
+            offline_result = _read_metric_row(
+                metrics_path,
+                phase="initial",
+                offline_update=0,
+                online_step=0,
+            )
+        completion_return = float(offline_result["return_mean"])
+        if not np.isfinite(completion_return):
+            raise FloatingPointError("Offline completion return is non-finite")
+        best_return = completion_return
+        best_online_step = 0
+        # The completion checkpoint and JSON must both be finite and agree.
+        atomic_torch_save(
+            latest_path,
+            _checkpoint_payload(
+                config=config,
+                dataset=dataset,
+                koopman=koopman,
+                observation_normalizer=observation_normalizer,
+                learner=learner,
+                replay=replay,
+                generator=generator,
+                phase="offline",
+                offline_update=offline_update,
+                online_step=0,
+                online_episode=0,
+                environment_protocol=environment_protocol,
+                best_return=best_return,
+                best_online_step=best_online_step,
+                initialization=initialization,
+                online_extension=extension_metadata,
+            ),
+        )
+        run_metadata.update(
+            completed=True,
+            completion_scope="offline_only",
+            offline_updates_completed=offline_update,
+            online_steps_completed=0,
+            best_return=best_return,
+            best_online_step=best_online_step,
+            wall_time_seconds=time.time() - started,
+        )
+        _atomic_json(output / "run.json", run_metadata)
+        return
 
     if online_step % config.num_envs:
         raise ValueError("Resume online_step is not aligned to the vector width")
@@ -1364,7 +1465,7 @@ def run(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", choices=METHODS, required=True)
+    parser.add_argument("--method", choices=TRAIN_METHODS, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--koopman", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -1380,8 +1481,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--offline-eval-interval-updates", type=int, default=10_000
     )
+    parser.add_argument(
+        "--eval-interval-online-steps", type=int, default=5_000
+    )
     parser.add_argument("--initialize-from-offline", type=Path)
     parser.add_argument("--extend-online-steps", type=int)
+    parser.add_argument("--stop-after-offline", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     return args
@@ -1428,7 +1533,11 @@ def main() -> None:
         num_envs=num_envs,
         env_workers=env_workers,
         cql_weight=args.cql_weight,
-        eval_interval_online_steps=smoke_online_steps if args.smoke else 5_000,
+        eval_interval_online_steps=(
+            smoke_online_steps
+            if args.smoke
+            else args.eval_interval_online_steps
+        ),
         eval_episodes=2 if args.smoke else args.eval_episodes,
         checkpoint_interval_updates=10 if args.smoke else 10_000,
         log_interval_updates=5 if args.smoke else 1_000,
@@ -1443,6 +1552,7 @@ def main() -> None:
         args.output_dir,
         initialize_from_offline=args.initialize_from_offline,
         extend_online_steps=args.extend_online_steps,
+        stop_after_offline=args.stop_after_offline,
     )
 
 

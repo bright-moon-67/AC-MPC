@@ -21,6 +21,7 @@ TemperatureObjective = Literal["calql_log_alpha", "rlpd"]
 CriticHeadReduction = Literal["sum", "mean"]
 OnlineCQLMode = Literal["all_valid_mc", "off"]
 NetworkProfile = Literal["exorl_cql", "rlpd"]
+MPVEScope = Literal["off", "offline_only", "online_only", "both"]
 
 
 @dataclass(frozen=True)
@@ -33,12 +34,14 @@ class MethodSpec:
     offline_pretraining: bool
     calql: bool
     offline_replay_online: bool
-    mpve: bool
+    mpve_scope: MPVEScope
     completed_online_returns: bool
     profile: str
     batch_size: int
     hidden_dim: int
     critic_hidden_layers: int
+    controller_hidden_dim: int
+    controller_hidden_layers: int
     critic_ensemble_size: int
     target_critic_subset: int
     target_tau: float
@@ -70,12 +73,14 @@ _CALQL_RAW = dict(
     offline_pretraining=True,
     calql=True,
     offline_replay_online=True,
-    mpve=False,
+    mpve_scope="off",
     completed_online_returns=True,
     profile="exorl_cql_backbone_calql_standard_single_tanh_v1",
     batch_size=1024,
     hidden_dim=1024,
     critic_hidden_layers=2,
+    controller_hidden_dim=128,
+    controller_hidden_layers=1,
     critic_ensemble_size=2,
     target_critic_subset=2,
     target_tau=0.01,
@@ -104,12 +109,14 @@ _RLPD_RAW = dict(
     offline_pretraining=False,
     calql=False,
     offline_replay_online=True,
-    mpve=False,
+    mpve_scope="off",
     completed_online_returns=False,
     profile="rlpd_official_state_core_v1",
     batch_size=256,
     hidden_dim=256,
     critic_hidden_layers=2,
+    controller_hidden_dim=128,
+    controller_hidden_layers=1,
     critic_ensemble_size=10,
     target_critic_subset=2,
     target_tau=0.005,
@@ -134,6 +141,8 @@ _CALQL_AC_KMPC = {
     **_CALQL_RAW,
     "representation": "koopman_lifted",
     "actor": "ac_kmpc",
+    "controller_hidden_dim": 1024,
+    "controller_hidden_layers": 2,
     "profile": "exorl_cql_backbone_calql_ac_kmpc_lifted_v1",
 }
 _CAL_RLPD = dict(
@@ -145,6 +154,8 @@ _CAL_RLPD = dict(
     batch_size=256,
     hidden_dim=256,
     critic_hidden_layers=2,
+    controller_hidden_dim=128,
+    controller_hidden_layers=1,
     critic_ensemble_size=10,
     target_critic_subset=2,
     target_tau=0.005,
@@ -167,6 +178,16 @@ _CAL_RLPD = dict(
     env_workers=5,
 )
 
+# Structured RLPD variants use the same controller capacity scale as the
+# ordinary RLPD actor.  The controller remains structurally different (its
+# output is the KMPC cost/plan parameterization), but its learned torso is
+# two 256-wide layers rather than the wider Cal-QL 1024-wide profile.
+_CAL_RLPD_KMPC_RLPD_WIDTH = {
+    **{key: value for key, value in _CAL_RLPD.items() if key != "profile"},
+    "controller_hidden_dim": 256,
+    "controller_hidden_layers": 2,
+}
+
 METHOD_SPECS: dict[str, MethodSpec] = {
     "Cal-QL-Raw": MethodSpec(name="Cal-QL-Raw", **_CALQL_RAW),
     "Cal-QL-AC-KMPC": MethodSpec(
@@ -177,25 +198,72 @@ METHOD_SPECS: dict[str, MethodSpec] = {
         name="Cal-RLPD-Raw",
         representation="raw",
         actor="mlp",
-        mpve=False,
+        mpve_scope="off",
         **_CAL_RLPD,
     ),
     "Cal-RLPD-AC-KMPC": MethodSpec(
         name="Cal-RLPD-AC-KMPC",
         representation="koopman_lifted",
         actor="ac_kmpc",
-        mpve=False,
+        mpve_scope="off",
         **_CAL_RLPD,
     ),
     "Cal-RLPD-AC-KMPC-MPVE": MethodSpec(
         name="Cal-RLPD-AC-KMPC-MPVE",
         representation="koopman_lifted",
         actor="ac_kmpc",
-        mpve=True,
+        # MPVE is part of both phases: offline critic pretraining and online
+        # value expansion use the same detached Koopman target construction.
+        mpve_scope="both",
         **_CAL_RLPD,
     ),
 }
+# Standalone experiments are intentionally excluded from ``METHODS`` so the
+# legacy matrix/aggregate contract remains unchanged.  They are launched and
+# stopped independently and may have their own execution horizon.
+STANDALONE_METHOD_SPECS: dict[str, MethodSpec] = {
+    "Cal-RLPD-KMPC": MethodSpec(
+        name="Cal-RLPD-KMPC",
+        representation="koopman_lifted",
+        actor="ac_kmpc",
+        mpve_scope="off",
+        profile="calql_regularized_rlpd_cal_kmpc_rlpd_width_v2",
+        **_CAL_RLPD_KMPC_RLPD_WIDTH,
+    ),
+    "Cal-RLPD-MPVE": MethodSpec(
+        name="Cal-RLPD-MPVE",
+        representation="koopman_lifted",
+        actor="ac_kmpc",
+        mpve_scope="both",
+        profile="calql_regularized_rlpd_cal_kmpc_mpve_rlpd_width_v2",
+        **_CAL_RLPD_KMPC_RLPD_WIDTH,
+    ),
+    "Cal-QL-MPVE": MethodSpec(
+        name="Cal-QL-MPVE",
+        representation="koopman_lifted",
+        actor="ac_kmpc",
+        mpve_scope="both",
+        profile="exorl_cql_backbone_calql_ac_kmpc_mpve_v1",
+        **{
+            key: value
+            for key, value in _CALQL_AC_KMPC.items()
+            if key not in ("profile", "representation", "actor", "mpve_scope")
+        },
+    ),
+    "Cal-RLPD-AC-KMPC-Offline-MPVE": MethodSpec(
+        name="Cal-RLPD-AC-KMPC-Offline-MPVE",
+        representation="koopman_lifted",
+        actor="ac_kmpc",
+        # Standalone variant is also a complete offline-to-online MPVE
+        # method; it is not a different actor, only a different MPVE scope.
+        mpve_scope="both",
+        profile="calql_regularized_rlpd_offline_mpve_auxiliary_v1",
+        **{key: value for key, value in _CAL_RLPD.items() if key != "profile"},
+    ),
+}
 METHODS = tuple(METHOD_SPECS)
+TRAIN_METHOD_SPECS = {**METHOD_SPECS, **STANDALONE_METHOD_SPECS}
+TRAIN_METHODS = tuple(TRAIN_METHOD_SPECS)
 
 
 @dataclass(frozen=True)
@@ -212,6 +280,8 @@ class O2OConfig:
     batch_size: int | None = None
     hidden_dim: int | None = None
     critic_hidden_layers: int | None = None
+    controller_hidden_dim: int | None = None
+    controller_hidden_layers: int | None = None
     critic_ensemble_size: int | None = None
     target_critic_subset: int | None = None
     discount: float = 0.99
@@ -250,7 +320,6 @@ class O2OConfig:
 
     kmpc_horizon: int = 20
     kmpc_solver_iterations: int = 20
-    controller_hidden_dim: int = 128
     mpve_total_horizon: int = 10
     mpve_loss_weight: float = 1.0
 
@@ -261,13 +330,15 @@ class O2OConfig:
     offline_eval_interval_updates: int = 10_000
 
     def __post_init__(self) -> None:
-        if self.method not in METHOD_SPECS:
-            raise ValueError(f"Unknown method {self.method!r}; expected {METHODS}")
-        spec = METHOD_SPECS[self.method]
+        if self.method not in TRAIN_METHOD_SPECS:
+            raise ValueError(f"Unknown method {self.method!r}; expected {TRAIN_METHODS}")
+        spec = TRAIN_METHOD_SPECS[self.method]
         for name in (
             "batch_size",
             "hidden_dim",
             "critic_hidden_layers",
+            "controller_hidden_dim",
+            "controller_hidden_layers",
             "critic_ensemble_size",
             "target_critic_subset",
             "target_tau",
@@ -293,19 +364,20 @@ class O2OConfig:
 
     @property
     def method_spec(self) -> MethodSpec:
-        return METHOD_SPECS[self.method]
+        return TRAIN_METHOD_SPECS[self.method]
 
     def validate(self) -> None:
         if self.task != "cartpole_swingup":
             raise ValueError("The first O2O protocol is frozen to cartpole_swingup")
-        if self.method not in METHODS:
-            raise ValueError(f"Unknown method {self.method!r}; expected {METHODS}")
+        if self.method not in TRAIN_METHODS:
+            raise ValueError(f"Unknown method {self.method!r}; expected {TRAIN_METHODS}")
         integer_fields = (
             "batch_size", "hidden_dim", "critic_hidden_layers",
+            "controller_hidden_dim", "controller_hidden_layers",
             "critic_ensemble_size", "target_critic_subset", "offline_updates",
             "cql_actions", "online_steps", "online_utd", "online_warmup_steps",
             "replay_capacity", "num_envs", "env_workers", "kmpc_horizon",
-            "kmpc_solver_iterations", "controller_hidden_dim",
+            "kmpc_solver_iterations",
             "mpve_total_horizon", "eval_interval_online_steps", "eval_episodes",
             "checkpoint_interval_updates", "log_interval_updates",
             "offline_eval_interval_updates",
@@ -400,7 +472,7 @@ class O2OConfig:
 
     @property
     def requires_own_offline_pretraining(self) -> bool:
-        return self.uses_offline_pretraining and not self.uses_mpve
+        return self.uses_offline_pretraining and not self.requires_offline_fork
 
     @property
     def uses_offline_replay_online(self) -> bool:
@@ -431,7 +503,23 @@ class O2OConfig:
 
     @property
     def uses_mpve(self) -> bool:
-        return self.method_spec.mpve
+        return self.method_spec.mpve_scope != "off"
+
+    @property
+    def uses_offline_mpve(self) -> bool:
+        return self.method_spec.mpve_scope in ("offline_only", "both")
+
+    @property
+    def uses_online_mpve(self) -> bool:
+        return self.method_spec.mpve_scope in ("online_only", "both")
+
+    @property
+    def requires_offline_fork(self) -> bool:
+        # A unified MPVE method must learn the offline critic with MPVE too;
+        # it therefore owns its offline pretraining rather than forking a
+        # non-MPVE AC-KMPC snapshot.  Legacy online-only fork checkpoints are
+        # intentionally not accepted under the new method identity.
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
