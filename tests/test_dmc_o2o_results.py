@@ -38,7 +38,7 @@ from experiments.dmc.o2o.evaluate import (
 from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
 from experiments.dmc.o2o.learner import O2OLearner
 from experiments.dmc.o2o.networks import FrozenObservationNormalizer
-from experiments.dmc.o2o.plot import plot_aggregate
+from experiments.dmc.o2o.plot import plot_aggregate, plot_offline_curves
 
 
 PROTOCOL = {
@@ -606,6 +606,70 @@ def test_aggregate_uses_training_seeds_and_plot_writes_png_pdf(
     png_path, pdf_path = plot_aggregate(aggregate_path, tmp_path / "curves")
     assert png_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert pdf_path.read_bytes().startswith(b"%PDF")
+
+
+def _write_offline_run(root: Path, method: str) -> Path:
+    """Write a minimal offline-only run (run.json + metrics.jsonl)."""
+
+    root.mkdir(parents=True)
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "kind": "acmpc_dmc_o2o_run_v1",
+                "config": {"method": method},
+                "completed": True,
+                "execution_scope": "offline_only",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    rows: list[dict[str, Any]] = []
+    for step, value in ((10_000, 100.0), (20_000, 300.0), (30_000, 500.0)):
+        rows.append(
+            {
+                "phase": "offline_diagnostic",
+                "offline_update": step,
+                "online_step": 0,
+                "return_mean": value,
+                "return_std_population": 1.0,
+                "returns": [value] * EVALUATION_EPISODES,
+            }
+        )
+    rows.append(
+        {
+            "phase": "offline_evaluation",
+            "offline_update": 50_000,
+            "online_step": 0,
+            "return_mean": 700.0,
+            "return_std_population": 2.0,
+            "returns": [700.0] * EVALUATION_EPISODES,
+        }
+    )
+    (root / "metrics.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_plot_offline_curves_writes_png_and_csv(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    first = _write_offline_run(tmp_path / "Cal-QL-Raw", "Cal-QL-Raw")
+    second = _write_offline_run(tmp_path / "kmpc", "Cal-QL-AC-KMPC")
+    png_path, csv_path = plot_offline_curves(
+        [first, second], tmp_path / "offline_curves"
+    )
+    assert png_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    csv = csv_path.read_text(encoding="utf-8")
+    assert (
+        csv.splitlines()[0]
+        == "method,offline_update,return_mean,return_std_population"
+    )
+    # The historical internal name is normalized for display and CSV.
+    assert "Cal-QL-AC-KMPC" not in csv
+    assert "Cal-QL-KMPC,10000,100.0,1.0" in csv
+    assert "Cal-QL-Raw,50000,700.0,2.0" in csv
 
 
 def test_aggregate_rejects_method_specific_config_drift_across_seeds(
