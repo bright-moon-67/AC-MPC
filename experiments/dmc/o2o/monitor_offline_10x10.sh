@@ -8,6 +8,7 @@ DEVICE="${4:-cuda}"
 OFFLINE_UPDATES="${5:-50000}"
 ONLY_METHOD="${6:-}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+PARALLEL_WORKERS="${O2O_EVAL_WORKERS:-10}"
 
 METHODS=(Cal-QL-Raw Cal-RLPD-Raw Cal-QL-KMPC Cal-QL-MPVE Cal-RLPD-KMPC Cal-RLPD-MPVE)
 declare -A TRAIN_METHODS=(
@@ -56,6 +57,7 @@ PY
     method="${TRAIN_METHODS[$name]}"
     extra=(--dataset "$DATASET" --device "$DEVICE" --checkpoint latest
            --seed-base 9100000 --num-seeds 10 --episodes-per-seed 10
+           --parallel-workers "$PARALLEL_WORKERS"
            --output "$result")
     if [[ "$method" != *Raw ]]; then
       extra+=(--koopman "$KOOPMAN")

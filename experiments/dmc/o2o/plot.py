@@ -274,7 +274,7 @@ def plot_aggregate(aggregate_path: Path, output_prefix: Path) -> tuple[Path, Pat
 
 
 def plot_offline_curves(
-    run_dirs: Iterable[Path], output_prefix: Path
+    run_dirs: Iterable[Path], output_prefix: Path, *, task_label: str = "Cartpole Swingup"
 ) -> tuple[Path, Path]:
     """Plot offline return vs gradient updates and export the raw points as CSV.
 
@@ -332,13 +332,13 @@ def plot_offline_curves(
         )
     axis.set_title("Offline diagnostic return (10 episodes)")
     axis.set_xlabel("Offline gradient updates (thousands)")
-    axis.set_ylabel("Cartpole Swingup episode return (maximum 1000)")
+    axis.set_ylabel(f"{task_label} episode return (maximum 1000)")
     axis.set_ylim(0.0, MAX_EPISODE_RETURN * 1.02)
     axis.axhline(MAX_EPISODE_RETURN, color="black", linestyle=":", linewidth=1)
     axis.grid(alpha=0.25)
     axis.legend(fontsize=8, loc="best")
     figure.suptitle(
-        "DMC Cartpole offline-only development\n"
+        f"DMC {task_label} offline-only development\n"
         "(50k dataset / 50k updates; shading is 10-episode population std)",
         fontsize=13,
     )
@@ -370,6 +370,11 @@ def main() -> None:
         default=[],
         help="explicit offline-only run directory (repeatable)",
     )
+    parser.add_argument(
+        "--task-label",
+        default="Cartpole Swingup",
+        help="Task label used in the offline plot title and y-axis",
+    )
     parser.add_argument("--output-prefix", type=Path, required=True)
     args = parser.parse_args()
     if args.aggregate is not None:
@@ -381,7 +386,9 @@ def main() -> None:
         run_dirs.extend(
             sorted(path.parent for path in args.offline_root.rglob("run.json"))
         )
-    png_path, csv_path = plot_offline_curves(run_dirs, args.output_prefix)
+    png_path, csv_path = plot_offline_curves(
+        run_dirs, args.output_prefix, task_label=args.task_label
+    )
     print(json.dumps({"png": str(png_path), "csv": str(csv_path)}, indent=2))
 
 

@@ -587,6 +587,7 @@ def _prepare_online_extension(
     )
     target_config.validate()
     latest_path = output / "latest.pt"
+    best_path = output / "best.pt"
     run_path = output / "run.json"
     if not latest_path.is_file():
         raise ValueError("Online extension requires an existing completed run")
@@ -598,7 +599,6 @@ def _prepare_online_extension(
         raise ValueError("Online extension run.json must contain an object")
 
     checkpoint_paths = [latest_path]
-    best_path = output / "best.pt"
     if best_path.is_file():
         checkpoint_paths.append(best_path)
     checkpoints = {path: load_checkpoint(path) for path in checkpoint_paths}
@@ -769,6 +769,7 @@ def run(
     protocol_env.close()
 
     latest_path = output / "latest.pt"
+    best_path = output / "best.pt"
     extension_metadata: dict[str, Any] | None = None
     if extend_online_steps is not None:
         if isinstance(extend_online_steps, bool) or not isinstance(
@@ -840,6 +841,24 @@ def run(
         online_episode = int(payload["online_episode"])
         best_return = float(payload["best_return"])
         best_online_step = int(payload["best_online_step"])
+        # A best checkpoint may have been written after the latest recovery
+        # checkpoint and before a process interruption.  Restore its score so
+        # the next save does not forget that improvement.
+        if best_path.is_file():
+            best_payload = load_checkpoint(best_path)
+            if (
+                best_payload.get("config_fingerprint") != config.fingerprint
+                or best_payload.get("dataset", {}).get("sha256") != dataset.sha256
+                or best_payload.get("environment_protocol") != environment_protocol
+            ):
+                raise ValueError("Best checkpoint identity differs on resume")
+            expected_koopman = None if koopman is None else koopman.identity()
+            if best_payload.get("koopman") != expected_koopman:
+                raise ValueError("Best checkpoint Koopman identity differs on resume")
+            saved_best_return = float(best_payload["best_return"])
+            if saved_best_return > best_return:
+                best_return = saved_best_return
+                best_online_step = int(best_payload["best_online_step"])
         initialization = payload.get("initialization")
         saved_extension = payload.get("online_extension")
         if saved_extension is not None:
@@ -881,6 +900,11 @@ def run(
         ),
         "environment_protocol": environment_protocol,
         "device": str(device),
+        "checkpoint_artifacts": {
+            "latest": "latest.pt",
+            "best": "best.pt",
+            "best_selection": "highest_recorded_evaluation_return",
+        },
         "started_unix_seconds": time.time(),
         "resumed": resumed,
         "algorithm_label": config.method_spec.profile,
@@ -924,6 +948,34 @@ def run(
         "execution_scope": "offline_only" if stop_after_offline else "offline_to_online",
     }
     _atomic_json(output / "run.json", run_metadata)
+
+    def save_best_checkpoint(
+        pending_trajectory: dict[str, list[np.ndarray | float]] | None = None,
+    ) -> None:
+        """Atomically publish the learner state selected by evaluation."""
+
+        atomic_torch_save(
+            best_path,
+            _checkpoint_payload(
+                config=config,
+                dataset=dataset,
+                koopman=koopman,
+                observation_normalizer=observation_normalizer,
+                learner=learner,
+                replay=replay,
+                generator=generator,
+                phase=("offline" if online_step == 0 else "online"),
+                offline_update=offline_update,
+                online_step=online_step,
+                online_episode=online_episode,
+                environment_protocol=environment_protocol,
+                best_return=best_return,
+                best_online_step=best_online_step,
+                initialization=initialization,
+                pending_trajectory=pending_trajectory,
+                online_extension=extension_metadata,
+            ),
+        )
 
     initial_evaluation_phase = (
         "offline_evaluation" if initialization is not None else "initial"
@@ -974,6 +1026,10 @@ def run(
         initial_eval = evaluate(
             learner, episodes=config.eval_episodes, seed_base=9_100_000
         )
+        if initial_eval["return_mean"] > best_return:
+            best_return = float(initial_eval["return_mean"])
+            best_online_step = 0
+            save_best_checkpoint()
         _append_jsonl(
             metrics_path,
             {
@@ -988,6 +1044,8 @@ def run(
     if config.requires_own_offline_pretraining:
         def evaluate_offline_diagnostic_if_due() -> None:
             """Persist an idempotent fixed-seed diagnostic at offline milestones."""
+
+            nonlocal best_return, best_online_step
 
             if (
                 offline_update <= 0
@@ -1029,6 +1087,10 @@ def run(
             diagnostic = evaluate(
                 learner, episodes=config.eval_episodes, seed_base=9_100_000
             )
+            if diagnostic["return_mean"] > best_return:
+                best_return = float(diagnostic["return_mean"])
+                best_online_step = 0
+                save_best_checkpoint()
             _append_jsonl(
                 metrics_path,
                 {
@@ -1126,6 +1188,10 @@ def run(
             offline_eval = evaluate(
                 learner, episodes=config.eval_episodes, seed_base=9_100_000
             )
+            if offline_eval["return_mean"] > best_return:
+                best_return = float(offline_eval["return_mean"])
+                best_online_step = 0
+                save_best_checkpoint()
             _append_jsonl(
                 metrics_path,
                 {
@@ -1199,8 +1265,10 @@ def run(
         completion_return = float(offline_result["return_mean"])
         if not np.isfinite(completion_return):
             raise FloatingPointError("Offline completion return is non-finite")
-        best_return = completion_return
-        best_online_step = 0
+        if completion_return > best_return:
+            best_return = completion_return
+            best_online_step = 0
+            save_best_checkpoint()
         # The completion checkpoint and JSON must both be finite and agree.
         atomic_torch_save(
             latest_path,
@@ -1418,28 +1486,7 @@ def run(
                 if evaluation["return_mean"] > best_return:
                     best_return = evaluation["return_mean"]
                     best_online_step = online_step
-                    atomic_torch_save(
-                        output / "best.pt",
-                        _checkpoint_payload(
-                            config=config,
-                            dataset=dataset,
-                            koopman=koopman,
-                            observation_normalizer=observation_normalizer,
-                            learner=learner,
-                            replay=replay,
-                            generator=generator,
-                            phase="online",
-                            offline_update=offline_update,
-                            online_step=online_step,
-                            online_episode=online_episode,
-                            environment_protocol=environment_protocol,
-                            best_return=best_return,
-                            best_online_step=best_online_step,
-                            initialization=initialization,
-                            pending_trajectory=pending_trajectory,
-                            online_extension=extension_metadata,
-                        ),
-                    )
+                    save_best_checkpoint(pending_trajectory)
                 print(
                     f"method={config.method} online={online_step}/{config.online_steps} "
                     f"eval={evaluation['return_mean']:.2f} best={best_return:.2f}",
