@@ -786,8 +786,10 @@ def run(
     resumed = latest_path.is_file()
     if resumed and initialize_from_offline is not None:
         raise ValueError("Cannot combine --initialize-from-offline with resume")
-    if stop_after_offline and not config.uses_offline_mpve:
-        raise ValueError("--stop-after-offline is reserved for Offline-MPVE")
+    # ``--stop-after-offline`` is useful for any method when the caller wants
+    # to inspect/freeze the offline checkpoint before launching online
+    # fine-tuning.  Methods without offline pretraining (plain RLPD) are
+    # recorded as an explicit offline=N/A boundary and never enter the env.
     if config.requires_offline_fork and not resumed and initialize_from_offline is None:
         raise ValueError(
             "AC-KMPC-MPVE requires --initialize-from-offline from the paired "
@@ -1149,12 +1151,23 @@ def run(
                 )
 
     if stop_after_offline:
-        offline_result = _read_metric_row(
-            metrics_path,
-            phase="offline_evaluation",
-            offline_update=config.offline_updates,
-            online_step=0,
-        )
+        if config.uses_offline_pretraining:
+            offline_result = _read_metric_row(
+                metrics_path,
+                phase="offline_evaluation",
+                offline_update=config.offline_updates,
+                online_step=0,
+            )
+        else:
+            # RLPD starts from random initialization and has no offline
+            # gradient phase.  Its step-zero evaluation is the only valid
+            # offline boundary; do not fabricate a 60k offline checkpoint.
+            offline_result = _read_metric_row(
+                metrics_path,
+                phase="initial",
+                offline_update=0,
+                online_step=0,
+            )
         completion_return = float(offline_result["return_mean"])
         if not np.isfinite(completion_return):
             raise FloatingPointError("Offline completion return is non-finite")
@@ -1468,6 +1481,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--offline-eval-interval-updates", type=int, default=10_000
     )
+    parser.add_argument(
+        "--eval-interval-online-steps", type=int, default=5_000
+    )
     parser.add_argument("--initialize-from-offline", type=Path)
     parser.add_argument("--extend-online-steps", type=int)
     parser.add_argument("--stop-after-offline", action="store_true")
@@ -1517,7 +1533,11 @@ def main() -> None:
         num_envs=num_envs,
         env_workers=env_workers,
         cql_weight=args.cql_weight,
-        eval_interval_online_steps=smoke_online_steps if args.smoke else 5_000,
+        eval_interval_online_steps=(
+            smoke_online_steps
+            if args.smoke
+            else args.eval_interval_online_steps
+        ),
         eval_episodes=2 if args.smoke else args.eval_episodes,
         checkpoint_interval_updates=10 if args.smoke else 10_000,
         log_interval_updates=5 if args.smoke else 1_000,
