@@ -266,7 +266,7 @@ git -C ManiSoft submodule update --init --recursive
 使用，ManiSoft 分支或版本不对时，AC-MPC 中的接口将无法工作。
 
 本文最后核对时的兼容基线为 ManiSoft
-`85d7d997ec324c620f6d69817be0d1e6535f1147`；AC-MPC 应使用包含
+`b5299b6dbeac23ab8e82efd8f417a5e8394313a5`；AC-MPC 应使用包含
 KMPC-IQL format v2 和本文档的 PR HEAD。PR 合并后建议在实验记录中同时保存
 两个仓库的 `git rev-parse HEAD`，不要只记录分支名。
 
