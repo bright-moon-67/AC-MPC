@@ -1,0 +1,22 @@
+name: antmaze_legacy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - glew
+  - mesalib
+  - patchelf
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - Cython==0.29.37
+      - numpy==1.23.5
+      - gym==0.23.1
+      - gymnasium==1.0.0
+      - mujoco-py==2.1.2.14
+      - h5py==3.10.0
+      - matplotlib>=3.8,<4
+      - torch==2.6.0+cu124
+      - PyYAML>=6
+      - tqdm
+      - termcolor
