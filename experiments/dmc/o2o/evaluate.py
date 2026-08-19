@@ -123,6 +123,64 @@ def _validate_initialization_lineage(
     koopman_sha256: str | None,
     environment_protocol: Mapping[str, Any],
 ) -> None:
+    if (
+        isinstance(initialization, Mapping)
+        and initialization.get("kind")
+        == "acmpc_o2o_offline_continuation_v1"
+    ):
+        source_path_value = initialization.get("source_path")
+        if not isinstance(source_path_value, str) or not source_path_value:
+            raise ValueError("Offline continuation source path is invalid")
+        source_path = Path(source_path_value).resolve()
+        if source_path.name != "latest.pt" or not source_path.is_file():
+            raise FileNotFoundError(
+                f"Offline continuation latest.pt is missing: {source_path}"
+            )
+        source = load_checkpoint(source_path)
+        source_config = _config_from_checkpoint(source)
+        if source_config.method != config.method:
+            raise ValueError("Offline continuation source method differs")
+        source_fields = source_config.to_dict()
+        target_fields = config.to_dict()
+        for field in ("online_steps", "eval_interval_online_steps", "eval_episodes"):
+            source_fields.pop(field)
+            target_fields.pop(field)
+        if source_fields != target_fields:
+            raise ValueError("Offline continuation source config differs")
+        if source.get("dataset", {}).get("sha256") != dataset_sha256:
+            raise ValueError("Offline continuation source dataset differs")
+        source_koopman = source.get("koopman")
+        if koopman_sha256 is None:
+            if source_koopman is not None:
+                raise ValueError("Raw offline continuation source contains Koopman")
+        elif (
+            not isinstance(source_koopman, Mapping)
+            or source_koopman.get("sha256") != koopman_sha256
+        ):
+            raise ValueError("Offline continuation source Koopman differs")
+        if source.get("environment_protocol") != dict(environment_protocol):
+            raise ValueError("Offline continuation source DMC protocol differs")
+        if (
+            source.get("phase") != "offline"
+            or _validate_counter(source, "offline_update") != config.offline_updates
+            or _validate_counter(source, "online_step") != 0
+            or _validate_counter(source, "online_episode") != 0
+            or source.get("initialization") is not None
+        ):
+            raise ValueError("Offline continuation source is not the final boundary")
+        expected = {
+            "kind": "acmpc_o2o_offline_continuation_v1",
+            "source_path": str(source_path),
+            "source_sha256": file_sha256(source_path),
+            "source_method": source_config.method,
+            "source_config_fingerprint": source_config.fingerprint,
+            "target_config_fingerprint": config.fingerprint,
+            "source_offline_update": config.offline_updates,
+            "shared_state": "actor_critic_target_temperature_optimizers_replay_rng",
+        }
+        if dict(initialization) != expected:
+            raise ValueError("Offline continuation lineage differs from its source")
+        return
     if not config.requires_offline_fork:
         if initialization is not None:
             raise ValueError("Non-forking checkpoint contains fork lineage")

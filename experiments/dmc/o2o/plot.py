@@ -202,6 +202,157 @@ def _write_offline_csv(curves: Mapping[str, list[dict[str, Any]]], path: Path) -
         temporary.unlink(missing_ok=True)
 
 
+def _online_curves(run_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    """Read raw training episodes and fixed-seed online evaluations."""
+
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    training: list[dict[str, Any]] = []
+    evaluations: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        phase = row.get("phase")
+        step = row.get("online_step")
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            continue
+        if phase == "online_episode":
+            value = row.get("episode_return")
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                training.append(
+                    {
+                        "online_step": step,
+                        "return_mean": float(value),
+                        "return_std_population": 0.0,
+                    }
+                )
+        elif (
+            (phase in ("initial", "offline_evaluation") and step == 0)
+            or (phase == "online_evaluation" and step > 0)
+        ):
+            value = row.get("return_mean")
+            std = row.get("return_std_population", 0.0)
+            if (
+                isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and isinstance(std, (int, float))
+                and math.isfinite(float(std))
+            ):
+                # A resumed run may repeat an idempotent evaluation.  The
+                # latest durable row at a step is authoritative.
+                evaluations[step] = {
+                    "online_step": step,
+                    "return_mean": float(value),
+                    "return_std_population": float(std),
+                }
+    if not training and not evaluations:
+        raise ValueError(f"No online rows in {run_dir}/metrics.jsonl")
+    return {
+        "training": training,
+        "evaluation": [evaluations[step] for step in sorted(evaluations)],
+    }
+
+
+def _write_online_csv(
+    curves: Mapping[str, dict[str, list[dict[str, Any]]]], path: Path
+) -> None:
+    lines = ["series,method,online_step,return_mean,return_std_population"]
+    for method in sorted(curves):
+        for series in ("training", "evaluation"):
+            for point in curves[method][series]:
+                lines.append(
+                    f"{series},{method},{point['online_step']},"
+                    f"{point['return_mean']!r},"
+                    f"{point['return_std_population']!r}"
+                )
+    payload = "\n".join(lines) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def plot_online_run_curves(
+    run_dirs: Iterable[Path],
+    output_prefix: Path,
+    *,
+    task_label: str,
+    protocol_label: str,
+) -> tuple[Path, Path]:
+    """Plot single-training-seed online curves directly from run artifacts."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    resolved = [Path(path).resolve() for path in run_dirs]
+    if not resolved:
+        raise ValueError("At least one online run directory is required")
+    curves: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for run_dir in resolved:
+        method = _method_name(run_dir)
+        if method in curves:
+            raise ValueError(f"Duplicate method {method}")
+        curves[method] = _online_curves(run_dir)
+
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5.4), constrained_layout=True)
+    training_axis, evaluation_axis = axes
+    for index, (method, method_curves) in enumerate(sorted(curves.items())):
+        color = COLORS.get(method, f"C{index % 10}")
+        training = method_curves["training"]
+        if training:
+            x = np.asarray([point["online_step"] for point in training]) / 1000.0
+            y = np.asarray([point["return_mean"] for point in training])
+            training_axis.plot(
+                x, y, color=color, linewidth=1.5, marker="o", markersize=3,
+                label=method,
+            )
+        evaluation = method_curves["evaluation"]
+        if evaluation:
+            x = np.asarray([point["online_step"] for point in evaluation]) / 1000.0
+            y = np.asarray([point["return_mean"] for point in evaluation])
+            std = np.asarray(
+                [point["return_std_population"] for point in evaluation]
+            )
+            evaluation_axis.plot(
+                x, y, color=color, linewidth=2, marker="o", markersize=3.5,
+                label=method,
+            )
+            evaluation_axis.fill_between(
+                x,
+                np.clip(y - std, 0.0, None),
+                np.clip(y + std, None, MAX_EPISODE_RETURN),
+                color=color,
+                alpha=0.12,
+                linewidth=0,
+            )
+    training_axis.set_title("Online training episode return")
+    evaluation_axis.set_title("Deterministic evaluation return (10 episodes)")
+    for axis in axes:
+        axis.set_xlabel("Online environment steps (thousands)")
+        axis.set_ylabel(f"{task_label} episode return (maximum 1000)")
+        axis.set_ylim(0.0, MAX_EPISODE_RETURN * 1.02)
+        axis.axhline(MAX_EPISODE_RETURN, color="black", linestyle=":", linewidth=1)
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=8, loc="best")
+    figure.suptitle(
+        f"DMC {task_label} online learning\n"
+        f"{protocol_label}; single training seed; evaluation shading is population std",
+        fontsize=13,
+    )
+    output_prefix = output_prefix.resolve()
+    png_path = output_prefix.with_suffix(".png")
+    csv_path = output_prefix.with_suffix(".csv")
+    _save_atomic(figure, png_path, image_format="png")
+    plt.close(figure)
+    _write_online_csv(curves, csv_path)
+    return png_path, csv_path
+
+
 def plot_aggregate(aggregate_path: Path, output_prefix: Path) -> tuple[Path, Path]:
     import matplotlib
 
@@ -274,7 +425,11 @@ def plot_aggregate(aggregate_path: Path, output_prefix: Path) -> tuple[Path, Pat
 
 
 def plot_offline_curves(
-    run_dirs: Iterable[Path], output_prefix: Path, *, task_label: str = "Cartpole Swingup"
+    run_dirs: Iterable[Path],
+    output_prefix: Path,
+    *,
+    task_label: str = "Cartpole Swingup",
+    protocol_label: str = "dataset-specific offline protocol",
 ) -> tuple[Path, Path]:
     """Plot offline return vs gradient updates and export the raw points as CSV.
 
@@ -339,7 +494,7 @@ def plot_offline_curves(
     axis.legend(fontsize=8, loc="best")
     figure.suptitle(
         f"DMC {task_label} offline-only development\n"
-        "(50k dataset / 50k updates; shading is 10-episode population std)",
+        f"({protocol_label}; shading is 10-episode population std)",
         fontsize=13,
     )
 
@@ -363,6 +518,11 @@ def main() -> None:
         type=Path,
         help="root that recursively contains offline-only method runs",
     )
+    mode.add_argument(
+        "--online-root",
+        type=Path,
+        help="root that recursively contains online method runs",
+    )
     parser.add_argument(
         "--offline-run-dir",
         type=Path,
@@ -371,9 +531,21 @@ def main() -> None:
         help="explicit offline-only run directory (repeatable)",
     )
     parser.add_argument(
+        "--online-run-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help="explicit online run directory (repeatable)",
+    )
+    parser.add_argument(
         "--task-label",
         default="Cartpole Swingup",
         help="Task label used in the offline plot title and y-axis",
+    )
+    parser.add_argument(
+        "--protocol-label",
+        default="dataset-specific offline protocol",
+        help="Dataset/update protocol label used in the offline plot subtitle",
     )
     parser.add_argument("--output-prefix", type=Path, required=True)
     args = parser.parse_args()
@@ -381,13 +553,29 @@ def main() -> None:
         png_path, pdf_path = plot_aggregate(args.aggregate, args.output_prefix)
         print(json.dumps({"png": str(png_path), "pdf": str(pdf_path)}, indent=2))
         return
+    if args.online_root is not None:
+        run_dirs = list(args.online_run_dir)
+        run_dirs.extend(
+            sorted(path.parent for path in args.online_root.rglob("run.json"))
+        )
+        png_path, csv_path = plot_online_run_curves(
+            run_dirs,
+            args.output_prefix,
+            task_label=args.task_label,
+            protocol_label=args.protocol_label,
+        )
+        print(json.dumps({"png": str(png_path), "csv": str(csv_path)}, indent=2))
+        return
     run_dirs = list(args.offline_run_dir)
     if args.offline_root is not None:
         run_dirs.extend(
             sorted(path.parent for path in args.offline_root.rglob("run.json"))
         )
     png_path, csv_path = plot_offline_curves(
-        run_dirs, args.output_prefix, task_label=args.task_label
+        run_dirs,
+        args.output_prefix,
+        task_label=args.task_label,
+        protocol_label=args.protocol_label,
     )
     print(json.dumps({"png": str(png_path), "csv": str(csv_path)}, indent=2))
 

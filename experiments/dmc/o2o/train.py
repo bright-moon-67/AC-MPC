@@ -399,8 +399,28 @@ def _validate_resume(
             raise ValueError(
                 "MPVE offline-fork lineage no longer matches the immutable source"
             )
-    elif not config.requires_offline_fork and initialization is not None:
-        raise ValueError("Non-forking method unexpectedly contains fork lineage")
+    elif initialization is not None:
+        if (
+            not isinstance(initialization, dict)
+            or initialization.get("kind")
+            != "acmpc_o2o_offline_continuation_v1"
+        ):
+            raise ValueError("Non-forking method contains invalid initialization lineage")
+        source_path = initialization.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError("Offline continuation source path is invalid")
+        _source, current_identity = _validated_offline_continuation_source(
+            Path(source_path),
+            target_config=config,
+            dataset=dataset,
+            koopman=koopman,
+            observation_normalizer=observation_normalizer,
+            environment_protocol=environment_protocol,
+        )
+        if initialization != current_identity:
+            raise ValueError(
+                "Offline continuation lineage no longer matches the immutable source"
+            )
 
 
 def _validated_offline_fork_source(
@@ -482,6 +502,95 @@ def _load_offline_fork(
         observation_normalizer=observation_normalizer,
         environment_protocol=environment_protocol,
     )
+
+
+def _validated_offline_continuation_source(
+    path: Path,
+    *,
+    target_config: O2OConfig,
+    dataset: OfflineDataset,
+    koopman: FrozenKoopman | None,
+    observation_normalizer: FrozenObservationNormalizer | None,
+    environment_protocol: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate one completed offline-only ``latest.pt`` for online continuation."""
+
+    path = path.resolve()
+    if path.name != "latest.pt":
+        raise ValueError("Online continuation must start from offline latest.pt")
+    source = load_checkpoint(path)
+    source_config = O2OConfig(**source.get("config", {}))
+    if source_config.method != target_config.method:
+        raise ValueError("Offline continuation method differs")
+    source_fields = source_config.to_dict()
+    target_fields = target_config.to_dict()
+    for field in ("online_steps", "eval_interval_online_steps", "eval_episodes"):
+        source_fields.pop(field)
+        target_fields.pop(field)
+    if source_fields != target_fields:
+        raise ValueError("Offline continuation config differs outside online budget/eval cadence")
+    if source.get("config_fingerprint") != source_config.fingerprint:
+        raise ValueError("Offline continuation source config fingerprint is invalid")
+    _validate_resume(
+        source,
+        source_config,
+        dataset,
+        koopman,
+        environment_protocol,
+        observation_normalizer=observation_normalizer,
+        require_initialization=False,
+    )
+    expected = {
+        "phase": "offline",
+        "offline_update": target_config.offline_updates,
+        "online_step": 0,
+        "online_episode": 0,
+        "initialization": None,
+    }
+    mismatches = {
+        key: {"actual": source.get(key), "expected": value}
+        for key, value in expected.items()
+        if source.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"Offline continuation source is not the final offline boundary: {mismatches}"
+        )
+    run_path = path.parent / "run.json"
+    try:
+        run_metadata = json.loads(run_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError("Offline continuation source requires valid run.json") from exc
+    if not isinstance(run_metadata, dict):
+        raise ValueError("Offline continuation source run.json must contain an object")
+    expected_run = {
+        "kind": "acmpc_dmc_o2o_run_v1",
+        "config_fingerprint": source_config.fingerprint,
+        "execution_scope": "offline_only",
+        "completed": True,
+        "offline_updates_completed": target_config.offline_updates,
+        "online_steps_completed": 0,
+    }
+    run_mismatches = {
+        key: {"actual": run_metadata.get(key), "expected": value}
+        for key, value in expected_run.items()
+        if run_metadata.get(key) != value
+    }
+    if run_mismatches:
+        raise ValueError(
+            f"Offline continuation source run is not completed offline-only: {run_mismatches}"
+        )
+    identity = {
+        "kind": "acmpc_o2o_offline_continuation_v1",
+        "source_path": str(path),
+        "source_sha256": file_sha256(path),
+        "source_method": source_config.method,
+        "source_config_fingerprint": source_config.fingerprint,
+        "target_config_fingerprint": target_config.fingerprint,
+        "source_offline_update": target_config.offline_updates,
+        "shared_state": "actor_critic_target_temperature_optimizers_replay_rng",
+    }
+    return source, identity
 
 
 def _validate_offline_snapshot(
@@ -719,6 +828,7 @@ def run(
     output: Path,
     *,
     initialize_from_offline: Path | None = None,
+    initialize_from_offline_final: Path | None = None,
     extend_online_steps: int | None = None,
     stop_after_offline: bool = False,
 ) -> None:
@@ -778,7 +888,7 @@ def run(
             raise ValueError("Extended online budget must be an integer")
         if extend_online_steps % 5_000:
             raise ValueError("Extended online budget must be a multiple of 5000")
-        if initialize_from_offline is not None:
+        if initialize_from_offline is not None or initialize_from_offline_final is not None:
             raise ValueError("Cannot initialize an offline fork while extending")
         config, extension_metadata = _prepare_online_extension(
             base_config=config,
@@ -809,8 +919,16 @@ def run(
     best_return = float("-inf")
     best_online_step = -1
     resumed = latest_path.is_file()
-    if resumed and initialize_from_offline is not None:
-        raise ValueError("Cannot combine --initialize-from-offline with resume")
+    if resumed and (
+        initialize_from_offline is not None
+        or initialize_from_offline_final is not None
+    ):
+        raise ValueError("Cannot combine offline initialization with resume")
+    if (
+        initialize_from_offline is not None
+        and initialize_from_offline_final is not None
+    ):
+        raise ValueError("Offline initialization modes are mutually exclusive")
     # ``--stop-after-offline`` is useful for any method when the caller wants
     # to inspect/freeze the offline checkpoint before launching online
     # fine-tuning.  Methods without offline pretraining (plain RLPD) are
@@ -884,6 +1002,21 @@ def run(
             environment_protocol=environment_protocol,
         )
         learner.load_state_dict(payload["learner"])
+        restore_rng(payload["rng"], generator)
+        offline_update = int(payload["offline_update"])
+    elif initialize_from_offline_final is not None:
+        payload, initialization = _validated_offline_continuation_source(
+            initialize_from_offline_final,
+            target_config=config,
+            dataset=dataset,
+            koopman=koopman,
+            observation_normalizer=observation_normalizer,
+            environment_protocol=environment_protocol,
+        )
+        learner.load_state_dict(payload["learner"])
+        replay.load_state_dict(payload["online_replay"])
+        if replay.size != 0 or replay.cursor != 0:
+            raise ValueError("Offline continuation source contains online replay data")
         restore_rng(payload["rng"], generator)
         offline_update = int(payload["offline_update"])
 
@@ -1567,6 +1700,11 @@ def parse_args() -> argparse.Namespace:
         "--eval-interval-online-steps", type=int, default=5_000
     )
     parser.add_argument("--initialize-from-offline", type=Path)
+    parser.add_argument(
+        "--initialize-from-offline-final",
+        type=Path,
+        help="Start a fresh online run from a completed same-method offline latest.pt",
+    )
     parser.add_argument("--extend-online-steps", type=int)
     parser.add_argument("--stop-after-offline", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -1636,6 +1774,7 @@ def main() -> None:
         args.koopman,
         args.output_dir,
         initialize_from_offline=args.initialize_from_offline,
+        initialize_from_offline_final=args.initialize_from_offline_final,
         extend_online_steps=args.extend_online_steps,
         stop_after_offline=args.stop_after_offline,
     )
