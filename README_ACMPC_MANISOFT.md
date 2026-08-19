@@ -1,6 +1,6 @@
 # AC-MPC + ManiSoft 项目说明
 
-本文档用于向接手同事交接 AC-MPC + ManiSoft 工作，覆盖环境搭建、Koopman
+本文档用于 AC-MPC + ManiSoft 工作，覆盖环境搭建、Koopman
 数据收集与训练、单点跟踪、三 waypoint PPO-KMPC、离线数据收集和 KMPC-IQL。
 文档同时区分当前推荐主线、仍可复现的旧实验和正在验证的研究分支。除特别
 标注外，命令均从 `AC-MPC/` 根目录执行；当前服务器上已配好的环境和数据位置
@@ -114,7 +114,8 @@ max_delta = 0.0125
 
 ### 1.5 已具备 artifact 时的最短使用路径
 
-先定义与机器无关的路径。后文出现 `/root/autodl-tmp` 时，均可用相同方式替换：
+先定义工作区路径。除下文 1.6 节说明的 v15e checkpoint 内嵌 Koopman
+绝对路径外，后文出现 `/root/autodl-tmp` 时均可用相同方式替换：
 
 ```bash
 export WORKSPACE=/path/to/workspace
@@ -134,9 +135,10 @@ cd "$ACMPC_ROOT"
 直接评估当前主线 v15e：
 
 ```bash
+V15E=runs/manisoft_ppo_compare_v15_zmixed_24h/e_kmpc_r8_lr3_std18_md0125/last.pt
+
 "$AC_MPC_PYTHON" scripts/evaluate_manisoft_ppo_comparison.py \
-  --checkpoint runs/manisoft_ppo_compare_v15_zmixed_24h/\
-e_kmpc_r8_lr3_std18_md0125/last.pt \
+  --checkpoint "$V15E" \
   --scenario "$MANISOFT_ROOT/configs/demo_elastica_fast.yaml" \
   --waypoint-root data/processed/manisoft_waypoint_bank_v2_zmixed_merged \
   --output runs/handoff_smoke/v15e_eval_10ep \
@@ -146,6 +148,75 @@ e_kmpc_r8_lr3_std18_md0125/last.pt \
 评估器使用确定性 KMPC mean，并保存逐回合轨迹和 `summary.json`。若故意在与
 checkpoint 记录不同的 waypoint bank 上测试泛化，必须额外传入
 `--allow-other-waypoint-bank`；否则 SHA256 不一致会被拒绝。
+
+### 1.6 v15e 最小交接 artifact
+
+同事已经从 GitHub 获取 AC-MPC `manisoft-port` 和 ManiSoft
+`acmpc-integration` 两个配套分支后，若只要求直接运行上面的 v15e 确定性评估，
+不需要复制服务器上的整个 `data/`、`runs/` 或 `work_dirs/`。在代码之外至少还需
+交付以下三项，并保持相对 AC-MPC 仓库根目录的目录结构：
+
+| 必需 artifact | 大小 | 内容与作用 |
+| --- | ---: | --- |
+| `runs/manisoft_ppo_compare_v15_zmixed_24h/e_kmpc_r8_lr3_std18_md0125/last.pt` | 约 2.7 MB | 当前推荐 v15e PPO-KMPC 行为策略 |
+| `work_dirs/manisoft_koopman_history_h10_abs_rho095_seed42_20260811/koopman_history/best_validation.pt` | 约 2.9 MB | v15e 加载时必需的 H=10、谱半径上限 0.95 history Koopman 模型 |
+| `data/processed/manisoft_waypoint_bank_v2_zmixed_merged/` | 约 106 MB | 与 checkpoint 匹配的完整 v2 waypoint bank；含 `manifest.json` 和 904 个 triplet，共 2,713 个文件 |
+
+三项合计约 111 MB。用于交接核验的 SHA256 为：
+
+```text
+0b82cba4f5c1bf423de3395c15ef2998482ca4db660151127795e531e830c6c6  v15e last.pt
+7e2bc0cffe23e095d50a5914716c83545617202ca0d80e29763a3ab2240ec779  history Koopman best_validation.pt
+d6e44fe6027a55753ee731c0a7e2bf3e1803090e8b066c051f0de9821e6281cd  v2 waypoint bank manifest.json
+```
+
+这三项均被 `.gitignore` 排除，不会随代码 PR 或普通 `git clone`
+自动获取。它们已按上述目录结构发布为公开 GitHub Release asset：
+
+- Release：[v15e-artifacts-20260819](https://github.com/bright-moon-67/AC-MPC/releases/tag/v15e-artifacts-20260819)
+- 文件：`acmpc-v15e-minimal-artifacts-20260819.tar.gz`
+- 大小：87,310,950 bytes（约 83.3 MiB）
+- 整包 SHA256：`2cbe57731490c8cbc106f93e1bbd48f190cf79a2f23cdf88403fd21eb0593296`
+- 代码基线：AC-MPC `manisoft-port` commit
+  `8dba696c5caf79bfd6c90aa41801e16b6508cdf7`
+
+由于下方说明的 v15e 绝对路径限制，当前开箱即用方式是先把两个仓库
+放到 `/root/autodl-tmp/AC-MPC` 和 `/root/autodl-tmp/ManiSoft`，再执行：
+
+```bash
+export WORKSPACE=/root/autodl-tmp
+export ARTIFACT_ARCHIVE=/tmp/acmpc-v15e-minimal-artifacts-20260819.tar.gz
+
+curl --fail --location \
+  --output "$ARTIFACT_ARCHIVE" \
+  https://github.com/bright-moon-67/AC-MPC/releases/download/v15e-artifacts-20260819/acmpc-v15e-minimal-artifacts-20260819.tar.gz
+
+echo "2cbe57731490c8cbc106f93e1bbd48f190cf79a2f23cdf88403fd21eb0593296  $ARTIFACT_ARCHIVE" \
+  | sha256sum --check
+
+tar -xzf "$ARTIFACT_ARCHIVE" -C "$WORKSPACE"
+
+test -f "$WORKSPACE/AC-MPC/runs/manisoft_ppo_compare_v15_zmixed_24h/e_kmpc_r8_lr3_std18_md0125/last.pt"
+test -f "$WORKSPACE/AC-MPC/work_dirs/manisoft_koopman_history_h10_abs_rho095_seed42_20260811/koopman_history/best_validation.pt"
+test -f "$WORKSPACE/AC-MPC/data/processed/manisoft_waypoint_bank_v2_zmixed_merged/manifest.json"
+```
+
+压缩包只会在已 clone 的 `AC-MPC/` 中补充上述三项被忽略的 artifact，
+不包含或覆盖代码文件。校验成功后才继续执行 1.5 节的 v15e 评估。
+
+这里存在一个当前 checkpoint 格式的可移植性限制：v15e `last.pt` 的 payload
+保存了训练机器上的 Koopman 绝对路径：
+
+```text
+/root/autodl-tmp/AC-MPC/work_dirs/manisoft_koopman_history_h10_abs_rho095_seed42_20260811/koopman_history/best_validation.pt
+```
+
+`load_manisoft_ppo_checkpoint()` 会直接读取这个绝对路径并校验文件 SHA256，当前
+evaluator 没有提供覆盖 Koopman 路径的命令行参数。因此，在 loader 尚未增加
+路径重映射功能前，开箱即用的交接环境必须把 AC-MPC 放在
+`/root/autodl-tmp/AC-MPC`；若安装在其它路径，需要先迁移 checkpoint 元数据或
+修改 loader，不能只设置 `ACMPC_ROOT`。`--waypoint-root` 可以显式覆盖 waypoint
+bank 路径，不受这一限制。
 
 ## 2. 环境配置
 
@@ -194,6 +265,11 @@ git -C ManiSoft submodule update --init --recursive
 `acmpc-integration`（`git branch --show-current`）。两个仓库必须配套
 使用，ManiSoft 分支或版本不对时，AC-MPC 中的接口将无法工作。
 
+本文最后核对时的兼容基线为 ManiSoft
+`85d7d997ec324c620f6d69817be0d1e6535f1147`；AC-MPC 应使用包含
+KMPC-IQL format v2 和本文档的 PR HEAD。PR 合并后建议在实验记录中同时保存
+两个仓库的 `git rev-parse HEAD`，不要只记录分支名。
+
 ### 2.3 创建环境并安装依赖
 
 两个仓库共用一个 Python 环境，环境名可自行指定（下文以 `acmpc-manisoft`
@@ -205,6 +281,9 @@ conda create -n acmpc-manisoft python=3.11 -y
 conda activate acmpc-manisoft
 python -m pip install --upgrade pip
 
+git -C ManiSoft/third_party/pyelastica apply \
+  ../../patches/pyelastica_local.patch
+
 python -m pip install -e ./ManiSoft
 python -m pip install --no-deps \
   -e ./ManiSoft/third_party/pyelastica \
@@ -214,18 +293,21 @@ python -m pip install -e \
   './AC-MPC[test,mpc,plots,tracking]'
 ```
 
-ManiSoft 使用了两处 PyElastica 兼容性修改。在全新克隆的仓库中执行：
+ManiSoft 只维护一份权威补丁 `patches/pyelastica_local.patch`，其中包含
+两处 PyElastica 兼容修改：face normals 转为 `float64`，以及跳过
+ManiSoft 自定义 rod/mesh contact 不兼容的上游 contact-order 检查。该补丁
+只需在全新 submodule 上应用一次。如命令提示补丁已应用，不要
+重复执行（当前服务器已应用）。
 
-```bash
-git -C ManiSoft/third_party/pyelastica apply \
-  ../../patches/pyelastica_local.patch
-```
+### 2.4 可选：下载完整仿真资源
 
-补丁只需应用一次。如命令提示补丁已应用，不要重复执行（当前服务器已应用）。
+当前 v15e 主线使用 `configs/demo_elastica_fast.yaml`：该配置
+`renderer: null`、`objects: []` 且无 gripper，headless 数据采集、训练和
+评估不会读取 `ManiSoft/assets/`。如果只需要部署 v15e，可跳过本节，
+不需要下载约 3.1 GB 资源。
 
-### 2.4 下载仿真资源
-
-`assets/` 体积较大，未纳入 Git。下载并解压到 ManiSoft 仓库根目录：
+只有运行 ManiSoft 官方可视化 demo、VLM benchmark、gripper 或物体/纹理
+任务时，才需要把 `assets/` 下载并解压到 ManiSoft 仓库根目录：
 
 ```bash
 cd ManiSoft
@@ -243,13 +325,62 @@ README 用 `--exclude "assets.tar"` 单独下载到 `work_dirs/Datasets/`。
 
 ### 2.5 安装验证
 
+#### 必做：headless 主线验证
+
+下列检查不需要 `assets/`、Blender、桌面环境或 checkpoint。命令从同时包含
+`AC-MPC/` 和 `ManiSoft/` 的 workspace 根目录执行：
+
 ```bash
 python -c "import manisoft, antmaze_ac; print('imports: OK')"
 python -m pytest AC-MPC/tests -q
+(cd ManiSoft && python -m pytest -q)
+
+export MANISOFT_ROOT="$PWD/ManiSoft"
+(cd AC-MPC && python - <<'PY'
+import os
+from pathlib import Path
+
+import numpy as np
+
+from antmaze_ac.envs.manisoft_tracking_env import ManiSoftTipTrackingEnv
+
+scenario = Path(os.environ["MANISOFT_ROOT"]) / "configs/demo_elastica_fast.yaml"
+env = ManiSoftTipTrackingEnv(scenario, episode_steps=2)
+observation, _ = env.reset(seed=0)
+observation, reward, _, _, _ = env.step(np.zeros(18, dtype=np.float32))
+assert observation.shape == (45,)
+assert np.isfinite(observation).all() and np.isfinite(reward)
+print("headless ManiSoft step: OK")
+PY
+)
+```
+
+本文最后核对时，AC-MPC 应为 `109 passed`，ManiSoft 应为 `4 passed`，
+最后一行应输出 `headless ManiSoft step: OK`。这一步真正创建
+Elastica 环境、重置软体臂并执行一个 50 Hz 控制步，比只测试 import 更能
+发现子模块、补丁或数值依赖错误。
+
+#### 可选：完整渲染 demo 验证
+
+`ManiSoft/scripts/demo.py` 不是 v15e 的安装冒烟；它使用 Blender、
+MuJoCo renderer、gripper、纹理和完整 `assets/`。只有需要这些功能时才
+安装系统渲染依赖并运行：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y autoconf automake build-essential cmake \
+  libboost-all-dev libpng-dev libjpeg-dev libtiff-dev libopenexr-dev \
+  libsdl1.2-dev libsm6 libxext6 freeglut3-dev libxrender1 \
+  libxkbcommon-x11-0
+conda install ffmpeg -y
+
 (cd ManiSoft && python scripts/demo.py)
 ```
 
-仿真 demo 的输出位于 `ManiSoft/work_dirs/`，首次运行需编译渲染内核，可能耗时数分钟。
+该 demo 还要求已完成 2.4 节的 `assets/` 下载。输出位于
+`ManiSoft/work_dirs/demo/`，首次运行可能耗时数分钟。在纯 SSH/headless
+服务器上，不应把该可选渲染 demo 的失败与 v15e headless 安装失败
+混为一谈；优先以上一节的三项检查为准。
 
 服务器长时间训练时，可显式指定解释器；`AC-MPC/scripts/run_*_detached.sh`
 等后台脚本均以 `AC_MPC_PYTHON`（缺省 `python`）启动训练：
@@ -521,7 +652,8 @@ python scripts/validate_koopman_lqr_reference_abs.py \
 - `max-delta ≥0.005` 或 `control-weight ≤10000` 全部失败（末端在
   100–680 mm 间振荡，无法收敛）。
 
-**各方案最佳结果**（完整命令与复验步骤见 `docs/best_validation_commands.md`）：
+**各方案最佳结果**（完整命令与复验步骤见
+`docs/manisoft_koopman_best_validation_commands.md`）：
 
 | 方案 | 脚本 | 最佳结果 |
 | --- | --- | --- |
@@ -535,7 +667,7 @@ python scripts/validate_koopman_lqr_reference_abs.py \
 | targeted v4 tip history LQR | `validate_koopman_lqr_reference_history.py` | ≈0.157 mm @1000 步（feedback-scale 30） |
 
 history 模型的反馈尺度与其它模型不同（不同 checkpoint 的有效增益尺度不同），
-调参时以 `docs/best_validation_commands.md` 中的现成命令为准。
+调参时以 `docs/manisoft_koopman_best_validation_commands.md` 中的现成命令为准。
 
 ## 5. 专家轨迹与三 waypoint BC-KMPC
 
@@ -683,8 +815,8 @@ python scripts/train_manisoft_bc_kmpc_ppo.py \
 实际运行（`runs/manisoft_bc_kmpc_three_waypoint/ppo`，seed 42）：
 `actor_learning_rate=3×10⁻⁷`、30 updates、61,440 timesteps，最佳完成回合
 平均回报 152.4；末次 rollout 的 `completed_success_rate=0`、
-`waypoints_completed_mean=0.286`——属于早期小规模实验，更成熟的 PPO 对比
-与调参见后续章节。
+`waypoints_completed_mean=0.286`——属于早期小规模实验。当前推荐的从头训练
+PPO-KMPC、v15e 配置及对照结果见第 6 章。
 
 重点监控指标：`action_saturation_rate`（可行分布下应接近零）、
 `distance_minimum`、`completed_success_rate`、`waypoints_completed_mean`、
@@ -753,3 +885,660 @@ dagger 版本），closed-loop 成功率 0，已弃用。
 专家轨迹的成功率参考：`v5` 收集日志中专家本身约 1/3 episode 达到
 3/3 waypoints（waypoint 任务对专家 MPC 也有难度），收集时以
 `rollout_noise_std` 覆盖相邻状态。
+
+## 6. 当前在线主线：v15 structured PPO-KMPC
+
+### 6.1 v15 与早期 BC-KMPC 的关系
+
+第 5 章从 fixed-cost OSQP 专家出发，经过 BC、DAgger 和 PPO 精调，适合研究
+“专家监督能否把 cost-map 带入可用区域”。后续实验发现，更强的结构化归纳
+偏置可以让 KMPC cost-map 从零直接用 PPO 训练，因此
+`scripts/train_manisoft_ppo_comparison.py` 的 v15 路线：
+
+- 不加载 BC checkpoint；
+- 冻结 history Koopman encoder 和 `A/B/C`；
+- 随机初始化低维 structured cost-map 和独立 critic；
+- 在真实 ManiSoft 三 waypoint 环境中训练 PPO；
+- 同时训练同输入的 MLP actor 作为非 KMPC 对照。
+
+因此新使用者要复现当前主要策略时，不需要先跑第 5 章全部 BC/DAgger 管线；
+只要具备 history Koopman checkpoint 和 waypoint bank，即可直接训练或评估
+第 6 章策略。第 5 章仍是专家数据和历史对照的权威说明。
+
+### 6.2 v15e 的模型结构
+
+v15e 使用 H=10、谱半径上限 0.95 的 history Koopman。当前状态经冻结 encoder
+得到 lift，cost-map 输入为当前 lift 加三 waypoint/stage context，仅输出五个
+有物理意义的正权重倍率：
+
+```text
+tip-x weight
+tip-y weight
+tip-z weight
+shared 18D absolute-action weight
+final-stage tip multiplier
+```
+
+五个网络输出经 `exp(log(8) * tanh(raw))` 映射到 `[1/8,8]`。非末端 42 个
+物理状态维度只保留很小的固定基准权重；线性项不自由学习，而是由显式参考
+构造：
+
+```text
+x_ref = current non-tip state + active waypoint tip xyz
+u_ref = 0
+p_x = -Q x_ref
+p_u = -R u_ref
+```
+
+这使零初始化 cost-map 已经对应一个有效的末端参考跟踪器。与自由输出每个
+horizon cost term 的 full actor 相比，v15 structured actor 只有 12,165 个
+可训练 actor 参数，降低了 PPO 从零学习的难度。完整数学比较见
+`docs/kmpc_v15e_vs_upstream_cost_and_solver.md`。
+
+动力学预测 horizon 为 10。QP 在 normalized-delta 空间求解 180 个变量：
+
+```text
+d[0:10] ∈ [-1,1]^(10×18)
+u[k] = u[-1] + max_delta * sum(d[0:k])
+u[k] ∈ [-0.30,0.30]
+```
+
+训练/部署固定展开 80 次 FISTA，另用 320 次求解计算诊断误差。每个控制周期
+只执行第一步。零增量初值在物理上等价于“未来保持上一拍绝对动作”，对需要
+非零维持激励的柔性系统比每次从零绝对动作开始更连续。
+
+### 6.3 v15 六组对照与推荐模型
+
+`scripts/launch_manisoft_ppo_compare_v15_zmixed_24h.sh` 在相同 Koopman、904
+triplet z-mixed waypoint bank、seed 42 和 PPO 设置下启动六组实验：
+
+| 名称 | actor | 主要差异 | 定位 |
+| --- | --- | --- | --- |
+| v15a | KMPC | range 8、lr 3e-5、std 0.15、delta 0.015 | v14 最强分支基线 |
+| v15b | KMPC | actor lr 降至 2.5e-5 | 减少 KL 尖峰 |
+| v15c | KMPC | std 降至 0.13 | 更少探索噪声 |
+| v15d | KMPC | range 7、lr 3.5e-5 | range/lr 插值 |
+| **v15e** | **KMPC** | **range 8、lr 3e-5、std 0.18、delta 0.0125** | **当前主线** |
+| v15f | MLP | 256×256、直接输出绝对动作 | 非 KMPC 对照 |
+
+其中 range 8 指 structured multiplier 范围 `[1/8,8]`。a/b/e 被继续训练，
+现有记录约为 9.3–9.4M timesteps；e 的最后 PPO rollout 为 12/16 成功、平均
+完成 2.625 个 waypoint。a 的 `last.pt` 在独立 v4 test20 上确定性评估为
+60% 成功。e 随后成为 v4/v5 大规模离线数据的唯一行为 checkpoint，因此所有
+IQL provenance 校验都以 v15e `last.pt` 的 SHA256 为准。
+
+当前建议：
+
+- 部署、继续采集数据或作为 IQL behavior baseline：使用 **v15e `last.pt`**；
+- 复核已有独立 test20 结果：使用 v15a `last.pt`；
+- 研究 checkpoint 选择：同时评估某一配置的 `best.pt` 和 `last.pt`；
+- 不要依据单个 rollout 中偶然出现的 `1.0` success rate 宣称模型最佳，因为
+  当轮可能只完成了 1–6 个 episode。
+
+### 6.4 单独复现 v15e 训练
+
+下面命令等价于 launcher 中的 v15e 单项。`K`、`S`、`W` 分别是 history
+Koopman、场景和训练 waypoint bank：
+
+```bash
+K=work_dirs/manisoft_koopman_history_h10_abs_rho095_seed42_20260811/koopman_history/best_validation.pt
+S="$MANISOFT_ROOT/configs/demo_elastica_fast.yaml"
+W=data/processed/manisoft_waypoint_bank_v2_zmixed_merged
+
+"$AC_MPC_PYTHON" -u scripts/train_manisoft_ppo_comparison.py \
+  --actor ppo_kmpc \
+  --koopman-checkpoint "$K" --scenario "$S" --waypoint-root "$W" \
+  --output runs/manisoft_ppo_compare_v15_reproduction/v15e_seed42 \
+  --episode-steps 300 --absolute-action-limit 0.30 \
+  --progress-reward-scale 1.0 --horizon 10 \
+  --kmpc-cost-parameterization structured --kmpc-hidden-dims 128 \
+  --structured-log-scale 2.0794415416798357 \
+  --solver-iterations 80 --solver-diagnostic-iterations 320 \
+  --normalized-delta-curvature 0 --max-delta 0.0125 \
+  --total-timesteps 100000000 --rollout-steps 4096 --num-envs 16 \
+  --parallel-env-processes --minibatch-size 512 --update-epochs 4 \
+  --learning-rate 1e-4 --actor-learning-rate 3e-5 \
+  --std-learning-rate 1e-6 --freeze-log-std --no-anneal-learning-rate \
+  --initial-action-std 0.18 --minimum-action-std 0.001 \
+  --maximum-action-std 0.20 --gamma 0.99 --gae-lambda 0.95 \
+  --clip-range 0.2 --clip-value-loss --value-coefficient 0.5 \
+  --entropy-coefficient 1e-4 --max-grad-norm 0.5 \
+  --target-kl 0.02 --kl-soft-stop-multiplier 1.5 \
+  --kl-hard-rollback-multiplier 3.0 --normalize-advantages-globally \
+  --checkpoint-interval-updates 50 --max-wall-time-hours 24 \
+  --device cuda --seed 42
+```
+
+16 个环境分别在 spawn 子进程中运行 CPU 仿真，GPU 对 batch observation 做
+统一 policy inference。服务器实测这种布局比单进程顺序仿真快；CPU 核数不足
+时减少 `--num-envs`，并确保 `rollout-steps` 能被 `num-envs` 整除。
+
+继续训练必须传入与原运行完全相同的 runtime、PPO signature、Koopman hash、
+waypoint-bank hash 和 seed，仅允许增加墙钟预算：
+
+```bash
+# 在上面的完整命令末尾替换/增加：
+--resume runs/manisoft_ppo_compare_v15_reproduction/v15e_seed42/last.pt \
+--max-wall-time-hours 48
+```
+
+不能只写一个缩短版 resume 命令；训练器会拒绝与 checkpoint 不一致的参数。
+
+### 6.5 `best.pt`、`last.pt` 与训练日志
+
+每个 PPO 运行目录包含：
+
+```text
+run_config.json       完整参数、hash、动作语义和可训练参数量
+history.jsonl         每个 PPO update 的训练/rollout 指标
+training_status.json  最近一次 update 快照
+best.pt               按 rollout score 保存的 checkpoint
+last.pt               最后一个安全 checkpoint，可用于 resume
+```
+
+PPO 的 `best.pt` 按以下字典序 score 选择：
+
+```text
+(completed_success_rate,
+ waypoints_completed_mean,
+ completed_episode_return_mean)
+```
+
+由于一个 rollout 中完整 episode 数会变化，这个 score 适合训练期留档，但不是
+无偏模型选择。正式选择必须调用第 9 章的确定性 evaluator。v15e 离线数据使用
+`last.pt`，因此若要完全复现数据 provenance，不能擅自替换成 `best.pt`。
+
+训练时重点监控：
+
+- `completed_success_rate`、`waypoints_completed_mean`、`distance_minimum`；
+- `action_bound_rate` 和 `action_clip_saturation_rate`，正常应接近零；
+- `projected_gradient_residual_mean` 和 80/320 次首动作差异；
+- `approx_kl`、`ppo_early_stopped`、`ppo_kl_hard_rollbacks`；
+- `applied_delta_action_abs_max`，v15e 不应超过 0.0125。
+
+### 6.6 v16 source ablation
+
+v16 不是新推荐模型，而是相对 v15e 的三个单因素消融：
+
+- Q2：显式 `-Q*x_ref` 改为自由学习的隐式线性项；
+- Q3：normalized-delta QP 改为直接 absolute-action box QP；
+- Q8：关闭最后 stage 的 learned terminal multiplier。
+
+入口为 `scripts/launch_manisoft_ppo_compare_v16_source_ablation.sh`，设计和公式见
+`docs/kmpc_v15e_vs_upstream_cost_and_solver.md`。当前运行记录显示 Q2/Q3 出现
+很大的 KL 和零成功，Q8 也未达到 v15e 水平；这些是研究证据，不应作为交付
+默认 checkpoint。
+
+## 7. 用 v15e 构建离线 KMPC 数据集
+
+### 7.1 数据语义
+
+`scripts/collect_manisoft_kmpc_offline_dataset.py` 加载 PPO-KMPC checkpoint，
+在三 waypoint 环境中保存 transition-complete episode。默认按 checkpoint 的
+截断 Normal 分布随机采样动作；加 `--deterministic` 才只执行 KMPC mean。
+
+标准字段为：
+
+```text
+observations          687D history/waypoint observation
+actions               18D normalized delta，策略实际接收的动作
+rewards
+next_observations
+terminals             完成三个 waypoint
+timeouts              达到 episode_steps
+episode_ids
+```
+
+另外保留：
+
+```text
+behavior_action_means
+behavior_log_probabilities
+value_estimates
+requested_absolute_actions
+applied_actions
+applied_delta_actions
+waypoint/stage diagnostics
+projected-gradient residuals
+```
+
+其中 `actions` 不是绝对肌肉激活。v15e 的物理动作由上一绝对动作和
+`max_delta=0.0125` 重建。IQL actor likelihood 和部署均使用同一个
+state-dependent truncated Normal 支持集。
+
+### 7.2 单进程采集与中断恢复
+
+```bash
+V15E=runs/manisoft_ppo_compare_v15_zmixed_24h/e_kmpc_r8_lr3_std18_md0125/last.pt
+
+"$AC_MPC_PYTHON" scripts/collect_manisoft_kmpc_offline_dataset.py \
+  --checkpoint "$V15E" \
+  --waypoint-root data/processed/manisoft_waypoint_bank_v4_full_merged \
+  --output data/processed/manisoft_kmpc_offline/example_v15e \
+  --episodes 1000 --episode-steps 300 --device cuda --seed 42 \
+  --allow-other-waypoint-bank
+```
+
+v15e checkpoint 记录的是 v2 z-mixed bank。用 v4/v5 bank 采集泛化数据时必须
+显式使用 `--allow-other-waypoint-bank`；scenario SHA256 仍必须一致。采集器每
+完成一个 episode 就写入独立 NPZ，因此崩溃后可在相同参数下加 `--resume`
+继续，episode seed 不受中断位置影响。
+
+大规模采集建议加 `--no-merged-dataset`，等所有分片完成后统一合并，避免每个
+worker 都构造大压缩文件。
+
+### 7.3 当前 v4/v5 八进程采集
+
+仓库提供：
+
+```bash
+bash scripts/collect_kmpc_v4_1498_parallel.sh
+bash scripts/collect_kmpc_v5_7109_parallel.sh
+```
+
+两者都用 v15e `last.pt`，各启动 8 个独立 worker。脚本里的 Python 路径是
+当前服务器值；迁移机器时先替换为 `$AC_MPC_PYTHON`。不要让 worker 共享
+`part_N` 目录。
+
+分片完成后分别合并：
+
+```bash
+"$AC_MPC_PYTHON" scripts/merge_kmpc_offline_parts.py \
+  --root data/processed/manisoft_kmpc_offline/v4_1498_stochastic \
+  --parts 8
+
+"$AC_MPC_PYTHON" scripts/merge_kmpc_offline_parts.py \
+  --root data/processed/manisoft_kmpc_offline/v5_7109_stochastic \
+  --parts 8
+```
+
+再合并两个来源：
+
+```bash
+"$AC_MPC_PYTHON" scripts/merge_multiple_kmpc_offline_roots.py \
+  --roots \
+    data/processed/manisoft_kmpc_offline/v4_1498_stochastic \
+    data/processed/manisoft_kmpc_offline/v5_7109_stochastic \
+  --parts 8 \
+  --output \
+    data/processed/manisoft_kmpc_offline/combined_v4_1498_v5_7109/dataset.npz
+```
+
+当前合并结果为：
+
+| 来源 | episodes | transitions |
+| --- | ---: | ---: |
+| v4 full | 1,498 | 339,565 |
+| v5 10k 中的有效 7,109 triplets | 7,109 | 1,600,628 |
+| **合计** | **8,607** | **1,940,193** |
+
+合并集随机闭环成功率 59.56%，平均回报 10.740，平均完成 2.507 个 waypoint。
+这些是 behavior dataset 的组成统计，不是离线训练后 candidate 的评估结果。
+
+### 7.4 provenance 校验
+
+`collection_config.json` 和合并 `summary.json` 记录：
+
+- behavior checkpoint 路径和 SHA256；
+- scenario、waypoint bank SHA256；
+- `max_delta` 和 action semantics；
+- episode/transition 数、随机种子和成功统计。
+
+IQL 初始化时会校验所有来源使用完全相同的 behavior checkpoint hash 和动作
+语义。如果重新训练了一个“参数相同”的 v15e，它的 hash 仍会不同，不能在不
+更新数据 provenance 的情况下替代原 behavior checkpoint。
+
+## 8. 当前离线主线：structured-v2 KMPC-IQL
+
+### 8.1 方法与部署形式
+
+IQL 是独立离线训练路线，不修改现有 PPO 实现。训练时包含：
+
+- twin action-value networks `Q1/Q2`；
+- expectile value network `V`；
+- exponentially advantage-weighted behavior cloning；
+- frozen target-Q 和 behavior-support penalty 的离线 checkpoint score。
+
+策略部署时仍然是 KMPC：
+
+```text
+687D observation
+  → frozen history Koopman lift/A/B/C
+  → learned structured-v2 cost map
+  → finite-horizon normalized-delta QP
+  → deterministic KMPC mean
+```
+
+Q/V 网络只用于训练，不进入 ManiSoft 部署推理。critic feature 额外包含最新
+绝对动作，以消除 normalized-delta 可行域对 `u[t-1]` 的状态混叠：
+
+```text
+f_t = [z_t, waypoint/stage context, normalized u[t-1]]
+```
+
+### 8.2 structured-v2 与 v15e 的区别
+
+v15e cost-map 输出 5 个权重；IQL 默认 candidate 为 structured-v2，共 11 个：
+
+```text
+tip xyz                         3
+shape/orientation group         1
+linear-velocity group           1
+angular-velocity group          1
+three muscle activation axes    3
+final-tip multiplier            1
+positive normalized-delta cost  1
+total                          11
+```
+
+训练开始时先把 v15e 中兼容的 cost-map 行迁移到 candidate，再用数据中保存的
+`behavior_action_means` 蒸馏 10,000 步。这一步解决 5-output v15e 和
+11-output structured-v2 不能直接完整加载的问题。随后 Q/V 预热 20,000 步，
+预热阶段 actor 冻结，之后才开始 IQL actor 更新。
+
+### 8.3 数据加载与内存要求
+
+当前压缩 `dataset.npz` 约 2.2 GiB，但所需字段展开约 10.2 GiB。第一次加载时
+`OfflineTransitionDataset` 在数据旁创建只读 NPY cache 并 memory-map；之后
+复用 cache，不再把两份 687D observation 全部读入 RAM。磁盘不足时使用
+`--cache-dir /other/disk/cache-name`。
+
+默认 timeout 继续 bootstrap，因为保存的每条 timeout transition 都有有效
+`next_observations`。若实验需要严格 episodic horizon，可传
+`--treat-timeouts-as-terminal`，但该设置会改变 dataset signature，resume 时
+必须保持一致。
+
+### 8.4 推荐训练命令
+
+K=60 candidate：
+
+```bash
+DATASET=data/processed/manisoft_kmpc_offline/combined_v4_1498_v5_7109/dataset.npz
+BEHAVIOR=runs/manisoft_ppo_compare_v15_zmixed_24h/e_kmpc_r8_lr3_std18_md0125/last.pt
+
+"$AC_MPC_PYTHON" -u scripts/train_manisoft_kmpc_iql.py \
+  --dataset "$DATASET" \
+  --initial-policy-checkpoint "$BEHAVIOR" \
+  --candidate-cost-parameterization structured_v2 \
+  --candidate-solver-iterations 60 \
+  --distillation-steps 10000 --critic-warmup-steps 20000 \
+  --selection-behavior-mse-penalty 10 \
+  --gradient-steps 500000 --batch-size 256 \
+  --validation-batch-size 1024 --validation-interval 5000 \
+  --checkpoint-interval 25000 --log-interval 100 \
+  --output runs/manisoft_kmpc_iql_v2/k60_seed42 \
+  --device cuda --seed 42
+```
+
+仓库 launcher 可分别启动 K=40 和 K=60 的配对实验：
+
+```bash
+screen -dmS iql_v2_k40_seed42 scripts/launch_manisoft_kmpc_iql_v2.sh 40
+screen -dmS iql_v2_k60_seed42 scripts/launch_manisoft_kmpc_iql_v2.sh 60
+```
+
+launcher 会拒绝覆盖已有 `history.jsonl`/`last.pt`，并以 lock 文件防止同一路径
+重复启动。迁移机器时需修改其中的仓库根目录和 Python 路径。
+
+主要超参数为：
+
+```text
+expectile = 0.9
+temperature = 0.1
+max advantage weight = 100
+discount = 0.99
+target tau = 0.01
+reward scale = 1
+reward bias = 0
+```
+
+本数据已经是带正负号的 dense progress reward 和 waypoint bonus，因此默认
+`reward_bias=0`；不要机械复制 AntMaze IQL 的 `-1` reward shift。
+
+### 8.5 checkpoint、恢复与当前状态
+
+IQL 运行目录包含：
+
+```text
+run_config.json
+history.jsonl
+last.pt
+best_offline.pt
+recovery_step_XXXXXXXX.pt
+```
+
+checkpoint 保存 candidate policy、Q/Q-target、V、所有 optimizer、RNG 状态、
+精确 dataset signature、行为策略 provenance 和超参数。恢复必须复用原运行的
+完整 training signature；下面是当前 K=60 launcher 的
+恢复形式，只有 `--resume`、`--output` 和可增加的墙钟限制不参与 signature：
+
+```bash
+DATASET=data/processed/manisoft_kmpc_offline/combined_v4_1498_v5_7109/dataset.npz
+
+"$AC_MPC_PYTHON" scripts/train_manisoft_kmpc_iql.py \
+  --dataset "$DATASET" \
+  --resume runs/manisoft_kmpc_iql_v2/k60_seed42/last.pt \
+  --candidate-cost-parameterization structured_v2 \
+  --candidate-solver-iterations 60 \
+  --distillation-steps 10000 --critic-warmup-steps 20000 \
+  --selection-behavior-mse-penalty 10 \
+  --gradient-steps 500000 --batch-size 256 \
+  --validation-batch-size 1024 --validation-interval 5000 \
+  --checkpoint-interval 25000 --log-interval 100 \
+  --output runs/manisoft_kmpc_iql_v2/k60_seed42 \
+  --device cuda --seed 42
+```
+
+K=40 恢复时只把两处 `k60` 和 `--candidate-solver-iterations 60` 改为 40。
+`--initial-policy-checkpoint` 从 resume payload 读取，不需要重复传入；其余参数
+若与原 run 不一致会被明确拒绝。
+
+`best_offline.pt` 使用预热结束时冻结的 target twin-Q 评分：candidate 相对
+behavior 的 Q 提升减去 behavior-mean MSE penalty。它是同一次运行中的稳定
+离线 proxy，不是环境成功率。最终仍必须闭环评估。
+
+截至 2026-08-19，现有 K=40/K=60 运行分别到约 324k/251.9k IQL updates，均
+未完成预定 500k，也尚未形成与 v15e 相同测试协议下的正式闭环结论。因此：
+
+- v15e 仍是当前默认可用策略；
+- IQL checkpoint 标记为 candidate/实验中；
+- 不应因 `best_offline.pt` 分数更高就直接替换 v15e。
+
+### 8.6 IQL 闭环评估
+
+PPO 和 IQL 共用 evaluator，脚本会根据 checkpoint 的 `method` 自动选择 loader：
+
+```bash
+"$AC_MPC_PYTHON" scripts/evaluate_manisoft_ppo_comparison.py \
+  --checkpoint runs/manisoft_kmpc_iql_v2/k60_seed42/best_offline.pt \
+  --scenario "$MANISOFT_ROOT/configs/demo_elastica_fast.yaml" \
+  --waypoint-root data/processed/manisoft_waypoint_bank_v2_zmixed_merged \
+  --output runs/manisoft_kmpc_iql_v2/k60_seed42/evaluation_100ep \
+  --episodes 100 --episode-steps 300 --device cuda --seed 42
+```
+
+对 K=40、K=60、v15e 和 v15a 必须使用完全相同的 waypoint schedule 才能比较。
+
+## 9. 统一评估与最终模型选择
+
+### 9.1 推荐协议
+
+模型选择分三层：
+
+1. **代码冒烟**：导入、单元测试、1–3 episodes，排除接口错误；
+2. **开发评估**：固定 20–100 triplet 独立 bank，快速比较候选；
+3. **正式评估**：未参与训练/采集的固定 bank，至少 100 episodes，多 seed，
+   同一 schedule 比较全部候选。
+
+正式报告至少包含：
+
+- `success_rate`：三个 waypoint 全部完成；
+- `waypoints_completed_mean`；
+- `return_mean`、`episode_steps_mean`；
+- `final_distance_mean`；
+- `action_bound_rate`、绝对动作和 delta 统计；
+- inference mean/p95 和 solver residual；
+- checkpoint、scenario、waypoint manifest SHA256。
+
+不要只报告训练 `history.jsonl` 最后一行，也不要把 behavior dataset 的成功率
+当成确定性 policy evaluation。
+
+### 9.2 公平比较命令模板
+
+```bash
+S="$MANISOFT_ROOT/configs/demo_elastica_fast.yaml"
+W=data/processed/manisoft_waypoint_bank_v4_test20
+
+for ITEM in \
+  "v15a:runs/manisoft_ppo_compare_v15_zmixed_24h/a_kmpc_r8_lr3_std15_md015/last.pt" \
+  "v15e:runs/manisoft_ppo_compare_v15_zmixed_24h/e_kmpc_r8_lr3_std18_md0125/last.pt" \
+  "iql_k40:runs/manisoft_kmpc_iql_v2/k40_seed42/best_offline.pt" \
+  "iql_k60:runs/manisoft_kmpc_iql_v2/k60_seed42/best_offline.pt"
+do
+  NAME=${ITEM%%:*}
+  CKPT=${ITEM#*:}
+  "$AC_MPC_PYTHON" scripts/evaluate_manisoft_ppo_comparison.py \
+    --checkpoint "$CKPT" --scenario "$S" --waypoint-root "$W" \
+    --allow-other-waypoint-bank \
+    --output "runs/formal_compare/$NAME" \
+    --episodes 100 --episode-steps 300 --device cuda --seed 4242
+done
+```
+
+上述 shell 循环是协议模板；只有四个 checkpoint 都存在并与当前代码兼容时
+才能直接执行。若正式 bank 与 checkpoint 记录的 bank 相同，可去掉
+`--allow-other-waypoint-bank`。
+
+### 9.3 结果文件
+
+每个 evaluator 输出目录包含：
+
+```text
+summary.json         汇总指标、runtime 和所有 episode 摘要
+trajectory_XXXX.npz  observation/action/reward/distance/stage 轨迹
+```
+
+排查失败时优先查看每个 waypoint 的 minimum distance：如果前两点都通过、
+第三点失败，通常是远距离/长时域问题；如果第一个点都无法进入 5 mm，先检查
+state normalization、场景 hash、动作语义和 checkpoint 是否匹配。
+
+## 10. 代码导航
+
+### 10.1 ManiSoft 侧
+
+| 文件 | 作用 |
+| --- | --- |
+| `manisoft/backend/elastica.py` | 纯 Elastica 连续体动力学后端 |
+| `manisoft/backend/manisoft_sim.py` | Elastica + MuJoCo 组合后端 |
+| `manisoft/muscle.py` | 6×3 激活到杆单元力矩的 SplineMuscle |
+| `manisoft/utils/math.py` | 45D Koopman 状态布局与旋转表示 |
+| `scripts/collect_koopman_data.py` | coverage/rate/targeted-rate 原始轨迹采集 |
+| `configs/demo_elastica_fast.yaml` | 当前主场景，0.2 ms 物理步长、50 Hz 控制 |
+| `patches/pyelastica_local.patch` | 本项目必需的 PyElastica 兼容补丁 |
+
+ManiSoft 自己也包含一套早期 `manisoft/control/`、`manisoft/koopman/` 和
+`manisoft/envs/koopman_tracking.py`。当前 v15/IQL 的权威策略实现位于 AC-MPC；
+不要混用两边同名的 tracking wrapper 或 checkpoint loader。
+
+### 10.2 AC-MPC 侧
+
+| 文件 | 作用 |
+| --- | --- |
+| `antmaze_ac/koopman/history_model.py` | history Koopman encoder 与线性动力学 |
+| `antmaze_ac/envs/manisoft_tracking_env.py` | 45D 单点/三 waypoint ManiSoft 环境 |
+| `antmaze_ac/envs/history_context_wrapper.py` | H=10、687D observation 和 delta action |
+| `antmaze_ac/envs/process_vector_env.py` | 多进程 ManiSoft vector env |
+| `antmaze_ac/rl/koopman_mpc_actor.py` | full/structured/structured-v2 KMPC 与 FISTA |
+| `antmaze_ac/rl/manisoft_ppo_policies.py` | PPO-KMPC/MLP policy 构造和加载 |
+| `antmaze_ac/rl/iql.py` | IQL Q/V、actor update 与 checkpoint loader |
+| `antmaze_ac/data/offline_transition_dataset.py` | 大 NPZ cache/memmap loader |
+| `scripts/train_manisoft_ppo_comparison.py` | v15/v16 from-scratch PPO 入口 |
+| `scripts/collect_manisoft_kmpc_offline_dataset.py` | PPO-KMPC 离线 transition 采集 |
+| `scripts/train_manisoft_kmpc_iql.py` | KMPC-IQL 训练入口 |
+| `scripts/evaluate_manisoft_ppo_comparison.py` | PPO/IQL 共用确定性评估 |
+
+配置、数据、代码和 checkpoint 都保存自己的语义字段和 hash。遇到加载拒绝时
+应先阅读报错并核对 provenance，不建议临时删除校验。
+
+## 11. 常见问题与交接检查
+
+### 11.1 常见问题
+
+**`import manisoft` 失败**
+
+确认两个仓库安装在同一个 Conda 环境，并使用同一个解释器运行脚本。仅在
+shell 中激活环境但后台脚本硬编码另一个 Python，是最常见原因。
+
+**`pip check` 报 PyElastica/Numba/PyVista 或 `bpy` 冲突**
+
+当前固定的 PyElastica 0.3.2 包元数据声明 `numba<0.58` 和
+`pyvista<0.40`，但 ManiSoft 的已验证环境固定为 `numba==0.61.0` 和
+`pyvista==0.45.2`；部分 Linux/headless 环境还会将 `bpy==4.4.0` 报为
+platform warning。这是子模块上游 metadata 与 ManiSoft 集成版本的已知
+差异，也是安装子模块时必须使用 `--no-deps` 的原因。
+
+不要为了消除 `pip check` 文本而擅自降级 Numba/PyVista，否则可能破坏
+ManiSoft 已验证的数值与渲染代码。对 v15e headless 主线，交付验收以
+2.5 节的 import、两仓测试和单步 Elastica 冒烟全部通过为准。如果
+`pip install` 本身失败，或 headless 冒烟未通过，则不属于可忽略的
+metadata 告警。
+
+**PyElastica 补丁无法应用**
+
+先运行：
+
+```bash
+git -C "$MANISOFT_ROOT/third_party/pyelastica" apply --reverse --check \
+  "$MANISOFT_ROOT/patches/pyelastica_local.patch"
+```
+
+若 reverse check 成功，说明补丁已经应用，不要再次 apply。应用补丁后顶层
+`git status` 显示 `m third_party/pyelastica` 是预期现象。
+
+**场景或 waypoint hash mismatch**
+
+waypoint bank 是在特定 scenario 上认证的，不能绕过 scenario mismatch。
+只有在有意测试另一份、但同 scenario 的 waypoint bank 时才使用
+`--allow-other-waypoint-bank`。
+
+**PPO resume 被拒绝**
+
+必须复用完整 runtime/training signature。检查 `run_config.json`，不要只恢复
+checkpoint 路径。尤其是 `max_delta`、solver iterations、structured range、
+rollout 数、学习率、seed 和 waypoint manifest 都必须一致。
+
+**IQL 首次加载像是卡住或占用大量磁盘**
+
+第一次正在解压 NPZ 字段并建立 memmap cache。检查 cache 目录是否持续增长；
+后续运行会直接复用。不要让两个首次构建进程同时写同一个 cache。
+
+**KMPC 很慢**
+
+确认 policy inference 在 GPU batch 上执行、环境使用
+`--parallel-env-processes`，并限制每个 worker 的 BLAS 线程数。K=60 IQL
+candidate 比 K=40 慢，v15 的 320 次 solver 只应用于诊断，不是执行动作的解。
+
+**动作突然饱和或仿真发散**
+
+先确认没有把 normalized delta 直接当成 absolute action；检查
+`applied_delta_action_abs_max`、`action_bound_rate`、scenario hash 和 state
+normalizer。v15e 的单维物理 delta 上限是 0.0125，绝对动作上限是 0.30。
+
+### 11.2 PR/交接前检查清单
+
+- [ ] AC-MPC 与 ManiSoft 的兼容分支或 commit 已在文档固定；
+- [ ] ManiSoft submodule 和唯一权威的 `patches/pyelastica_local.patch`
+      可从全新 clone 重建；
+- [ ] AC-MPC `109 passed`、ManiSoft `4 passed` 和 headless 单步冒烟均通过；
+- [ ] v15e 所需 Koopman、scenario、waypoint bank 的角色和目标路径明确；
+- [ ] v15e 最小 artifact 压缩包已发布到 GitHub Release，本文已填
+      Release URL、整包 SHA256 和解压命令；
+- [ ] v15e `last.pt` 与离线数据中的 behavior checkpoint SHA256 一致；
+- [ ] 数据集 episode/transition 数与 `summary.json` 一致；
+- [ ] 至少完成一次 v15e 10-episode smoke；
+- [ ] 正式结果明确区分 train rollout、behavior dataset 和 deterministic eval；
+- [ ] IQL 若未完成 500k/闭环评估，继续标记为实验中；
+- [ ] 所有服务器硬编码路径都已替换或在交接时说明。
+
+当前代码测试基线为 109 tests。涉及策略结构、动作语义、dataset loader 或
+checkpoint 格式的修改，必须至少重新运行全套测试，并对 v15e 做短闭环 smoke。
