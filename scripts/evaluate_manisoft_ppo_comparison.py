@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate a from-scratch ManiSoft PPO-MLP or PPO-KMPC checkpoint."""
+"""Evaluate a ManiSoft PPO or offline IQL policy checkpoint."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from antmaze_ac.envs.manisoft_tracking_env import (
     load_manisoft_waypoint_reference_bank,
 )
 from antmaze_ac.koopman.checkpoint import sha256
+from antmaze_ac.rl.iql import load_manisoft_iql_checkpoint
 from antmaze_ac.rl.manisoft_ppo_policies import load_manisoft_ppo_checkpoint
 
 
@@ -57,9 +58,15 @@ def main() -> None:
     if not checkpoint.is_file() or not scenario.is_file():
         raise FileNotFoundError("Checkpoint and scenario must exist")
 
-    policy, payload, koopman_payload = load_manisoft_ppo_checkpoint(
-        checkpoint, device
+    checkpoint_header = torch.load(
+        checkpoint, map_location="cpu", weights_only=False
     )
+    loader = (
+        load_manisoft_iql_checkpoint
+        if checkpoint_header.get("method") == "manisoft_kmpc_iql"
+        else load_manisoft_ppo_checkpoint
+    )
+    policy, payload, koopman_payload = loader(checkpoint, device)
     policy.eval()
     waypoint_root_value = args.waypoint_root or payload.get("waypoint_root")
     if waypoint_root_value is None:
