@@ -266,7 +266,7 @@ git -C ManiSoft submodule update --init --recursive
 使用，ManiSoft 分支或版本不对时，AC-MPC 中的接口将无法工作。
 
 本文最后核对时的兼容基线为 ManiSoft
-`b5299b6dbeac23ab8e82efd8f417a5e8394313a5`；AC-MPC 应使用包含
+`4e02bb87962604c6ab6abf06f3f273a1c49c1270`；AC-MPC 应使用包含
 KMPC-IQL format v2 和本文档的 PR HEAD。PR 合并后建议在实验记录中同时保存
 两个仓库的 `git rev-parse HEAD`，不要只记录分支名。
 
@@ -293,11 +293,23 @@ python -m pip install -e \
   './AC-MPC[test,mpc,plots,tracking]'
 ```
 
-ManiSoft 只维护一份权威补丁 `patches/pyelastica_local.patch`，其中包含
-两处 PyElastica 兼容修改：face normals 转为 `float64`，以及跳过
-ManiSoft 自定义 rod/mesh contact 不兼容的上游 contact-order 检查。该补丁
-只需在全新 submodule 上应用一次。如命令提示补丁已应用，不要
-重复执行（当前服务器已应用）。
+ManiSoft 有意保留两份内容完全相同的 PyElastica 补丁：
+
+- `patches/pyelastica_local.patch`：权威副本，上述安装命令使用此路径；
+- `third_party/pyelastica.patch`：兼容旧脚本和旧文档路径的镜像副本。
+
+两份文件不是两个不同补丁，必须保持逐字节一致，使用时任选其一即可，
+**不要连续应用两份**。补丁包含两处兼容修改：face normals 转为
+`float64`，以及跳过 ManiSoft 自定义 rod/mesh contact 不兼容的上游
+contact-order 检查。它只需在全新 submodule 上应用一次。如命令提示补丁
+已应用，不要重复执行（当前服务器已应用）。可用下面的命令核对两份文件：
+
+```bash
+cmp ManiSoft/patches/pyelastica_local.patch \
+  ManiSoft/third_party/pyelastica.patch
+sha256sum ManiSoft/patches/pyelastica_local.patch \
+  ManiSoft/third_party/pyelastica.patch
+```
 
 ### 2.4 可选：下载完整仿真资源
 
