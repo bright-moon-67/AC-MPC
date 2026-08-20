@@ -107,7 +107,14 @@ def _final_10x10(run_dir: Path, counter: int, seed: int, method: str) -> float:
     return value
 
 
-def _training_seed_summary(values: list[float], n_seeds: int) -> dict[str, Any]:
+def _training_seed_summary(
+    values: list[float], n_seeds: int | None = None
+) -> dict[str, Any]:
+    # Preserve the original helper contract used by tests and downstream
+    # notebooks while allowing partial formal aggregates to pass an explicit
+    # expected seed count.
+    if n_seeds is None:
+        n_seeds = len(values)
     array = np.asarray(values, dtype=np.float64)
     if array.shape != (n_seeds,) or not np.isfinite(array).all():
         raise ValueError(

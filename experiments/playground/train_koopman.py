@@ -174,6 +174,32 @@ def _lift(params: Any, state: Any):
     return jp.concatenate((state, _mlp(params["encoder"], state)), axis=-1)
 
 
+def _differentiable_spectral_radius(matrix: Any, iterations: int = 32):
+    """Estimate the dominant eigenvalue magnitude without a GPU eigensolver.
+
+    JAX does not implement nonsymmetric eigendecomposition on CUDA.  Power
+    iteration is differentiable, inexpensive for the 15/72 dimensional
+    Koopman matrices used here, and converges to the spectral radius when the
+    dominant mode is unique.  Exact NumPy eigvals are still recorded once per
+    epoch after the small matrix has moved to the host.
+    """
+
+    import jax
+    import jax.numpy as jp
+
+    size = matrix.shape[0]
+    vector = jp.arange(1, size + 1, dtype=matrix.dtype)
+    vector = vector / jp.maximum(jp.linalg.norm(vector), 1e-12)
+
+    def step(current: Any, _unused: Any):
+        following = matrix @ current
+        following = following / jp.maximum(jp.linalg.norm(following), 1e-12)
+        return following, None
+
+    vector, _ = jax.lax.scan(step, vector, None, length=iterations)
+    return jp.linalg.norm(matrix @ vector)
+
+
 def _loss(
     params: Any,
     states: Any,
@@ -205,8 +231,8 @@ def _loss(
     phi = _mlp(params["encoder"], states.reshape(-1, states.shape[-1]))
     phi_std = jp.std(phi, axis=0)
     latent_std = jp.mean(jp.maximum(0.0, 1.0 - phi_std) ** 2)
-    eigenvalue_abs = jp.abs(jp.linalg.eigvals(params["A"]))
-    stability = jp.mean(jp.maximum(0.0, eigenvalue_abs - spectral_radius_limit) ** 2)
+    spectral_radius = _differentiable_spectral_radius(params["A"])
+    stability = jp.maximum(0.0, spectral_radius - spectral_radius_limit) ** 2
     identity = jp.mean((params["A"] - jp.eye(params["A"].shape[0])) ** 2)
     dynamics = (
         10.0 * linear
@@ -223,7 +249,7 @@ def _loss(
         "rollout": rollout,
         "stability": stability,
         "latent_std": latent_std,
-        "spectral_radius": jp.max(eigenvalue_abs),
+        "spectral_radius": spectral_radius,
     }
 
 
@@ -411,6 +437,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "spectral_radius_limit_reference": args.spectral_radius_limit,
         "stability_reference_dt": args.stability_reference_dt,
         "effective_spectral_radius_limit": spectral_limit,
+        "spectral_radius_training_estimator": "differentiable_power_iteration_32_v1",
+        "spectral_radius_audit": "exact_numpy_eigvals_once_per_epoch",
         "seed": args.seed,
         "encoder_layer_count": 3,
         "reward_layer_count": 0,
@@ -431,6 +459,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             lambda value: float(np.asarray(value)),
             (train_metrics, validation_metrics),
         )
+        exact_spectral_radius = float(
+            np.max(np.abs(np.linalg.eigvals(np.asarray(params["A"]))))
+        )
+        train_host["spectral_radius_exact"] = exact_spectral_radius
+        validation_host["spectral_radius_exact"] = exact_spectral_radius
         joint = validation_host["rollout"]
         row = {
             "epoch": epoch,
@@ -456,6 +489,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "best_epoch": best_epoch,
                 "best_validation_joint_objective": best,
                 "best_validation_rollout_normalized_mse": validation_host["rollout"],
+                "best_spectral_radius_exact": exact_spectral_radius,
                 "dataset_sha256": run_metadata["data_manifest_sha256"],
                 "source_protocol_fingerprint": None,
             }
@@ -468,7 +502,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             print(
                 f"epoch={epoch} train={train_host['total']:.6g} "
                 f"val_joint={joint:.6g} val_rollout={validation_host['rollout']:.6g} "
-                f"rho={validation_host['spectral_radius']:.6g} best={best:.6g}",
+                f"rho_est={validation_host['spectral_radius']:.6g} "
+                f"rho_exact={exact_spectral_radius:.6g} best={best:.6g}",
                 flush=True,
             )
         if stale >= args.patience:
