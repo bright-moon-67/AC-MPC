@@ -1,0 +1,457 @@
+#!/usr/bin/env python
+"""PPO train or fine-tune the H=10 History-MLP baseline."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import random
+import time
+
+import numpy as np
+import torch
+
+from antmaze_ac.envs.history_context_wrapper import HistoryContextTrackingWrapper
+from antmaze_ac.envs.manisoft_tracking_env import ManiSoftTipTrackingEnv
+from antmaze_ac.koopman.checkpoint import sha256
+from antmaze_ac.rl.ppo import collect_rollout, collect_vector_rollout, ppo_update
+from antmaze_ac.rl.serialization import make_history_mlp_policy
+
+
+TIP_INDICES = (30, 31, 32)
+
+
+def _device(specification: str) -> torch.device:
+    return torch.device(
+        "cuda"
+        if specification == "auto" and torch.cuda.is_available()
+        else ("cpu" if specification == "auto" else specification)
+    )
+
+
+def _save(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _make_env(
+    *,
+    scenario: Path,
+    target_tip: np.ndarray,
+    episode_steps: int,
+    absolute_action_limit: float,
+    history_steps: int,
+    state_mean: np.ndarray,
+    state_std: np.ndarray,
+) -> HistoryContextTrackingWrapper:
+    base = ManiSoftTipTrackingEnv(
+        scenario,
+        target_tip=target_tip,
+        episode_steps=episode_steps,
+        absolute_action_limit=absolute_action_limit,
+    )
+    return HistoryContextTrackingWrapper(
+        base,
+        history_steps=history_steps,
+        state_mean=state_mean,
+        state_std=state_std,
+        tip_indices=TIP_INDICES,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--koopman-checkpoint", required=True)
+    parser.add_argument("--bc-checkpoint", default=None)
+    parser.add_argument("--scenario", required=True)
+    parser.add_argument("--reference", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--episode-steps", type=int, default=300)
+    parser.add_argument("--max-delta", type=float, default=0.001)
+    parser.add_argument("--absolute-action-limit", type=float, default=0.30)
+    parser.add_argument("--total-timesteps", type=int, default=None)
+    parser.add_argument("--rollout-steps", type=int, default=None)
+    parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--minibatch-size", type=int, default=None)
+    parser.add_argument("--update-epochs", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--actor-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--target-kl", type=float, default=0.02)
+    parser.add_argument("--checkpoint-interval-updates", type=int, default=None)
+    parser.add_argument("--max-wall-time-hours", type=float, default=None)
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    if args.resume is not None and args.bc_checkpoint is not None:
+        parser.error("--resume and --bc-checkpoint are mutually exclusive")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    device = _device(args.device)
+    koopman_path = Path(args.koopman_checkpoint).expanduser().resolve()
+    scenario = Path(args.scenario).expanduser().resolve()
+    reference_path = Path(args.reference).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    for name, path in (
+        ("metadata checkpoint", koopman_path),
+        ("scenario", scenario),
+        ("reference", reference_path),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing {name}: {path}")
+
+    with np.load(reference_path, allow_pickle=False) as archive:
+        reference_state = np.asarray(
+            archive["reference_state"],
+            dtype=np.float32,
+        ).reshape(-1)
+    if reference_state.shape != (45,):
+        raise ValueError("Reference state must be 45-D")
+    target_tip = reference_state[np.asarray(TIP_INDICES)]
+
+    policy, koopman_payload = make_history_mlp_policy(
+        koopman_path,
+        device,
+        absolute_action_limit=args.absolute_action_limit,
+        max_delta=args.max_delta,
+    )
+    config = koopman_payload["config"]
+    ppo = config["ppo"]
+    total_timesteps = int(args.total_timesteps or ppo["total_timesteps"])
+    rollout_steps = int(args.rollout_steps or ppo["rollout_steps"])
+    num_envs = int(args.num_envs)
+    minibatch_size = int(args.minibatch_size or ppo["minibatch_size"])
+    update_epochs = int(args.update_epochs or ppo["update_epochs"])
+    auxiliary_learning_rate = float(args.learning_rate or ppo["learning_rate"])
+    checkpoint_interval = int(
+        args.checkpoint_interval_updates or ppo["checkpoint_interval_updates"]
+    )
+    if min(total_timesteps, rollout_steps, num_envs, minibatch_size, update_epochs) < 1:
+        raise ValueError("PPO counts must be positive")
+    if rollout_steps % num_envs or total_timesteps % num_envs:
+        raise ValueError("rollout-steps and total-timesteps must divide by num-envs")
+    if minibatch_size < 2 or minibatch_size > rollout_steps:
+        raise ValueError("minibatch-size must lie in [2, rollout-steps]")
+    if min(args.actor_learning_rate, auxiliary_learning_rate, args.target_kl) <= 0:
+        raise ValueError("Learning rates and target-kl must be positive")
+
+    expected_koopman_sha = sha256(koopman_path)
+    bc_initialization = None
+    if args.bc_checkpoint is not None:
+        bc_path = Path(args.bc_checkpoint).expanduser().resolve()
+        bc_payload = torch.load(bc_path, map_location=device, weights_only=False)
+        if bc_payload.get("method") != "history_mlp_bc":
+            raise ValueError("--bc-checkpoint is not a History-MLP BC checkpoint")
+        if bc_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
+            raise ValueError("BC checkpoint references other metadata")
+        for key, expected in (
+            ("absolute_action_limit", args.absolute_action_limit),
+            ("max_delta", args.max_delta),
+            ("observation_dim", policy.observation_dim),
+            ("feature_dim", policy.feature_dim),
+            ("history_steps", policy.history_steps),
+        ):
+            if bc_payload["runtime"].get(key) != expected:
+                raise ValueError(f"BC checkpoint runtime {key} is incompatible")
+        policy.actor.load_state_dict(bc_payload["actor"])
+        bc_initialization = {
+            "checkpoint": str(bc_path),
+            "checkpoint_sha256": sha256(bc_path),
+            "best_validation_mse": float(bc_payload["best_validation_mse"]),
+        }
+
+    actor_parameters = list(policy.actor.parameters())
+    auxiliary_parameters = [*policy.critic.parameters(), policy.log_std]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": actor_parameters, "lr": args.actor_learning_rate},
+            {"params": auxiliary_parameters, "lr": auxiliary_learning_rate},
+        ],
+        eps=1e-5,
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    history_path = output / "history.jsonl"
+    status_path = output / "training_status.json"
+    if args.resume is None and history_path.exists():
+        raise FileExistsError(
+            f"{history_path} already exists; use a new output or --resume"
+        )
+
+    runtime = {
+        "absolute_action_limit": args.absolute_action_limit,
+        "max_delta": args.max_delta,
+        "observation_dim": policy.observation_dim,
+        "feature_dim": policy.feature_dim,
+        "state_dim": policy.state_dim,
+        "action_dim": policy.action_dim,
+        "history_steps": policy.history_steps,
+        "num_envs": num_envs,
+        "rollout_steps": rollout_steps,
+        "minibatch_size": minibatch_size,
+        "update_epochs": update_epochs,
+        "action_distribution": policy.ACTION_DISTRIBUTION,
+        "actor_learning_rate": args.actor_learning_rate,
+        "auxiliary_learning_rate": auxiliary_learning_rate,
+        "target_kl": args.target_kl,
+    }
+    metadata = {
+        "method": "actor_critic_history_mlp",
+        "format_version": 1,
+        "koopman_checkpoint": str(koopman_path),
+        "koopman_checkpoint_sha256": expected_koopman_sha,
+        "reference": str(reference_path),
+        "reference_sha256": sha256(reference_path),
+        "scenario": str(scenario),
+        "seed": args.seed,
+        "runtime": runtime,
+        "bc_initialization": bc_initialization,
+        "config": config,
+    }
+    timesteps = 0
+    update = 0
+    elapsed_before = 0.0
+    best_completed_return = -float("inf")
+    if args.resume is not None:
+        resume_path = Path(args.resume).expanduser().resolve()
+        resume_payload = torch.load(
+            resume_path,
+            map_location=device,
+            weights_only=False,
+        )
+        if resume_payload.get("method") != "actor_critic_history_mlp":
+            raise ValueError("Resume checkpoint is not actor-critic History-MLP")
+        if resume_payload["koopman_checkpoint_sha256"] != expected_koopman_sha:
+            raise ValueError("Resume checkpoint references other metadata")
+        if resume_payload.get("reference_sha256") != sha256(reference_path):
+            raise ValueError("Resume checkpoint references another target")
+        if resume_payload["runtime"] != runtime:
+            raise ValueError("Resume runtime configuration is incompatible")
+        if int(resume_payload["seed"]) != args.seed:
+            raise ValueError("Resume seed does not match --seed")
+        policy.load_state_dict(resume_payload["policy"])
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        timesteps = int(resume_payload["timesteps"])
+        update = int(resume_payload["update"])
+        elapsed_before = float(resume_payload.get("elapsed_seconds", 0.0))
+        best_completed_return = float(
+            resume_payload.get("best_completed_episode_return_mean", -float("inf"))
+        )
+        bc_initialization = resume_payload.get("bc_initialization")
+        metadata["bc_initialization"] = bc_initialization
+
+    _write_json(
+        output / "run_config.json",
+        {**metadata, "arguments": vars(args), "device": str(device)},
+    )
+    state_stats = koopman_payload["normalizers"]["state"]
+    envs = [
+        _make_env(
+            scenario=scenario,
+            target_tip=target_tip,
+            episode_steps=args.episode_steps,
+            absolute_action_limit=args.absolute_action_limit,
+            history_steps=policy.history_steps,
+            state_mean=np.asarray(state_stats["mean"], dtype=np.float32),
+            state_std=np.asarray(state_stats["std"], dtype=np.float32),
+        )
+        for _ in range(num_envs)
+    ]
+    for environment_index, env in enumerate(envs):
+        observation, _ = env.reset(seed=args.seed + environment_index)
+        env._ppo_observation = observation
+        env.action_space.seed(args.seed + environment_index)
+
+    def checkpoint_payload(elapsed_seconds: float) -> dict:
+        return {
+            **metadata,
+            "policy": policy.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "timesteps": timesteps,
+            "update": update,
+            "elapsed_seconds": elapsed_seconds,
+            "best_completed_episode_return_mean": best_completed_return,
+        }
+
+    started = time.monotonic()
+    wall_time_reached = False
+    try:
+        while timesteps < total_timesteps:
+            current_steps = min(rollout_steps, total_timesteps - timesteps)
+            if current_steps % num_envs:
+                raise ValueError("Final rollout is not divisible by num-envs")
+            synchronize = (
+                (lambda: torch.cuda.synchronize(device))
+                if device.type == "cuda"
+                else (lambda: None)
+            )
+            synchronize()
+            rollout_started = time.perf_counter()
+            rollout = (
+                collect_rollout(
+                    envs[0],
+                    policy,
+                    current_steps,
+                    ppo["gamma"],
+                    ppo["gae_lambda"],
+                    device,
+                )
+                if num_envs == 1
+                else collect_vector_rollout(
+                    envs,
+                    policy,
+                    current_steps,
+                    ppo["gamma"],
+                    ppo["gae_lambda"],
+                    device,
+                )
+            )
+            synchronize()
+            rollout_seconds = time.perf_counter() - rollout_started
+            update_started = time.perf_counter()
+            metrics = ppo_update(
+                policy,
+                optimizer,
+                rollout,
+                update_epochs=update_epochs,
+                minibatch_size=minibatch_size,
+                clip_range=ppo["clip_range"],
+                value_coefficient=ppo["value_coefficient"],
+                entropy_coefficient=ppo["entropy_coefficient"],
+                max_grad_norm=ppo["max_grad_norm"],
+                target_kl=args.target_kl,
+            )
+            synchronize()
+            update_seconds = time.perf_counter() - update_started
+            timesteps += current_steps
+            update += 1
+            elapsed = elapsed_before + time.monotonic() - started
+            with torch.no_grad():
+                diagnostic = policy(rollout.observations[: min(16, current_steps)])
+            completed_mean = (
+                float(rollout.episode_returns.mean())
+                if len(rollout.episode_returns)
+                else None
+            )
+            finite_distances = rollout.distances[np.isfinite(rollout.distances)]
+            row = {
+                "method": "actor_critic_history_mlp",
+                "seed": args.seed,
+                "update": update,
+                "timesteps": timesteps,
+                "elapsed_seconds": elapsed,
+                "rollout_seconds": rollout_seconds,
+                "ppo_update_seconds": update_seconds,
+                "iteration_steps_per_second": current_steps
+                / (rollout_seconds + update_seconds),
+                **metrics,
+                "reward_mean": float(rollout.rewards.mean()),
+                "completed_episodes": len(rollout.episode_returns),
+                "completed_episode_return_mean": completed_mean,
+                "episode_length_mean": (
+                    float(rollout.episode_lengths.mean())
+                    if len(rollout.episode_lengths)
+                    else None
+                ),
+                "distance_mean": (
+                    float(finite_distances.mean())
+                    if len(finite_distances)
+                    else None
+                ),
+                "distance_minimum": (
+                    float(finite_distances.min())
+                    if len(finite_distances)
+                    else None
+                ),
+                "completed_successes": int(rollout.episode_successes.sum()),
+                "completed_success_rate": (
+                    float(rollout.episode_successes.mean())
+                    if len(rollout.episode_successes)
+                    else None
+                ),
+                "action_saturation_rate": float(rollout.saturation.mean()),
+                "raw_mean_abs_mean": float(diagnostic.raw_mean.abs().mean()),
+                "log_std": policy.log_std.detach().cpu().tolist(),
+            }
+            if completed_mean is not None and completed_mean > best_completed_return:
+                best_completed_return = completed_mean
+                is_best = True
+            else:
+                is_best = False
+            with history_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, sort_keys=True) + "\n")
+            current_payload = checkpoint_payload(elapsed)
+            _save(output / "last.pt", current_payload)
+            if is_best:
+                _save(output / "best_completed_return.pt", current_payload)
+            if update % checkpoint_interval == 0:
+                _save(
+                    output / f"recovery_update_{update:06d}.pt",
+                    current_payload,
+                )
+            _write_json(status_path, {"state": "running", **row})
+            print(json.dumps(row, sort_keys=True), flush=True)
+            if (
+                args.max_wall_time_hours is not None
+                and elapsed >= args.max_wall_time_hours * 3600.0
+            ):
+                wall_time_reached = True
+                break
+        elapsed = elapsed_before + time.monotonic() - started
+        _write_json(
+            status_path,
+            {
+                "state": "wall_time_reached" if wall_time_reached else "complete",
+                "method": "actor_critic_history_mlp",
+                "timesteps": timesteps,
+                "updates": update,
+                "elapsed_seconds": elapsed,
+                "best_completed_episode_return_mean": best_completed_return,
+                "last_checkpoint_sha256": sha256(output / "last.pt"),
+            },
+        )
+    except BaseException as error:
+        elapsed = elapsed_before + time.monotonic() - started
+        emergency = checkpoint_payload(elapsed)
+        emergency["failure"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+        _save(output / "emergency.pt", emergency)
+        _write_json(
+            status_path,
+            {
+                "state": "failed",
+                "method": "actor_critic_history_mlp",
+                "timesteps": timesteps,
+                "updates": update,
+                "error": f"{type(error).__name__}: {error}",
+            },
+        )
+        raise
+    finally:
+        for env in envs:
+            env.close()
+
+
+if __name__ == "__main__":
+    main()
