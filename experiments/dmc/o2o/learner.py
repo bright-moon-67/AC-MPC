@@ -19,6 +19,8 @@ from experiments.dmc.o2o.koopman import FrozenKoopman
 from experiments.dmc.tasks.registry import get_task_spec
 from experiments.dmc.o2o.networks import (
     FrozenObservationNormalizer,
+    ValueNetwork,
+    atanh_clipped,
     build_actor,
     build_critic,
 )
@@ -247,6 +249,7 @@ class O2OLearner:
             self.actor = build_actor(
                 config.method,
                 self.koopman,
+                actor_kind=config.method_spec.actor,
                 network_profile=config.network_profile,
                 state_dim=self.state_dim,
                 action_dim=self.action_dim,
@@ -284,6 +287,18 @@ class O2OLearner:
             config.temperature_learning_rate,
             config.gradient_clip_norm,
         )
+        self.value: ValueNetwork | None = None
+        self.value_optimizer: torch.optim.Optimizer | None = None
+        if config.learner_family == "iql":
+            with _cpu_initialization_stream(
+                self.rng_substream_seeds["critic_init"] + 1
+            ):
+                self.value = ValueNetwork(self.state_dim, config.hidden_dim).to(device)
+            self.value_optimizer = _optimizer(
+                self.value.parameters(),
+                config.critic_learning_rate,
+                config.gradient_clip_norm,
+            )
         self.gradient_updates = 0
         self.actor_updates = 0
 
@@ -728,6 +743,122 @@ class O2OLearner:
             "temperature_loss": float(temperature_loss.detach()),
         }
 
+    def _data_action_log_prob(
+        self, state: torch.Tensor, action: torch.Tensor
+    ) -> torch.Tensor:
+        """Log probability of replay actions under a tanh-Gaussian actor."""
+
+        location, log_std = self.actor.distribution(state)
+        pre_tanh = atanh_clipped(action)
+        normal_log_prob = -0.5 * (
+            ((pre_tanh - location) / log_std.exp()).square()
+            + 2.0 * log_std
+            + math.log(2.0 * math.pi)
+        )
+        correction = 2.0 * (
+            math.log(2.0) - pre_tanh - F.softplus(-2.0 * pre_tanh)
+        )
+        return (normal_log_prob - correction).sum(dim=-1)
+
+    def _update_awac_actor(self, batch: TensorBatch) -> dict[str, float]:
+        state = self._encode(batch.observation).detach()
+        with torch.no_grad():
+            data_q = self._reduce_actor_q(self.critic(state, batch.action))
+            policy_action, _, _ = self.actor.sample(
+                state, generator=self.training_generator
+            )
+            value = self._reduce_actor_q(self.critic(state, policy_action))
+            advantage = data_q - value
+            weights = torch.exp(
+                advantage / self.config.method_spec.advantage_temperature
+            ).clamp(max=self.config.method_spec.advantage_weight_max)
+        log_prob = self._data_action_log_prob(state, batch.action)
+        actor_loss = -(weights * log_prob).mean()
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        actor_grad_norm = _clip(self.actor.parameters(), self.actor_optimizer)
+        self.actor_optimizer.step()
+        self.actor_updates += 1
+        return {
+            "actor_loss": float(actor_loss.detach()),
+            "actor_grad_norm": actor_grad_norm,
+            "entropy": float((-log_prob).detach().mean()),
+            "temperature": 0.0,
+            "temperature_loss": 0.0,
+            "advantage_mean": float(advantage.mean()),
+            "advantage_weight_mean": float(weights.mean()),
+        }
+
+    def _update_iql_once(self, batch: TensorBatch) -> dict[str, float]:
+        if self.value is None or self.value_optimizer is None:
+            raise RuntimeError("IQL value network is not initialized")
+        state = self._encode(batch.observation).detach()
+        next_state = self._encode(batch.next_observation).detach()
+        with torch.no_grad():
+            target_q = self.target_critic(state, batch.action).amin(dim=0)
+        value = self.value(state)
+        residual = target_q - value
+        expectile = self.config.method_spec.expectile
+        value_weight = torch.where(residual > 0, expectile, 1.0 - expectile)
+        value_loss = (value_weight * residual.square()).mean()
+        self.value_optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+        value_grad_norm = _clip(self.value.parameters(), self.value_optimizer)
+        self.value_optimizer.step()
+
+        with torch.no_grad():
+            q_target = (
+                batch.reward
+                + self.config.discount * batch.discount * self.value(next_state)
+            )
+        q = self.critic(state, batch.action)
+        critic_loss = self._reduce_critic_objective(
+            (q - q_target.unsqueeze(0)).square()
+        )
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        critic_grad_norm = _clip(self.critic.parameters(), self.critic_optimizer)
+        self.critic_optimizer.step()
+        with torch.no_grad():
+            for target_parameter, parameter in zip(
+                self.target_critic.parameters(), self.critic.parameters(), strict=True
+            ):
+                target_parameter.lerp_(parameter, self.config.target_tau)
+            advantage = self.target_critic(state, batch.action).amin(dim=0) - self.value(state)
+            weights = torch.exp(
+                self.config.method_spec.advantage_temperature * advantage
+            ).clamp(max=self.config.method_spec.advantage_weight_max)
+        log_prob = self._data_action_log_prob(state, batch.action)
+        actor_loss = -(weights * log_prob).mean()
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        actor_grad_norm = _clip(self.actor.parameters(), self.actor_optimizer)
+        self.actor_optimizer.step()
+        self.gradient_updates += 1
+        self.actor_updates += 1
+        return {
+            "critic_loss": float(critic_loss.detach()),
+            "bellman_loss": float(critic_loss.detach()),
+            "critic_grad_norm": critic_grad_norm,
+            "q_mean": float(q.detach().mean()),
+            "target_q_mean": float(q_target.mean()),
+            "value_loss": float(value_loss.detach()),
+            "value_grad_norm": value_grad_norm,
+            "value_mean": float(value.detach().mean()),
+            "actor_loss": float(actor_loss.detach()),
+            "actor_grad_norm": actor_grad_norm,
+            "entropy": float((-log_prob).detach().mean()),
+            "temperature": 0.0,
+            "temperature_loss": 0.0,
+            "advantage_mean": float(advantage.mean()),
+            "advantage_weight_mean": float(weights.mean()),
+            "cql_penalty": 0.0,
+            "calibration_bound_rate": 0.0,
+            "mpve_applied": 0.0,
+            "mpve_loss": 0.0,
+            "mpve_target_mean": 0.0,
+        }
+
     def update(
         self,
         batch: TensorBatch,
@@ -740,6 +871,13 @@ class O2OLearner:
         if batch.reward.shape[0] % utd:
             raise ValueError("Fused batch must divide evenly by UTD")
         size = batch.reward.shape[0] // utd
+        if self.config.learner_family == "iql":
+            metrics: dict[str, float] = {}
+            for index in range(utd):
+                metrics = self._update_iql_once(
+                    batch.slice(slice(index * size, (index + 1) * size))
+                )
+            return metrics
         cache = self._prepare_critic_cache(batch, phase=phase)
         metrics: dict[str, float] = {}
         mini_batch = batch
@@ -764,16 +902,19 @@ class O2OLearner:
                 cache=mini_cache,
                 phase=phase,
             )
-        metrics.update(
-            self.update_actor_and_temperature(
-                mini_batch,
-                state=mini_cache.state,
+        if self.config.learner_family == "awac":
+            metrics.update(self._update_awac_actor(mini_batch))
+        else:
+            metrics.update(
+                self.update_actor_and_temperature(
+                    mini_batch,
+                    state=mini_cache.state,
+                )
             )
-        )
         return metrics
 
     def state_dict(self) -> dict[str, Any]:
-        return {
+        state = {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "target_critic": self.target_critic.state_dict(),
@@ -795,6 +936,11 @@ class O2OLearner:
                 "training_sampling_state": self.training_generator.get_state().cpu(),
             },
         }
+        if self.value is not None:
+            assert self.value_optimizer is not None
+            state["value"] = self.value.state_dict()
+            state["value_optimizer"] = self.value_optimizer.state_dict()
+        return state
 
     def load_state_dict(
         self,
@@ -847,7 +993,14 @@ class O2OLearner:
         self.actor_optimizer.load_state_dict(state["actor_optimizer"])
         self.critic_optimizer.load_state_dict(state["critic_optimizer"])
         self.temperature_optimizer.load_state_dict(state["temperature_optimizer"])
+        if self.value is not None:
+            if self.value_optimizer is None or "value" not in state:
+                raise ValueError("IQL checkpoint is missing value-network state")
+            self.value.load_state_dict(state["value"], strict=True)
+            self.value_optimizer.load_state_dict(state["value_optimizer"])
         _optimizer_to(self.actor_optimizer, self.device)
+        if self.value_optimizer is not None:
+            _optimizer_to(self.value_optimizer, self.device)
         _optimizer_to(self.critic_optimizer, self.device)
         _optimizer_to(self.temperature_optimizer, self.device)
         self.target_critic.eval()

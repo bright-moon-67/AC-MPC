@@ -16,9 +16,12 @@ from experiments.dmc.o2o.aggregate import AGGREGATE_KIND, MAX_EPISODE_RETURN
 
 COLORS = {
     "Cal-QL-Raw": "#4c78a8",
+    "Cal-QL": "#4c78a8",
     "Cal-QL-AC-KMPC": "#b279a2",
     "RLPD-Raw": "#72b7b2",
+    "RLPD": "#72b7b2",
     "Cal-RLPD-Raw": "#54a24b",
+    "Cal-RLPD": "#54a24b",
     "Cal-QL-KMPC": "#f58518",
     "Cal-RLPD-KMPC": "#b279a2",
     "Cal-QL-MPVE": "#e45756",
@@ -26,6 +29,9 @@ COLORS = {
     # Historical internal names for the same structured methods.
     "Cal-RLPD-AC-KMPC": "#f58518",
     "Cal-RLPD-AC-KMPC-MPVE": "#e45756",
+    "Cal-RLPD-Lift": "#ff9da6",
+    "AWAC": "#9c755f",
+    "IQL": "#bab0ac",
 }
 
 
@@ -114,7 +120,12 @@ def _display_method(raw: str) -> str:
     `Cal-RLPD-KMPC` / `*-MPVE`.
     """
 
-    return raw.replace("-AC-KMPC", "-KMPC")
+    aliases = {
+        "Cal-QL-Raw": "Cal-QL",
+        "RLPD-Raw": "RLPD",
+        "Cal-RLPD-Raw": "Cal-RLPD",
+    }
+    return aliases.get(raw, raw).replace("-AC-KMPC", "-KMPC")
 
 
 def _method_name(run_dir: Path) -> str:

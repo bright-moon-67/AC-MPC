@@ -660,7 +660,7 @@ def test_plot_offline_curves_writes_png_and_csv(tmp_path: Path) -> None:
     # The historical internal name is normalized for display and CSV.
     assert "Cal-QL-AC-KMPC" not in csv
     assert "Cal-QL-KMPC,10000,100.0,1.0" in csv
-    assert "Cal-QL-Raw,50000,700.0,2.0" in csv
+    assert "Cal-QL,50000,700.0,2.0" in csv
 
 
 def test_aggregate_rejects_method_specific_config_drift_across_seeds(

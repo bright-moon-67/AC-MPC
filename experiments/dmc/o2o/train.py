@@ -33,6 +33,9 @@ from experiments.dmc.o2o.learner import O2OLearner, TensorBatch
 from experiments.dmc.o2o.networks import FrozenObservationNormalizer
 from experiments.dmc.tasks.adapter import make_dmc_adapter
 from experiments.dmc.tasks.registry import get_task_spec
+
+
+DIAGNOSTIC_EVAL_SEED_BASE = 9_000_000
 from experiments.dmc.ppo.vector_env import make_dmc_vector_env
 
 
@@ -315,6 +318,7 @@ def _checkpoint_payload(
         "kind": CHECKPOINT_KIND,
         "config": config.to_dict(),
         "config_fingerprint": config.fingerprint,
+        "method_spec": dataclasses.asdict(config.method_spec),
         "dataset": {
             "path": str(dataset.path),
             "sha256": dataset.sha256,
@@ -355,6 +359,11 @@ def _validate_resume(
 ) -> None:
     if payload.get("config_fingerprint") != config.fingerprint:
         raise ValueError("Resume config fingerprint differs")
+    if (
+        "method_spec" in payload
+        and payload.get("method_spec") != dataclasses.asdict(config.method_spec)
+    ):
+        raise ValueError("Resume immutable method specification differs")
     if payload.get("dataset", {}).get("sha256") != dataset.sha256:
         raise ValueError("Resume offline dataset differs")
     expected_koopman = None if koopman is None else koopman.identity()
@@ -1024,6 +1033,7 @@ def run(
         "kind": "acmpc_dmc_o2o_run_v1",
         "config": config.to_dict(),
         "config_fingerprint": config.fingerprint,
+        "method_spec": dataclasses.asdict(config.method_spec),
         "dataset": {"path": str(dataset.path), "sha256": dataset.sha256},
         "koopman": None if koopman is None else koopman.identity(),
         "raw_observation_normalizer": (
@@ -1037,6 +1047,10 @@ def run(
             "latest": "latest.pt",
             "best": "best.pt",
             "best_selection": "highest_recorded_evaluation_return",
+            "milestones": {
+                "offline": "offline_NNNNNN.pt at every offline diagnostic boundary",
+                "online": "online_NNNNNN.pt at every online diagnostic boundary",
+            },
         },
         "started_unix_seconds": time.time(),
         "resumed": resumed,
@@ -1059,6 +1073,12 @@ def run(
                 else "not_used_for_online_calibration"
             ),
             "latest_checkpoint": "synchronized_all_env_reset_boundary_only",
+        },
+        "diagnostic_evaluation": {
+            "deterministic": True,
+            "episodes": config.eval_episodes,
+            "seed_base": DIAGNOSTIC_EVAL_SEED_BASE,
+            "disjoint_from_final_10x10_seed_base": 9_100_000,
         },
         "initialization": initialization,
         "online_extension": extension_metadata,
@@ -1110,6 +1130,71 @@ def run(
             ),
         )
 
+    def save_milestone_checkpoint(
+        stage: str,
+        *,
+        pending_trajectory: dict[str, list[np.ndarray | float]] | None = None,
+    ) -> Path:
+        """Save the exact learner selected for one scheduled diagnostic."""
+
+        if stage not in {"offline", "online"}:
+            raise ValueError("Milestone stage must be offline or online")
+        counter = offline_update if stage == "offline" else online_step
+        if counter > 999_999:
+            raise ValueError("Milestone counter exceeds the six-digit artifact schema")
+        path = output / f"{stage}_{counter:06d}.pt"
+        atomic_torch_save(
+            path,
+            _checkpoint_payload(
+                config=config,
+                dataset=dataset,
+                koopman=koopman,
+                observation_normalizer=observation_normalizer,
+                learner=learner,
+                replay=replay,
+                generator=generator,
+                phase=stage,
+                offline_update=offline_update,
+                online_step=online_step,
+                online_episode=online_episode,
+                environment_protocol=environment_protocol,
+                best_return=best_return,
+                best_online_step=best_online_step,
+                initialization=initialization,
+                pending_trajectory=pending_trajectory,
+                online_extension=extension_metadata,
+            ),
+        )
+        return path
+
+    def save_milestone_metrics(
+        stage: str,
+        evaluation: dict[str, Any],
+    ) -> Path:
+        if stage not in {"offline", "online"}:
+            raise ValueError("Milestone stage must be offline or online")
+        counter = offline_update if stage == "offline" else online_step
+        path = output / f"evaluation_{stage}_{counter:06d}.json"
+        checkpoint_path = output / f"{stage}_{counter:06d}.pt"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError("Milestone metrics require their checkpoint")
+        _atomic_json(
+            path,
+            {
+                "kind": "acmpc_dmc_o2o_training_diagnostic_v1",
+                "task": config.task,
+                "method": config.method,
+                "training_seed": config.seed,
+                "stage": stage,
+                "offline_update": offline_update,
+                "online_step": online_step,
+                "checkpoint_path": str(checkpoint_path.resolve()),
+                "checkpoint_sha256": file_sha256(checkpoint_path),
+                "evaluation": evaluation,
+            },
+        )
+        return path
+
     initial_evaluation_phase = (
         "offline_evaluation" if initialization is not None else "initial"
     )
@@ -1142,6 +1227,9 @@ def run(
                 online_extension=extension_metadata,
             ),
         )
+        save_milestone_checkpoint(
+            "offline" if config.uses_offline_pretraining else "online"
+        )
     has_initial_evaluation = _has_metric_row(
         metrics_path,
         phase=initial_evaluation_phase,
@@ -1157,7 +1245,7 @@ def run(
                 "Cannot reconstruct a missing step-zero evaluation after training"
             )
         initial_eval = evaluate(
-            learner, episodes=config.eval_episodes, seed_base=9_100_000
+            learner, episodes=config.eval_episodes, seed_base=DIAGNOSTIC_EVAL_SEED_BASE
         )
         if initial_eval["return_mean"] > best_return:
             best_return = float(initial_eval["return_mean"])
@@ -1171,6 +1259,10 @@ def run(
                 "online_step": online_step,
                 **initial_eval,
             },
+        )
+        save_milestone_metrics(
+            "offline" if config.uses_offline_pretraining else "online",
+            initial_eval,
         )
 
     started = time.time()
@@ -1218,8 +1310,11 @@ def run(
                 ),
             )
             diagnostic = evaluate(
-                learner, episodes=config.eval_episodes, seed_base=9_100_000
+                learner,
+                episodes=config.eval_episodes,
+                seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
             )
+            save_milestone_checkpoint("offline")
             if diagnostic["return_mean"] > best_return:
                 best_return = float(diagnostic["return_mean"])
                 best_online_step = 0
@@ -1233,6 +1328,7 @@ def run(
                     **diagnostic,
                 },
             )
+            save_milestone_metrics("offline", diagnostic)
 
         # Covers a process interruption after the milestone checkpoint but
         # before its diagnostic row was durably flushed.
@@ -1319,7 +1415,9 @@ def run(
                     "Cannot reconstruct a missing offline evaluation after online updates"
                 )
             offline_eval = evaluate(
-                learner, episodes=config.eval_episodes, seed_base=9_100_000
+                learner,
+                episodes=config.eval_episodes,
+                seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
             )
             if offline_eval["return_mean"] > best_return:
                 best_return = float(offline_eval["return_mean"])
@@ -1334,6 +1432,19 @@ def run(
                     **offline_eval,
                 },
             )
+        else:
+            offline_eval = _read_metric_row(
+                metrics_path,
+                phase="offline_evaluation",
+                offline_update=config.offline_updates,
+                online_step=0,
+            )
+        save_milestone_checkpoint("offline")
+        # Online step zero is the exact final offline learner. Keep a named
+        # alias because it is one of the two paper-level 10x10 boundaries.
+        save_milestone_checkpoint("online")
+        save_milestone_metrics("offline", offline_eval)
+        save_milestone_metrics("online", offline_eval)
         if config.method == "Cal-RLPD-AC-KMPC":
             # Preserve the exact common state before either structured online
             # branch sees a real transition.  MPVE forks this file.  Once
@@ -1600,13 +1711,17 @@ def run(
                 episode_lengths.fill(0)
 
             should_evaluate = (
-                online_step in {1_000, 2_500, 5_000}
-                or online_step % config.eval_interval_online_steps == 0
+                online_step % config.eval_interval_online_steps == 0
                 or online_step == config.online_steps
             )
             if should_evaluate:
+                save_milestone_checkpoint(
+                    "online", pending_trajectory=pending_trajectory
+                )
                 evaluation = evaluate(
-                    learner, episodes=config.eval_episodes, seed_base=9_100_000
+                    learner,
+                    episodes=config.eval_episodes,
+                    seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
                 )
                 row = {
                     "phase": "online_evaluation",
@@ -1616,6 +1731,7 @@ def run(
                     **evaluation,
                 }
                 _append_jsonl(metrics_path, row)
+                save_milestone_metrics("online", evaluation)
                 if evaluation["return_mean"] > best_return:
                     best_return = evaluation["return_mean"]
                     best_online_step = online_step
@@ -1694,10 +1810,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cql-weight", type=float, default=0.01)
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument(
-        "--offline-eval-interval-updates", type=int, default=10_000
+        "--offline-eval-interval-updates", type=int, default=5_000
     )
     parser.add_argument(
-        "--eval-interval-online-steps", type=int, default=5_000
+        "--eval-interval-online-steps", type=int, default=2_500
     )
     parser.add_argument("--initialize-from-offline", type=Path)
     parser.add_argument(

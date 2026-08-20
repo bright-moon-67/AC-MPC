@@ -272,6 +272,7 @@ def convert_exorl(
     source_archive: Path | None = None,
     task: str = "cartpole_swingup",
     reward_source: str = "oracle",
+    allow_unselected_episode_files: bool = False,
 ) -> dict[str, Any]:
     """Convert official ExORL episodes to one strict transition archive."""
 
@@ -307,7 +308,7 @@ def convert_exorl(
             index for index in selected_indices if index not in available_by_index
         ]
         unexpected_indices = sorted(set(available_by_index) - set(selected_indices))
-        if missing_indices or unexpected_indices:
+        if missing_indices or (unexpected_indices and not allow_unselected_episode_files):
             raise ValueError(
                 "ExORL source files differ from the selected episode identity: "
                 f"missing={missing_indices[:10]}, unexpected={unexpected_indices[:10]}"

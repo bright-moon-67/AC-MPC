@@ -341,20 +341,44 @@ def _validate_manifest_header(
             "temporal_block_microstratum_start_v1"
         ):
             raise ValueError("Unsupported stratified source selection contract")
+        source_total_episodes = selection.get("source_total_episodes")
+        temporal_blocks = selection.get("temporal_blocks")
+        selected_per_block = selection.get("selected_episodes_per_block")
+        episodes_per_block = selection.get("episodes_per_block")
+        microstratum_width = selection.get("microstratum_width_episodes")
+        microstratum_offset = selection.get("microstratum_offset")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (
+                source_total_episodes,
+                temporal_blocks,
+                selected_per_block,
+                episodes_per_block,
+                microstratum_width,
+            )
+        ) or microstratum_offset != 0:
+            raise ValueError("Invalid temporal-stratified selection metadata")
+        if source_total_episodes != temporal_blocks * episodes_per_block:
+            raise ValueError("Selection block sizes do not cover the source episodes")
+        if episodes_per_block != selected_per_block * microstratum_width:
+            raise ValueError("Selection micro-strata do not cover each temporal block")
         expected_indices = temporal_stratified_episode_indices(
-            source_total_episodes=10_000,
-            temporal_deciles=10,
-            episodes_per_decile=100,
+            source_total_episodes=source_total_episodes,
+            temporal_deciles=temporal_blocks,
+            episodes_per_decile=selected_per_block,
         )
         actual_indices = manifest.get("source_episode_indices")
         if actual_indices != list(expected_indices):
-            raise ValueError("Manifest does not contain the canonical stratified IDs")
+            raise ValueError("Manifest episode IDs differ from its stratified selection")
         expected_identity = _episode_index_identity(expected_indices)
         if manifest.get("source_episode_indices_sha256") != expected_identity:
             raise ValueError("Manifest stratified episode-ID SHA256 differs")
-        expected_stage_counts = {f"decile_{index:02d}": 100 for index in range(10)}
+        expected_stage_counts = {
+            f"decile_{index:02d}": selected_per_block
+            for index in range(temporal_blocks)
+        }
         if protocol.stage_counts != expected_stage_counts:
-            raise ValueError("Stratified protocol must retain ten 100-episode deciles")
+            raise ValueError("Protocol stage counts differ from stratified selection")
 
 
 def _validate_stage_metadata(

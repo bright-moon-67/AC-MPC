@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,6 +28,7 @@ from experiments.dmc.tasks.registry import get_task_spec
 RUN_KIND = "acmpc_dmc_o2o_run_v1"
 EVALUATION_KIND = "acmpc_dmc_o2o_checkpoint_evaluation_v1"
 CHECKPOINT_NAMES = ("latest", "best")
+_MILESTONE_CHECKPOINT = re.compile(r"^(offline|online)_\d{6}$")
 EVALUATION_EPISODES = 10
 EVALUATION_SEED_BASE = 9_100_000
 
@@ -246,8 +249,13 @@ def validate_run_identity(
 ) -> ValidatedRun:
     """Cross-check run, checkpoint, config, dataset, and Koopman identities."""
 
-    if checkpoint_name not in CHECKPOINT_NAMES:
-        raise ValueError(f"checkpoint_name must be one of {CHECKPOINT_NAMES}")
+    if checkpoint_name not in CHECKPOINT_NAMES and not _MILESTONE_CHECKPOINT.fullmatch(
+        checkpoint_name
+    ):
+        raise ValueError(
+            "checkpoint_name must be latest, best, or a stage milestone such as "
+            "offline_050000/online_020000"
+        )
     run_dir = run_dir.resolve()
     run_metadata = _read_mapping(run_dir / "run.json")
     if run_metadata.get("kind") != RUN_KIND:
@@ -259,6 +267,13 @@ def validate_run_identity(
         raise ValueError("Run and checkpoint configs differ")
     if run_metadata.get("config_fingerprint") != config.fingerprint:
         raise ValueError("Run config fingerprint is invalid")
+    expected_method_spec = dataclasses.asdict(config.method_spec)
+    checkpoint_method_spec = checkpoint.get("method_spec")
+    run_method_spec = run_metadata.get("method_spec")
+    if checkpoint_method_spec is not None and checkpoint_method_spec != expected_method_spec:
+        raise ValueError("Checkpoint immutable method specification differs")
+    if run_method_spec is not None and run_method_spec != expected_method_spec:
+        raise ValueError("Run immutable method specification differs")
     if run_metadata.get("initialization") != checkpoint.get("initialization"):
         raise ValueError("Run and checkpoint initialization lineage differ")
 
@@ -285,7 +300,7 @@ def validate_run_identity(
     if checkpoint_normalizer != run_normalizer:
         raise ValueError("Run and checkpoint raw normalizer identities differ")
     observation_normalizer: FrozenObservationNormalizer | None = None
-    if config.uses_kmpc:
+    if config.requires_koopman:
         if not isinstance(checkpoint_koopman, Mapping):
             raise ValueError("Structured checkpoint is missing Koopman identity")
         expected_koopman_sha = checkpoint_koopman.get("sha256")
@@ -328,7 +343,7 @@ def validate_run_identity(
     if not isinstance(learner_state, Mapping):
         raise ValueError("Checkpoint is missing learner state")
     representation = learner_state.get("representation")
-    if config.uses_kmpc:
+    if config.requires_koopman:
         if not isinstance(checkpoint_koopman, Mapping):
             raise AssertionError("Structured identity validation drifted")
         architecture = checkpoint_koopman.get("architecture")
@@ -580,7 +595,11 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--checkpoint", choices=CHECKPOINT_NAMES, default="latest")
+    parser.add_argument(
+        "--checkpoint",
+        default="latest",
+        help="latest, best, or a saved milestone such as offline_050000/online_020000",
+    )
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--koopman", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")

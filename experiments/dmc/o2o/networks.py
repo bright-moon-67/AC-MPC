@@ -492,10 +492,29 @@ class ExORLCQLQEnsemble(nn.Module):
         return torch.stack([network(value)[..., 0] for network in self.q_nets], dim=0)
 
 
+class ValueNetwork(nn.Module):
+    """Two-layer state-value network used only by the IQL baseline."""
+
+    def __init__(self, state_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.apply(_orthogonal_linear)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.net(state)[..., 0]
+
+
 def build_actor(
     method: str,
     koopman: FrozenKoopman | None,
     *,
+    actor_kind: str | None = None,
     network_profile: str = "rlpd",
     state_dim: int,
     action_dim: int,
@@ -505,7 +524,16 @@ def build_actor(
     kmpc_solver_iterations: int,
     controller_hidden_layers: int = 1,
 ) -> nn.Module:
-    if "KMPC" in method or method in {"Cal-QL-MPVE", "Cal-RLPD-MPVE"}:
+    if actor_kind is None:
+        # Compatibility for older direct callers. New O2O code passes the
+        # immutable MethodSpec actor kind so a lifted-state MLP is not
+        # mistaken for an AC-KMPC controller.
+        actor_kind = (
+            "ac_kmpc"
+            if "KMPC" in method or method in {"Cal-QL-MPVE", "Cal-RLPD-MPVE"}
+            else "mlp"
+        )
+    if actor_kind == "ac_kmpc":
         if koopman is None:
             raise ValueError("AC-KMPC actor requires a Koopman model")
         return KMPCTanhGaussianActor(
@@ -520,8 +548,8 @@ def build_actor(
                 else LOG_STD_MIN
             ),
         )
-    if koopman is not None:
-        raise ValueError("Raw MLP actor must not receive a Koopman model")
+    if actor_kind != "mlp":
+        raise ValueError(f"Unknown actor kind {actor_kind!r}")
     if network_profile == "exorl_cql":
         return ExORLCQLActor(state_dim, action_dim, hidden_dim)
     if network_profile != "rlpd":

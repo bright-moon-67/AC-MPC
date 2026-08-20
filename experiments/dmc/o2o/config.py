@@ -27,6 +27,7 @@ CriticHeadReduction = Literal["sum", "mean"]
 OnlineCQLMode = Literal["all_valid_mc", "off"]
 NetworkProfile = Literal["exorl_cql", "rlpd"]
 MPVEScope = Literal["off", "offline_only", "online_only", "both"]
+LearnerFamily = Literal["sac", "awac", "iql"]
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,10 @@ class MethodSpec:
     online_warmup_steps: int
     num_envs: int
     env_workers: int
+    learner_family: LearnerFamily = "sac"
+    expectile: float = 0.7
+    advantage_temperature: float = 3.0
+    advantage_weight_max: float = 100.0
 
     @property
     def requires_koopman(self) -> bool:
@@ -227,6 +232,58 @@ METHOD_SPECS: dict[str, MethodSpec] = {
 # legacy matrix/aggregate contract remains unchanged.  They are launched and
 # stopped independently and may have their own execution horizon.
 STANDALONE_METHOD_SPECS: dict[str, MethodSpec] = {
+    # Paper-facing names. The historical *-Raw identities above remain intact
+    # so completed Cartpole/Walker matrices are still exactly reproducible.
+    "Cal-QL": MethodSpec(name="Cal-QL", **_CALQL_RAW),
+    "RLPD": MethodSpec(name="RLPD", **_RLPD_RAW),
+    "Cal-RLPD": MethodSpec(
+        name="Cal-RLPD",
+        representation="raw",
+        actor="mlp",
+        mpve_scope="off",
+        **_CAL_RLPD,
+    ),
+    "Cal-RLPD-Lift": MethodSpec(
+        name="Cal-RLPD-Lift",
+        representation="koopman_lifted",
+        actor="mlp",
+        mpve_scope="off",
+        profile="calql_regularized_rlpd_lifted_mlp_v1",
+        **{key: value for key, value in _CAL_RLPD.items() if key != "profile"},
+    ),
+    "AWAC": MethodSpec(
+        name="AWAC",
+        **{
+            **_RLPD_RAW,
+            "offline_pretraining": True,
+            "profile": "awac_offline_to_online_v1",
+            "critic_ensemble_size": 2,
+            "target_critic_subset": 2,
+            "backup_entropy": False,
+            "actor_q_reduction": "min",
+            "online_utd": 1,
+            "online_warmup_steps": 0,
+        },
+        learner_family="awac",
+        advantage_temperature=1.0,
+    ),
+    "IQL": MethodSpec(
+        name="IQL",
+        **{
+            **_RLPD_RAW,
+            "offline_pretraining": True,
+            "profile": "iql_offline_to_online_v1",
+            "critic_ensemble_size": 2,
+            "target_critic_subset": 2,
+            "backup_entropy": False,
+            "actor_q_reduction": "min",
+            "online_utd": 1,
+            "online_warmup_steps": 0,
+        },
+        learner_family="iql",
+        expectile=0.7,
+        advantage_temperature=3.0,
+    ),
     "Cal-RLPD-KMPC": MethodSpec(
         name="Cal-RLPD-KMPC",
         representation="koopman_lifted",
@@ -328,11 +385,11 @@ class O2OConfig:
     mpve_total_horizon: int = 10
     mpve_loss_weight: float = 1.0
 
-    eval_interval_online_steps: int = 5_000
+    eval_interval_online_steps: int = 2_500
     eval_episodes: int = 10
     checkpoint_interval_updates: int = 10_000
     log_interval_updates: int = 1_000
-    offline_eval_interval_updates: int = 10_000
+    offline_eval_interval_updates: int = 5_000
 
     def __post_init__(self) -> None:
         if self.method not in TRAIN_METHOD_SPECS:
@@ -453,6 +510,10 @@ class O2OConfig:
         if not math.isfinite(self.target_entropy):
             raise ValueError("target_entropy must be finite")
         spec = self.method_spec
+        if not 0.0 < spec.expectile < 1.0:
+            raise ValueError("IQL expectile must lie in (0, 1)")
+        if spec.advantage_temperature <= 0 or spec.advantage_weight_max <= 0:
+            raise ValueError("Advantage weighting parameters must be positive")
         semantic_fields = (
             "network_profile",
             "backup_entropy",
@@ -507,6 +568,10 @@ class O2OConfig:
     @property
     def uses_calql(self) -> bool:
         return self.method_spec.calql
+
+    @property
+    def learner_family(self) -> LearnerFamily:
+        return self.method_spec.learner_family
 
     def uses_calql_in_phase(self, phase: Literal["offline", "online"]) -> bool:
         if phase == "offline":

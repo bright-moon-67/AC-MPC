@@ -27,6 +27,21 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _relocated_path(path: str) -> Path:
+    """Resolve legacy prepared-data paths after the formal storage move."""
+
+    candidate = Path(path).resolve()
+    if candidate.exists():
+        return candidate
+    old_prefix = "/root/autodl-tmp/AC-MPC/runs/o2o/data/"
+    new_prefix = "/root/acmpc-o2o-nonformal-20260819/data/"
+    if path.startswith(old_prefix):
+        relocated = Path(new_prefix + path[len(old_prefix) :]).resolve()
+        if relocated.exists():
+            return relocated
+    return candidate
+
+
 def _manifest_stage_order(manifest: dict[str, Any]) -> tuple[str, ...]:
     order = manifest.get("stage_order")
     stages = manifest.get("stages")
@@ -66,7 +81,7 @@ def _load_data(directory: Path, task: str, manifest: dict[str, Any]):
         stage_metadata = manifest_stages[stage]
         if not isinstance(stage_metadata, dict):
             raise ValueError(f"Dataset manifest stage {stage!r} is invalid")
-        if Path(stage_metadata.get("path", "")).resolve() != path.resolve():
+        if _relocated_path(stage_metadata.get("path", "")) != path.resolve():
             raise ValueError(f"Dataset manifest path differs for stage {stage!r}")
         if stage_metadata.get("sha256") != _sha256(path):
             raise ValueError(f"Dataset stage SHA256 differs for {stage!r}")

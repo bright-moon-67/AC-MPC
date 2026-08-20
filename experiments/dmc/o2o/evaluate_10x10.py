@@ -292,7 +292,11 @@ def evaluate_10x10(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--checkpoint", choices=("latest", "best"), default="latest")
+    parser.add_argument(
+        "--checkpoint",
+        default="latest",
+        help="latest, best, or a saved offline/online milestone",
+    )
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--koopman", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")

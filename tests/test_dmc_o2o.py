@@ -186,6 +186,32 @@ def test_exorl_conversion_rejects_recorded_reward_mismatch(tmp_path: Path) -> No
         convert_exorl_cartpole(source, tmp_path / "transitions.npz")
 
 
+def test_selected_conversion_can_explicitly_read_a_subset_of_a_larger_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "raw"
+    source.mkdir()
+    _synthetic_exorl_episode(source / "20200101T000000_0_3.npz")
+    _synthetic_exorl_episode(source / "20200101T000001_1_3.npz")
+    with pytest.raises(ValueError, match="unexpected"):
+        convert_exorl_cartpole(
+            source,
+            tmp_path / "strict.npz",
+            max_transitions=3,
+            selected_episode_indices=(0,),
+        )
+    convert_exorl_cartpole(
+        source,
+        tmp_path / "subset.npz",
+        max_transitions=3,
+        selected_episode_indices=(0,),
+        allow_unselected_episode_files=True,
+    )
+    dataset = OfflineDataset.load(tmp_path / "subset.npz")
+    assert len(dataset) == 3
+    assert dataset.metadata["source_episode_indices"] == [0]
+
+
 def test_temporal_stratified_episode_indices_cover_every_decile() -> None:
     indices = temporal_stratified_episode_indices()
 
@@ -646,6 +672,50 @@ def test_method_specs_freeze_raw_and_structured_algorithm_profiles() -> None:
         assert structured.online_warmup_steps == 0
         assert structured.uses_calql_in_phase("offline")
         assert not structured.uses_calql_in_phase("online")
+
+
+def test_formal_walker_method_identities_are_unambiguous() -> None:
+    calql = O2OConfig(method="Cal-QL", task="walker_run")
+    rlpd = O2OConfig(method="RLPD", task="walker_run")
+    calibrated = O2OConfig(method="Cal-RLPD", task="walker_run")
+    lifted = O2OConfig(method="Cal-RLPD-Lift", task="walker_run")
+    awac = O2OConfig(method="AWAC", task="walker_run")
+    iql = O2OConfig(method="IQL", task="walker_run")
+
+    assert not calql.requires_koopman and calql.uses_calql
+    assert not rlpd.uses_offline_pretraining
+    assert calibrated.uses_offline_pretraining and calibrated.uses_calql
+    assert lifted.requires_koopman and not lifted.uses_kmpc
+    assert lifted.method_spec.actor == "mlp"
+    assert awac.learner_family == "awac" and awac.uses_offline_pretraining
+    assert iql.learner_family == "iql" and iql.uses_offline_pretraining
+    assert (calql.offline_eval_interval_updates, calql.eval_interval_online_steps) == (
+        5_000,
+        2_500,
+    )
+
+
+def test_lift_actor_is_an_mlp_and_awac_iql_updates_roundtrip(
+    koopman: FrozenKoopman,
+) -> None:
+    lift_config = _small_config("Cal-RLPD-Lift")
+    lifted = O2OLearner(lift_config, koopman, torch.device("cpu"))
+    assert isinstance(lifted.actor, MLPActor)
+    assert lifted.state_dim == koopman.lifted_dim
+
+    for method in ("AWAC", "IQL"):
+        config = _small_config(method)
+        learner = _raw_learner(config)
+        metrics = learner.update(_tensor_batch(), utd=1, phase="offline")
+        assert np.isfinite(list(metrics.values())).all()
+        restored = _raw_learner(config)
+        restored.load_state_dict(copy.deepcopy(learner.state_dict()))
+        if method == "IQL":
+            assert restored.value is not None
+            assert "value_loss" in metrics
+        else:
+            assert restored.value is None
+        restored.update(_tensor_batch(), utd=1, phase="online")
 
 
 def test_resolved_algorithm_semantics_are_fingerprinted_and_not_overridable() -> None:
@@ -1654,6 +1724,19 @@ def test_online_collection_batches_five_envs_but_updates_once_per_transition(
     assert checkpoint["online_step"] == 10
     assert checkpoint["online_episode"] == 5
     assert checkpoint["phase"] == "online"
+    for name in (
+        "offline_000000.pt",
+        "offline_000001.pt",
+        "offline_000002.pt",
+        "online_000000.pt",
+        "online_000010.pt",
+        "evaluation_offline_000000.json",
+        "evaluation_offline_000001.json",
+        "evaluation_offline_000002.json",
+        "evaluation_online_000000.json",
+        "evaluation_online_000010.json",
+    ):
+        assert (tmp_path / "run" / name).is_file(), name
 
     # A completed/resumed structured run must only validate its pre-online
     # fork snapshot.  It must never overwrite that file with the current

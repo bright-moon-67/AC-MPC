@@ -50,21 +50,29 @@ def _adapter_stages(dataset: OfflineDataset) -> list[tuple[str, int, int, list[i
     if (
         source_total != 10_000
         or blocks != 10
-        or per_block != 100
+        or per_block < 1
         or episodes_per_block != 1000
         or episode_count != blocks * per_block
+        or episodes_per_block % per_block
     ):
-        raise ValueError("Expected the canonical Proto10M 10x100 selection contract")
+        raise ValueError("Expected a Proto10M ten-decile microstratum contract")
 
     stages: list[tuple[str, int, int, list[int]]] = []
     for block in range(blocks):
         left = block * per_block
         right = left + per_block
         source_ids = selected[left:right]
-        expected_ids = list(range(block * episodes_per_block, (block + 1) * episodes_per_block, 10))
+        micro_width = episodes_per_block // per_block
+        expected_ids = list(
+            range(
+                block * episodes_per_block,
+                (block + 1) * episodes_per_block,
+                micro_width,
+            )
+        )
         if source_ids != expected_ids:
             raise ValueError(
-                f"Temporal decile {block} does not contain canonical 0,10,...,990 offsets"
+                f"Temporal decile {block} does not contain canonical microstratum starts"
             )
         stages.append((f"decile_{block:02d}", left, right, source_ids))
     return stages
@@ -109,8 +117,8 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
     task_name = str(dataset.metadata.get("task", "cartpole_swingup"))
     spec = get_task_spec(task_name)
     episode_count = int(dataset.metadata["episodes"])
-    if episode_count != 1000 or len(dataset) != 1_000_000:
-        raise ValueError("Primary ExORL Koopman fit requires exactly 1000x1000 transitions")
+    if episode_count < 1 or len(dataset) != episode_count * 1_000:
+        raise ValueError("Koopman adapter requires complete 1000-step episodes")
     episode_id = dataset.arrays["episode_id"].reshape(episode_count, 1000)
     episode_step = dataset.arrays["episode_step"].reshape(episode_count, 1000)
     expected_episode_id = np.broadcast_to(
@@ -141,6 +149,12 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
         raise ValueError("Canonical ExORL episodes must retain discount one")
 
     stages = _adapter_stages(dataset)
+    split_counts = {"train": 0, "validation": 0, "test": 0}
+    for _name, left, right, _source_ids in stages:
+        local_modulo = np.arange(right - left) % 10
+        split_counts["train"] += int(np.count_nonzero(local_modulo < 8))
+        split_counts["validation"] += int(np.count_nonzero(local_modulo == 8))
+        split_counts["test"] += int(np.count_nonzero(local_modulo == 9))
 
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -189,11 +203,7 @@ def prepare(dataset_path: Path, output_dir: Path) -> dict:
         "observation_dim": spec.obs_dim,
         "action_dim": spec.action_dim,
         "trainer_episode_split": "per_stage_modulo_10_8_1_1",
-        "trainer_split_episode_counts": {
-            "train": 800,
-            "validation": 100,
-            "test": 100,
-        },
+        "trainer_split_episode_counts": split_counts,
         "reward": dataset.metadata.get("reward"),
         "source_episode_identity_sha256": dataset.metadata.get(
             "source_episode_identity_sha256"
