@@ -175,6 +175,7 @@ def make_history_mpc_policy(
     linear_scale: float | None = None,
     action_quadratic_scale: float | None = None,
     waypoint_count: int = 1,
+    task_mode: str = "tracking",
 ) -> tuple[HistoryKoopmanMPCPolicy, dict]:
     """Build the soft-robot BC-KMPC policy from a history checkpoint."""
 
@@ -220,12 +221,18 @@ def make_history_mpc_policy(
     if action_quadratic_scale is not None:
         settings["action_quadratic_scale"] = float(action_quadratic_scale)
 
+    if task_mode not in {"tracking", "kinematic_push"}:
+        raise ValueError(f"Unsupported history MPC task_mode: {task_mode}")
     if waypoint_count < 1:
         raise ValueError("waypoint_count must be positive")
     task_context_dim = (
-        HistoryKoopmanMPCPolicy.TASK_CONTEXT_DIM
-        if waypoint_count == 1
-        else 4 * int(waypoint_count)
+        HistoryKoopmanMPCPolicy.KINEMATIC_PUSH_TASK_CONTEXT_DIM
+        if task_mode == "kinematic_push"
+        else (
+            HistoryKoopmanMPCPolicy.TASK_CONTEXT_DIM
+            if waypoint_count == 1
+            else 4 * int(waypoint_count)
+        )
     )
     limit = float(settings["absolute_action_limit"])
     actor = KoopmanMPCActor(
@@ -258,6 +265,7 @@ def make_history_mpc_policy(
         torch.as_tensor(state_stats["mean"], dtype=torch.float32),
         torch.as_tensor(state_stats["std"], dtype=torch.float32),
         waypoint_count=int(waypoint_count),
+        task_mode=task_mode,
         log_std_init=float(settings["log_std_init"]),
     ).to(device)
     return policy, payload
@@ -271,7 +279,12 @@ def load_history_mpc_checkpoint(
 
     policy_payload = torch.load(path, map_location=device, weights_only=False)
     method = policy_payload.get("method")
-    if method not in {"bc_kmpc_bc", "actor_critic_bc_kmpc"}:
+    if method not in {
+        "bc_kmpc_bc",
+        "actor_critic_bc_kmpc",
+        "kinematic_push_bc_kmpc",
+        "actor_critic_kinematic_push",
+    }:
         raise ValueError(f"{path} is not a BC-KMPC checkpoint")
     if int(policy_payload.get("format_version", 0)) < 4:
         raise ValueError(
@@ -296,8 +309,9 @@ def load_history_mpc_checkpoint(
         linear_scale=runtime.get("linear_scale"),
         action_quadratic_scale=runtime.get("action_quadratic_scale"),
         waypoint_count=int(runtime.get("waypoint_count", 1)),
+        task_mode=str(runtime.get("task_mode", "tracking")),
     )
-    if method == "bc_kmpc_bc":
+    if method in {"bc_kmpc_bc", "kinematic_push_bc_kmpc"}:
         policy.actor.load_state_dict(policy_payload["actor"])
     else:
         policy.load_state_dict(policy_payload["policy"])

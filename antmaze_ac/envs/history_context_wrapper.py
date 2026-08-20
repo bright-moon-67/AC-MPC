@@ -19,7 +19,10 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
     absolute action; optional ``max_delta`` use accepts a normalized increment
     and reconstructs the absolute action from that history state.  For a single goal
     ``task_context=target_tip``.  For an ordered waypoint task it is
-    ``[G1,G2,G3,one_hot(active_index)]``.
+    ``[G1,G2,G3,one_hot(active_index)]``.  Environments with a richer task may
+    expose a fixed ``task_context_dim`` and ``task_context`` property; that
+    vector is appended unchanged while the Koopman physical/history layout
+    remains identical.
     """
 
     def __init__(
@@ -51,12 +54,18 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
         self.context_dim = self.history_steps * (
             self.state_dim + self.action_dim
         )
+        external_context_dim = getattr(env, "task_context_dim", None)
+        self.has_external_task_context = external_context_dim is not None
         self.waypoint_count = int(getattr(env, "waypoint_count", 1))
         if self.waypoint_count < 1:
             raise ValueError("waypoint_count must be positive")
         self.task_context_dim = (
-            3 if self.waypoint_count == 1 else 4 * self.waypoint_count
+            int(external_context_dim)
+            if self.has_external_task_context
+            else (3 if self.waypoint_count == 1 else 4 * self.waypoint_count)
         )
+        if self.task_context_dim < 1:
+            raise ValueError("task_context_dim must be positive")
         self.tip_indices = np.asarray(tuple(tip_indices), dtype=np.int64)
         if self.tip_indices.shape != (3,):
             raise ValueError("tip_indices must contain exactly three indices")
@@ -117,6 +126,18 @@ class HistoryContextTrackingWrapper(gym.Wrapper):
 
     @property
     def task_context(self) -> np.ndarray:
+        if self.has_external_task_context:
+            context = np.asarray(
+                getattr(self.env, "task_context", None), dtype=np.float32
+            ).reshape(-1)
+            if context.shape != (self.task_context_dim,):
+                raise RuntimeError(
+                    "Wrapped task_context has wrong shape "
+                    f"{context.shape}; expected {(self.task_context_dim,)}"
+                )
+            if not np.isfinite(context).all():
+                raise FloatingPointError("Wrapped task_context contains NaN or Inf")
+            return context
         if self.waypoint_count == 1:
             return self.target_tip
         waypoints = np.asarray(
