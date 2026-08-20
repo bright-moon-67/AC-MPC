@@ -126,6 +126,7 @@ class HistoryKoopmanMPCPolicy(nn.Module):
     """
 
     TASK_CONTEXT_DIM = 6
+    KINEMATIC_PUSH_TASK_CONTEXT_DIM = 33
     ACTION_DISTRIBUTION = "diagonal_normal_v1"
 
     def __init__(
@@ -137,6 +138,7 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         state_std: torch.Tensor,
         *,
         waypoint_count: int = 1,
+        task_mode: str = "tracking",
         tip_indices: tuple[int, int, int] = (30, 31, 32),
         log_std_init: float = -3.0,
     ) -> None:
@@ -149,17 +151,24 @@ class HistoryKoopmanMPCPolicy(nn.Module):
             raise ValueError("Actor physical dimension does not match Koopman state")
         if actor.action_dim != koopman.action_dim:
             raise ValueError("Actor action dimension does not match Koopman action")
+        if task_mode not in {"tracking", "kinematic_push"}:
+            raise ValueError(f"Unsupported history MPC task_mode: {task_mode}")
         if waypoint_count < 1:
             raise ValueError("waypoint_count must be positive")
+        self.task_mode = str(task_mode)
         self.waypoint_count = int(waypoint_count)
-        self.task_observation_dim = (
-            3 if self.waypoint_count == 1 else 4 * self.waypoint_count
-        )
-        self.task_context_dim = (
-            self.TASK_CONTEXT_DIM
-            if self.waypoint_count == 1
-            else self.task_observation_dim
-        )
+        if self.task_mode == "kinematic_push":
+            self.task_observation_dim = self.KINEMATIC_PUSH_TASK_CONTEXT_DIM
+            self.task_context_dim = self.KINEMATIC_PUSH_TASK_CONTEXT_DIM
+        else:
+            self.task_observation_dim = (
+                3 if self.waypoint_count == 1 else 4 * self.waypoint_count
+            )
+            self.task_context_dim = (
+                self.TASK_CONTEXT_DIM
+                if self.waypoint_count == 1
+                else self.task_observation_dim
+            )
         if actor.context_dim != self.task_context_dim:
             raise ValueError(
                 f"Actor context_dim must be {self.task_context_dim}"
@@ -249,7 +258,28 @@ class HistoryKoopmanMPCPolicy(nn.Module):
         lifted = self.koopman.lift(normalized_state, split.history_context)
         tip_mean = self.state_mean[self.tip_indices]
         tip_std = self.state_std[self.tip_indices]
-        if self.waypoint_count == 1:
+        if self.task_mode == "kinematic_push":
+            # Raw layout is documented in KinematicPushTask.context.  Keep the
+            # actor input at the same fixed 32-D size but put heterogeneous
+            # coordinates on useful scales.  Only the active tip target enters
+            # the explicit MPC reference; all remaining object/obstacle/phase
+            # features condition the learned Q/p/R cost map.
+            task = split.task_context
+            actor_context = task.clone()
+            for start in (0, 3, 9, 12):
+                actor_context[..., start : start + 3] = (
+                    task[..., start : start + 3] - tip_mean
+                ) / tip_std
+            actor_context[..., 6:9] = task[..., 6:9] / 0.5
+            actor_context[..., 15:18] = task[..., 15:18] / 0.5
+            actor_context[..., 18:24] = task[..., 18:24] / 0.5
+            actor_context[..., 24:25] = task[..., 24:25] / 0.5
+            active_target = actor_context[..., 0:3]
+            action_reference = normalized_state.new_zeros(
+                *normalized_state.shape[:-1],
+                self.action_dim,
+            )
+        elif self.waypoint_count == 1:
             normalized_target = (split.task_context - tip_mean) / tip_std
             normalized_tip = normalized_state[..., self.tip_indices]
             target_error = normalized_target - normalized_tip

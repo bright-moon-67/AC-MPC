@@ -32,6 +32,8 @@ class FixedCostHistoryKoopmanMPC:
         track_tip_only: bool = False,
         tip_indices: tuple[int, int, int] = (30, 31, 32),
         tip_state_scale: float = 5.0,
+        tip_axis_scales: tuple[float, float, float] | None = None,
+        physical_state_scales: np.ndarray | None = None,
         qp_max_iterations: int = 4000,
         qp_absolute_tolerance: float = 1e-5,
         qp_relative_tolerance: float = 1e-5,
@@ -72,12 +74,28 @@ class FixedCostHistoryKoopmanMPC:
             raise ValueError("Action limits do not match the Koopman action dimension")
 
         tip_index_array = np.asarray(tip_indices, dtype=np.int64)
-        state_scales = np.ones(self.physical_dim, dtype=np.float64)
-        if track_tip_only:
-            state_scales.fill(0.0)
-            state_scales[tip_index_array] = 1.0
+        if physical_state_scales is not None:
+            state_scales = np.asarray(
+                physical_state_scales, dtype=np.float64
+            ).reshape(-1)
+            if state_scales.shape != (self.physical_dim,):
+                raise ValueError("physical_state_scales has the wrong shape")
+            if np.any(state_scales < 0) or not np.isfinite(state_scales).all():
+                raise ValueError("physical_state_scales must be finite and non-negative")
         else:
-            state_scales[tip_index_array] = float(tip_state_scale)
+            state_scales = np.ones(self.physical_dim, dtype=np.float64)
+            if track_tip_only:
+                state_scales.fill(0.0)
+                state_scales[tip_index_array] = 1.0
+            else:
+                state_scales[tip_index_array] = float(tip_state_scale)
+            if tip_axis_scales is not None:
+                axis_scales = np.asarray(tip_axis_scales, dtype=np.float64)
+                if axis_scales.shape != (3,) or np.any(axis_scales <= 0):
+                    raise ValueError(
+                        "tip_axis_scales must contain three positive values"
+                    )
+                state_scales[tip_index_array] = axis_scales
         self.state_scales = state_scales
 
         A = model.A.detach().cpu().double().numpy()
