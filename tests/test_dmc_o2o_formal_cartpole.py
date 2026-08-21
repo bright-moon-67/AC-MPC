@@ -8,6 +8,7 @@ from experiments.dmc.o2o.formal_cartpole import FORMAL_METHODS, FORMAL_TRAINING_
 from experiments.dmc.o2o.formal_cartpole_dataset import selected_episode_indices
 from experiments.dmc.o2o.formal_cartpole_koopman import training_command as koopman_command
 from experiments.dmc.o2o.formal_cartpole_watcher import archive_checkpoints
+from experiments.dmc.o2o.formal_cartpole_results import training_seed_statistics
 from experiments.playground.train_koopman import _differentiable_spectral_radius
 
 
@@ -56,3 +57,10 @@ def test_gpu_safe_spectral_radius_estimator() -> None:
     assert abs(estimate - 0.97) < 1e-4
     gradient = jax.grad(_differentiable_spectral_radius)(matrix)
     assert np.isfinite(np.asarray(gradient)).all()
+
+
+def test_cartpole_formal_training_seed_statistics() -> None:
+    summary = training_seed_statistics([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert summary["mean"] == 3.0
+    assert summary["sample_std"] == np.std([1, 2, 3, 4, 5], ddof=1)
+    assert summary["ci95_student_t"][0] < 3.0 < summary["ci95_student_t"][1]
