@@ -41,6 +41,7 @@ from experiments.dmc.o2o.networks import (
 from experiments.dmc.o2o import train as train_module
 from experiments.dmc.o2o.train import (
     _load_offline_fork,
+    _pending_trajectory_state,
     _truncate_metrics_to_checkpoint,
     _validate_resume,
 )
@@ -1414,6 +1415,36 @@ def test_unified_mpve_owns_offline_pretraining_and_rejects_forks(
         koopman,
         environment_protocol,
     )
+    empty_pending = {key: [] for key in train_module._PENDING_KEYS}
+    assert _pending_trajectory_state(empty_pending) == {
+        "kind": "calql_pending_trajectory_v1",
+        "count": 0,
+        "arrays": {},
+    }
+    legacy_empty = copy.deepcopy(checkpoint)
+    legacy_empty["online_pending_trajectory"]["arrays"] = {
+        key: np.empty((0,), dtype=np.float32)
+        for key in train_module._PENDING_KEYS
+    }
+    _validate_resume(
+        legacy_empty,
+        target_config,
+        dataset,
+        koopman,
+        environment_protocol,
+    )
+    invalid_pending = copy.deepcopy(legacy_empty)
+    invalid_pending["online_pending_trajectory"]["arrays"]["reward"] = np.ones(
+        (1,), dtype=np.float32
+    )
+    with pytest.raises(ValueError, match="unfinished trajectory"):
+        _validate_resume(
+            invalid_pending,
+            target_config,
+            dataset,
+            koopman,
+            environment_protocol,
+        )
     forked = copy.deepcopy(checkpoint)
     forked["initialization"] = {"kind": "acmpc_o2o_offline_fork_v1"}
     with pytest.raises(ValueError, match="Non-forking method"):

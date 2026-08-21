@@ -72,6 +72,8 @@ def _pending_trajectory_state(
     if len(set(lengths.values())) != 1:
         raise ValueError("Pending Cal-QL trajectory field lengths disagree")
     count = next(iter(lengths.values()))
+    if count == 0:
+        return {"kind": "calql_pending_trajectory_v1", "count": 0, "arrays": {}}
     arrays = {
         "observation": np.asarray(pending["observation"], dtype=np.float32),
         "action": np.asarray(pending["action"], dtype=np.float32),
@@ -387,7 +389,15 @@ def _validate_resume(
     # ``latest.pt`` is deliberately written only at synchronized reset
     # boundaries.  Restoring a partial trajectory without simulator state
     # would be invalid, so a resumable checkpoint must be empty here.
-    if pending.get("count") != 0 or pending.get("arrays") != {}:
+    pending_count = pending.get("count")
+    pending_arrays = pending.get("arrays")
+    legacy_empty_arrays = (
+        pending_count == 0
+        and isinstance(pending_arrays, dict)
+        and set(pending_arrays) == set(_PENDING_KEYS)
+        and all(np.asarray(value).size == 0 for value in pending_arrays.values())
+    )
+    if pending_count != 0 or (pending_arrays != {} and not legacy_empty_arrays):
         raise ValueError("Resumable checkpoint contains an unfinished trajectory")
     initialization = payload.get("initialization")
     if config.requires_offline_fork and require_initialization:
