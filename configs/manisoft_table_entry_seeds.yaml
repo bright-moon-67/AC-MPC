@@ -1,0 +1,97 @@
+# Static activation seeds are converted into slow minimum-jerk bends and then
+# independently replayed in the current gravity-enabled PyElastica scenario.
+# They are merely search seeds: only trajectories passing endpoint, stability,
+# action-rate, and whole-arm/table clearance checks enter the generated bank.
+table:
+  # Selected by a full-arm clearance sweep. The lower top and nearer front
+  # edge expose the z=0.45--0.52 m operating band without intersecting the rod.
+  x_bounds: [-0.55, 0.55]
+  y_bounds: [0.42, 0.86]
+  surface_z: 0.36
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+workspace:
+  low: [-0.30, 0.50, 0.445]
+  high: [0.30, 0.80, 0.54]
+  # The certified left entry settles at 0.9007 m from the base. 0.91 m keeps
+  # a 9 cm margin to the actual 1 m rod length while avoiding an artificial
+  # rejection at the old rounded 0.90 m cutoff.
+  max_reach: 0.91
+
+motion:
+  ramp_steps: 300
+  hold_steps: 100
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.002
+  maximum_replay_tip_error: 0.00002
+
+seeds:
+  # Source IDs document how the static activation was discovered. Runtime
+  # generation has no dependency on the source episode or Koopman dataset.
+  - name: right_entry
+    source: exploration_episode_406
+    align_rotation_degrees: 158.52
+    rotation_offset_degrees: -20.0
+    action:
+      [0.07322716, -0.17204455, -0.02647009,
+       0.18984915, -0.10532530, -0.10413968,
+       0.25258970, 0.04338277, -0.23487107,
+       0.29999998, 0.16541147, -0.02697558,
+       0.28649822, 0.20384784, 0.07471012,
+       0.21168624, 0.14071658, 0.11940411]
+  - name: right_center_entry
+    source: exploration_episode_406
+    align_rotation_degrees: 158.52
+    rotation_offset_degrees: -10.0
+    action:
+      [0.07322716, -0.17204455, -0.02647009,
+       0.18984915, -0.10532530, -0.10413968,
+       0.25258970, 0.04338277, -0.23487107,
+       0.29999998, 0.16541147, -0.02697558,
+       0.28649822, 0.20384784, 0.07471012,
+       0.21168624, 0.14071658, 0.11940411]
+  - name: left_center_entry
+    source: exploration_episode_604
+    align_rotation_degrees: 117.95
+    rotation_offset_degrees: 10.0
+    action:
+      [0.23657766, 0.03449283, 0.08052858,
+       0.10780812, 0.25081265, 0.08864136,
+       -0.02915447, 0.24983288, 0.08788547,
+       0.00761871, 0.19984151, 0.10224239,
+       0.19844860, 0.23354773, 0.05832694,
+       0.24490176, 0.20121911, -0.02573508]
+  - name: left_entry
+    source: exploration_episode_604
+    align_rotation_degrees: 117.95
+    rotation_offset_degrees: 20.0
+    action:
+      [0.23657766, 0.03449283, 0.08052858,
+       0.10780812, 0.25081265, 0.08864136,
+       -0.02915447, 0.24983288, 0.08788547,
+       0.00761871, 0.19984151, 0.10224239,
+       0.19844860, 0.23354773, 0.05832694,
+       0.24490176, 0.20121911, -0.02573508]
+  - name: low_right_entry
+    source: exploration_episode_258
+    align_rotation_degrees: -55.088867
+    rotation_offset_degrees: -15.0
+    action:
+      [-0.06607236, -0.10127203, 0.09496418,
+       -0.07207602, -0.04477362, 0.15215166,
+       -0.19235948, -0.12108730, 0.18867970,
+       -0.23989178, -0.29774427, -0.05157010,
+       -0.20974284, -0.28740817, -0.17020564,
+       -0.11077245, -0.25518245, -0.13135646]
+  - name: low_left_entry
+    source: exploration_episode_258
+    align_rotation_degrees: -55.088867
+    rotation_offset_degrees: 20.0
+    action:
+      [-0.06607236, -0.10127203, 0.09496418,
+       -0.07207602, -0.04477362, 0.15215166,
+       -0.19235948, -0.12108730, 0.18867970,
+       -0.23989178, -0.29774427, -0.05157010,
+       -0.20974284, -0.28740817, -0.17020564,
+       -0.11077245, -0.25518245, -0.13135646]

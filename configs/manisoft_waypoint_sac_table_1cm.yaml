@@ -1,0 +1,42 @@
+environment:
+  curriculum: table_point
+  # 30 s at 50 Hz: enough for a 0.5--0.9 m gated descent even at 0.04 m/s.
+  episode_steps: 1500
+  absolute_action_limit: 0.30
+  max_action_delta: 0.01
+  workspace_low: [-0.30, 0.38, 0.445]
+  workspace_high: [0.30, 0.72, 0.56]
+  max_reach: 0.90
+  tracking_guard: 0.030
+  lookahead_distance: 0.040
+  # Final endpoint must remain inside 1 cm for eight consecutive frames.
+  success_threshold: 0.010
+  success_streak: 8
+  table_surface_z: 0.39
+  minimum_tip_z: 0.405
+  min_desired_speed: 0.040
+  max_desired_speed: 0.070
+  requested_rate_penalty_scale: 0.01
+  terminal_precision_scale: 0.50
+  terminal_distance_penalty_scale: 0.20
+
+sac:
+  learning_rate: 0.0001
+  buffer_size: 2000000
+  learning_starts: 20000
+  batch_size: 512
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  # With 16 vector environments, two updates per vector step preserve the
+  # original one-gradient-update-per-eight-transitions ratio.
+  gradient_steps: 2
+  net_arch: [256, 256, 256]
+
+training:
+  total_timesteps: 1000000
+  num_envs: 16
+  checkpoint_freq: 100000
+  eval_freq: 100000
+  eval_episodes: 5
+  save_replay_buffer: false

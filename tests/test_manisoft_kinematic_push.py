@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import yaml
 
 from antmaze_ac.envs.kinematic_push_task import (
     KinematicPushConfig,
@@ -108,3 +111,33 @@ def test_route_contact_follow_and_success() -> None:
     result = task.update(push_tip, _safe_nodes(push_tip), 0.0)
     assert result["success"]
     np.testing.assert_allclose(task.target_center[:2], task.goal_center[:2])
+
+
+def test_revised_project_scene_fits_table_and_routes_around_obstacle() -> None:
+    scenario_path = Path(
+        "/root/autodl-tmp/ManiSoft/configs/push_around_obstacle_kinematic.yaml"
+    )
+    payload = yaml.safe_load(scenario_path.read_text(encoding="utf-8"))
+    config = KinematicPushConfig.from_dict(payload["task"])
+    np.testing.assert_allclose(
+        config.obstacle_maximum - config.obstacle_minimum,
+        [0.10, 0.15, 0.05],
+    )
+    assert config.obstacle_minimum[2] == config.table_surface_z
+    target_half = config.target_size * 0.5
+    for center in (config.target_initial_center, config.goal_center):
+        assert config.table_x_bounds[0] <= center[0] - target_half[0]
+        assert center[0] + target_half[0] <= config.table_x_bounds[1]
+        assert config.table_y_bounds[0] <= center[1] - target_half[1]
+        assert center[1] + target_half[1] <= config.table_y_bounds[1]
+        assert np.isclose(center[2] - target_half[2], config.table_surface_z)
+    for side in (-1, 1):
+        task = KinematicPushTask(config)
+        task.reset([0.0, 0.0, 1.0], route_side=side)
+        route = np.vstack(([0.0, 0.0, 1.0], task.route_waypoints()))
+        assert not polyline_intersects_aabb(
+            route,
+            config.obstacle_minimum,
+            config.obstacle_maximum,
+            padding=config.tip_radius,
+        )
