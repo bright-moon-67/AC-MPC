@@ -1,0 +1,79 @@
+environment:
+  # Ordered local multi-point tracking.  Each internal corner must be entered
+  # within 1 cm before progress can continue onto the next straight segment.
+  curriculum: table_waypoint_polyline
+  episode_steps: 1000
+  absolute_action_limit: 0.30
+  max_action_delta: 0.008
+  action_mode: table_cartesian_delta
+  equilibrium_rotation_degrees: 4.0
+  equilibrium_xy_scale_delta: 0.03
+  table_action_calibration_path: data/processed/manisoft_table_action_calibration_v1/calibration_1cm.npz
+  cartesian_action_step_scale: 0.025
+  cartesian_action_leak: 0.008
+  workspace_low: [-0.30, 0.50, 0.445]
+  workspace_high: [0.30, 0.80, 0.54]
+  max_reach: 0.91
+  waypoint_segment_count_range: [2, 3]
+  waypoint_segment_length_range: [0.012, 0.022]
+  waypoint_maximum_extent: 0.035
+  waypoint_maximum_turn_degrees: 90.0
+  waypoint_vertical_delta_range: [0.0, 0.0]
+  waypoint_single_line_probability: 0.40
+  internal_waypoint_capture_radius: 0.010
+  internal_waypoint_bonus: 1.0
+  tracking_guard: 0.020
+  target_lead_distance: 0.008
+  lookahead_distance: 0.018
+  maximum_projection_advance: 0.015
+  projection_backtrack: 0.003
+  success_threshold: 0.010
+  success_streak: 8
+  terminal_capture_radius: 0.018
+  stall_grace_steps: 140
+  stall_window_steps: 350
+  stall_progress_epsilon: 0.0004
+  table_surface_z: 0.36
+  minimum_tip_z: 0.415
+  table_x_bounds: [-0.55, 0.55]
+  table_y_bounds: [0.42, 0.86]
+  arm_radius: 0.050
+  table_safety_margin: 0.005
+  enforce_whole_arm_table_clearance: true
+  entry_bank_path: data/processed/manisoft_table_entry_bank_v1/entry_bank.npz
+  min_desired_speed: 0.012
+  max_desired_speed: 0.035
+  entry_mid_anchor_probability: 0.0
+  entry_mid_advance_fraction_range: [0.30, 0.55]
+  entry_mid_anchor_fraction_range: [0.55, 0.85]
+  entry_anchor_probability: 0.0
+  entry_anchor_fraction_range: [0.30, 0.65]
+  requested_rate_penalty_scale: 0.002
+  policy_action_penalty_scale: 0.005
+  endpoint_progress_scale: 0.0
+  terminal_precision_scale: 2.0
+  terminal_distance_penalty_scale: 1.0
+  table_violation_penalty: 300.0
+  terminal_settle_steps: 150
+  terminal_timeout_penalty: 75.0
+
+sac:
+  learning_rate: 0.00001
+  buffer_size: 1000000
+  learning_starts: 20000
+  batch_size: 2048
+  tau: 0.005
+  gamma: 0.997
+  train_freq: 1
+  gradient_steps: 8
+  ent_coef: auto_0.05
+  target_entropy: -1.0
+  net_arch: [256, 256, 256]
+
+training:
+  total_timesteps: 120000
+  num_envs: 28
+  checkpoint_freq: 30000
+  eval_freq: 30000
+  eval_episodes: 36
+  save_replay_buffer: false

@@ -37,6 +37,7 @@ wandb/
 # Local research notes and generated reports are never published. Keep the
 # maintained ManiSoft runbooks as the opt-in documents in this directory.
 /docs/*
+!/docs/manisoft_waypoint_sac.md
 !/docs/manisoft_bc_kmpc.md
 !/docs/manisoft_history_mlp_baseline.md
 !/docs/kmpc_v15e_vs_upstream_cost_and_solver.md

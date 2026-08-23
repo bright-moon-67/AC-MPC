@@ -1,0 +1,81 @@
+environment:
+  # Pure SAC curriculum: short suffix -> longer suffix -> complete physical
+  # entry -> table-local motion -> joined path. No reference actions enter SAC.
+  curriculum: mixed
+  episode_steps: 1800
+  absolute_action_limit: 0.30
+  # 0.015 can drive an untrained random policy into PyElastica divergence on
+  # a moving bent-state reset. 0.008 still permits fast control changes while
+  # keeping pure-SAC warm-up rollouts numerically recoverable.
+  max_action_delta: 0.008
+  workspace_low: [-0.30, 0.50, 0.445]
+  workspace_high: [0.30, 0.80, 0.54]
+  max_reach: 0.91
+  tracking_guard: 0.030
+  target_lead_distance: 0.012
+  lookahead_distance: 0.035
+  maximum_projection_advance: 0.040
+  projection_backtrack: 0.010
+  success_threshold: 0.010
+  success_streak: 8
+  # Projection alone is insufficient: a tip several centimetres off the path
+  # can project onto its last segment. Enter terminal settling only after the
+  # real endpoint lies inside this capture ball.
+  terminal_capture_radius: 0.025
+  stall_grace_steps: 120
+  stall_window_steps: 300
+  stall_progress_epsilon: 0.001
+  table_surface_z: 0.36
+  minimum_tip_z: 0.415
+  table_x_bounds: [-0.55, 0.55]
+  table_y_bounds: [0.42, 0.86]
+  arm_radius: 0.050
+  table_safety_margin: 0.005
+  enforce_whole_arm_table_clearance: true
+  entry_bank_path: data/processed/manisoft_table_entry_bank_v1/entry_bank.npz
+  min_desired_speed: 0.015
+  max_desired_speed: 0.10
+  # Early entry_mid failures are roughly three times longer than successful
+  # suffix episodes and otherwise dominate the transition replay buffer. Keep
+  # certified bridge/tail anchors at the episode source while still exposing
+  # every worker to the new 30%-55% segment. Explicit evaluation fractions
+  # bypass this sampler.
+  entry_mid_anchor_probability: 0.75
+  entry_mid_advance_fraction_range: [0.30, 0.55]
+  entry_mid_anchor_fraction_range: [0.55, 0.85]
+  # The selected entry_mid policy already solves all six exact upright starts
+  # at low/medium speed; only high-speed terminal settling remains weak.  Keep
+  # most reset mass on certified 30%-65% suffixes so continued training cannot
+  # erase that behavior, while 15% exact upright episodes still traverse the
+  # complete path and train the high-speed endpoint failure.
+  entry_anchor_probability: 0.85
+  entry_anchor_fraction_range: [0.30, 0.65]
+  requested_rate_penalty_scale: 0.005
+  endpoint_progress_scale: 0.0
+  terminal_precision_scale: 0.75
+  terminal_distance_penalty_scale: 0.30
+  # Hard termination must not be cheaper than attempting a longer entry
+  # rollout. A -10 penalty produced deliberate early table contacts in the
+  # entry_tail -> entry_mid transfer pilot.
+  table_violation_penalty: 300.0
+  terminal_settle_steps: 150
+  terminal_timeout_penalty: 50.0
+
+sac:
+  learning_rate: 0.0002
+  buffer_size: 1500000
+  learning_starts: 5000
+  batch_size: 512
+  tau: 0.005
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 1
+  net_arch: [256, 256, 256]
+
+training:
+  total_timesteps: 1000000
+  num_envs: 8
+  checkpoint_freq: 100000
+  eval_freq: 100000
+  eval_episodes: 5
+  save_replay_buffer: false
