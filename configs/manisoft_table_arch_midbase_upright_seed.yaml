@@ -1,0 +1,36 @@
+table:
+  x_bounds: [0.15, 0.65]
+  y_bounds: [0.28, 0.72]
+  surface_z: 0.36
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+workspace:
+  low: [-0.01, -0.01, 1.54]
+  high: [0.01, 0.01, 1.71]
+  max_reach: 2.0
+
+motion:
+  ramp_steps: 100
+  hold_steps: 300
+  stability_tail_steps: 100
+  absolute_action_limit: 0.60
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.0001
+  maximum_replay_tip_error: 0.00002
+  maximum_tip_downward_angle_degrees: 180.0
+  # Straight rods can report a few 1e-8 m of negative roundoff here.
+  minimum_arch_height: -0.000001
+
+seeds:
+  - name: midbase_upright_search_origin
+    source: zero_activation_settled_state
+    align_rotation_degrees: 0.0
+    rotation_offset_degrees: 0.0
+    action:
+      [0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0]

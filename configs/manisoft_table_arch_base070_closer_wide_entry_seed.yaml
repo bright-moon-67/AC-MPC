@@ -1,0 +1,37 @@
+table:
+  # Move the usable table footprint towards the arm base and make it wide
+  # enough to cover every currently certified angle-60 pose-map sample.
+  x_bounds: [0.00, 0.65]
+  y_bounds: [0.10, 0.68]
+  surface_z: 0.34
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+workspace:
+  low: [0.02, 0.12, 0.395]
+  high: [0.63, 0.66, 0.54]
+  max_reach: 1.20
+
+motion:
+  ramp_steps: 600
+  hold_steps: 1000
+  stability_tail_steps: 300
+  absolute_action_limit: 0.60
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.002
+  maximum_replay_tip_error: 0.00002
+  maximum_tip_downward_angle_degrees: 15.0
+  minimum_arch_height: 0.40
+
+seeds:
+  - name: base070_closer_wide_entry
+    source: base070_wide_table_pose_map_index_60
+    align_rotation_degrees: 0.0
+    rotation_offset_degrees: 0.0
+    action:
+      [-0.40174681, -0.08687500, 0.02790844,
+       0.22441182, -0.00481803, -0.00962044,
+       -0.50241590, 0.60000000, 0.28981274,
+       -0.16633953, 0.14972329, -0.39931685,
+       -0.53790700, 0.60000000, -0.07694412,
+       -0.54633296, 0.50687879, 0.28598031]

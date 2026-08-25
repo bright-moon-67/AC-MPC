@@ -1,0 +1,38 @@
+# Ground-mounted ManiSoft entry for the 0.15 m tabletop branch.
+# The action was found without a terminal-orientation objective and is
+# independently replayed/certified by generate_manisoft_table_entry_bank.py.
+table:
+  x_bounds: [-0.55, 0.55]
+  y_bounds: [0.42, 0.86]
+  surface_z: 0.15
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+workspace:
+  low: [-0.10, 0.64, 0.205]
+  high: [0.10, 0.74, 0.255]
+  max_reach: 1.0
+
+motion:
+  absolute_action_limit: 1.0
+  ramp_steps: 400
+  hold_steps: 200
+  stability_tail_steps: 160
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.001
+  maximum_replay_tip_error: 0.00002
+  maximum_tip_downward_angle_degrees: 180.0
+  minimum_arch_height: 0.0
+
+seeds:
+  - name: ground015_center
+    source: search_center_limit100_candidate_118
+    align_rotation_degrees: 0.0
+    rotation_offset_degrees: 0.0
+    action:
+      [0.48438960, -0.22947502, -0.26166984,
+       0.60082513,  0.43450856,  0.04257604,
+      -0.00513055,  0.42257974,  0.28103945,
+      -0.48444405,  0.45491028, -0.18830399,
+      -0.51285106, -0.06447458, -0.19841926,
+      -0.72908312, -0.54468042, -0.07802872]

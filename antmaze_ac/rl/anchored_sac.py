@@ -22,6 +22,8 @@ class AnchoredSAC(SAC):
 
     anchor_actor = None
     actor_anchor_coef = 0.0
+    source_policy_warmup = False
+    actor_learning_starts = 0
 
     def enable_actor_anchor(self, coefficient: float) -> None:
         if coefficient <= 0:
@@ -32,8 +34,49 @@ class AnchoredSAC(SAC):
         for parameter in self.anchor_actor.parameters():
             parameter.requires_grad_(False)
 
+    def enable_source_policy_warmup(self) -> None:
+        """Collect a new curriculum buffer without uniform random actions.
+
+        SB3 normally samples the entire action box before ``learning_starts``.
+        That is appropriate for a fresh low-dimensional policy, but unsafe for
+        an 18-D soft-arm residual policy transferred to a nearby curriculum.
+        Use the loaded source actor deterministically during that buffer-only
+        phase; standard stochastic SAC actions resume once learning starts.
+        """
+
+        self.source_policy_warmup = True
+
+    def delay_actor_updates_until(self, timestep: int) -> None:
+        if timestep < self.num_timesteps:
+            raise ValueError("actor update timestep cannot be in the past")
+        self.actor_learning_starts = int(timestep)
+
+    def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
+        if self.source_policy_warmup and self.num_timesteps < learning_starts:
+            assert self._last_obs is not None, "last observation is unavailable"
+            unscaled_action, _ = self.predict(
+                self._last_obs, deterministic=True
+            )
+            scaled_action = self.policy.scale_action(unscaled_action)
+            if action_noise is not None:
+                scaled_action = np.clip(
+                    scaled_action + action_noise(), -1.0, 1.0
+                )
+            buffer_action = scaled_action
+            action = self.policy.unscale_action(scaled_action)
+            return action, buffer_action
+        return super()._sample_action(
+            learning_starts,
+            action_noise=action_noise,
+            n_envs=n_envs,
+        )
+
     def _excluded_save_params(self) -> list[str]:
-        return super()._excluded_save_params() + ["anchor_actor"]
+        return super()._excluded_save_params() + [
+            "anchor_actor",
+            "source_policy_warmup",
+            "actor_learning_starts",
+        ]
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         if self.anchor_actor is None or self.actor_anchor_coef <= 0:
@@ -111,28 +154,46 @@ class AnchoredSAC(SAC):
             critic_loss.backward()
             self.critic.optimizer.step()
 
-            q_values_pi = th.cat(
-                self.critic(replay_data.observations, actions_pi), dim=1
-            )
-            min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
-            sac_actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-            current_mean_action = self.actor(
-                replay_data.observations, deterministic=True
-            )
-            with th.no_grad():
-                source_mean_action = self.anchor_actor(
+            if self.num_timesteps >= self.actor_learning_starts:
+                q_values_pi = th.cat(
+                    self.critic(replay_data.observations, actions_pi), dim=1
+                )
+                min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+                sac_actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+                current_mean_action = self.actor(
                     replay_data.observations, deterministic=True
                 )
-            anchor_loss = F.mse_loss(current_mean_action, source_mean_action)
-            actor_loss = sac_actor_loss + self.actor_anchor_coef * anchor_loss
+                with th.no_grad():
+                    source_mean_action = self.anchor_actor(
+                        replay_data.observations, deterministic=True
+                    )
+                anchor_loss = F.mse_loss(
+                    current_mean_action, source_mean_action
+                )
+                actor_loss = (
+                    sac_actor_loss + self.actor_anchor_coef * anchor_loss
+                )
 
-            actor_losses.append(float(actor_loss.item()))
-            sac_actor_losses.append(float(sac_actor_loss.item()))
-            anchor_losses.append(float(anchor_loss.item()))
-            anchor_action_rmses.append(float(th.sqrt(anchor_loss).item()))
-            self.actor.optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor.optimizer.step()
+                actor_losses.append(float(actor_loss.item()))
+                sac_actor_losses.append(float(sac_actor_loss.item()))
+                anchor_losses.append(float(anchor_loss.item()))
+                anchor_action_rmses.append(float(th.sqrt(anchor_loss).item()))
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor.optimizer.step()
+            else:
+                with th.no_grad():
+                    current_mean_action = self.actor(
+                        replay_data.observations, deterministic=True
+                    )
+                    source_mean_action = self.anchor_actor(
+                        replay_data.observations, deterministic=True
+                    )
+                    anchor_loss = F.mse_loss(
+                        current_mean_action, source_mean_action
+                    )
+                anchor_losses.append(float(anchor_loss.item()))
+                anchor_action_rmses.append(float(th.sqrt(anchor_loss).item()))
 
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(
@@ -145,8 +206,15 @@ class AnchoredSAC(SAC):
         self._n_updates += gradient_steps
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
-        self.logger.record("train/actor_loss", np.mean(actor_losses))
-        self.logger.record("train/actor_sac_loss", np.mean(sac_actor_losses))
+        self.logger.record(
+            "train/actor_update_active",
+            float(self.num_timesteps >= self.actor_learning_starts),
+        )
+        if actor_losses:
+            self.logger.record("train/actor_loss", np.mean(actor_losses))
+            self.logger.record(
+                "train/actor_sac_loss", np.mean(sac_actor_losses)
+            )
         self.logger.record("train/actor_anchor_loss", np.mean(anchor_losses))
         self.logger.record(
             "train/actor_anchor_action_rmse", np.mean(anchor_action_rmses)

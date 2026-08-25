@@ -1,0 +1,111 @@
+# Ground-mounted, centerline-table SAC branch for low tabletop polylines.
+# The simulator's original 45-D physical state is unchanged.  No terminal
+# orientation constraint is used; the only geometric safety constraint is
+# whole-arm clearance from the 0.15 m tabletop.
+environment:
+  curriculum: table_waypoint_polyline
+  episode_steps: 12000
+  absolute_action_limit: 1.0
+  max_action_delta: 0.00075
+  action_mode: table_pose_residual
+  observation_mode: legacy70
+  table_pose_map_path: data/processed/manisoft_table_ground015_high_pose_map_v1/pose_map.npz
+  # All 478 vertices are long-hold certified.  In nearest-neighbour mode the
+  # actuator request never interpolates across a sparse hull gap, so an edge
+  # length cutoff would only make otherwise usable centre paths fail reset.
+  pose_map_interpolation_mode: barycentric
+  equilibrium_path_prior_weight: 1.0
+  # Low-table stage: keep exploration inside the static pose map's clearance
+  # reserve.  Residual authority can be widened after the first safe policy.
+  equilibrium_path_residual_scale: 0.005
+
+  # Start from the well-covered centre instead of forcing the sparse hull
+  # boundary into the first long run.  The pose-map triangulation remains the
+  # final authority and rejects any sampled chord that crosses an invalid gap.
+  workspace_low: [-0.130, 0.590, 0.235]
+  workspace_high: [0.170, 0.790, 0.255]
+  max_reach: 1.0
+  waypoint_segment_count_range: [5, 8]
+  waypoint_segment_count_probabilities: [0.15, 0.30, 0.35, 0.20]
+  waypoint_segment_length_range: [0.050, 0.150]
+  waypoint_maximum_extent: 0.160
+  # Every non-initial segment turns by 60--120 degrees, so 90-degree corners
+  # are central to the training distribution instead of rare edge cases.
+  waypoint_minimum_turn_degrees: 60.0
+  waypoint_maximum_turn_degrees: 120.0
+  waypoint_vertical_delta_range: [0.0, 0.0]
+  waypoint_single_line_probability: 0.0
+
+  # Track XY accurately while accepting the requested five-centimetre Z band.
+  tracking_vertical_tolerance: 0.025
+  internal_waypoint_capture_radius: 0.012
+  internal_waypoint_bonus: 2.0
+  internal_waypoint_progress_scale: 0.50
+  internal_waypoint_distance_penalty_scale: 0.25
+  waypoint_stall_steps: 3200
+  waypoint_stall_distance_epsilon: 0.0002
+  tracking_guard: 0.025
+  cross_track_penalty_scale: 0.20
+  tracking_distance_penalty_scale: 0.10
+  target_lead_distance: 0.008
+  lookahead_distance: 0.018
+  maximum_projection_advance: 0.020
+  projection_backtrack: 0.004
+  success_threshold: 0.012
+  success_streak: 8
+  terminal_capture_radius: 0.022
+  stall_grace_steps: 800
+  stall_window_steps: 3600
+  stall_progress_epsilon: 0.0002
+
+  table_surface_z: 0.15
+  minimum_tip_z: 0.200
+  table_x_bounds: [-0.55, 0.55]
+  table_y_bounds: [0.42, 0.86]
+  arm_radius: 0.050
+  table_safety_margin: 0.000
+  # One millimetre only absorbs segment/AABB discretization noise; signed
+  # clearance remains visible in logs and larger penetration still terminates.
+  table_clearance_violation_tolerance: 0.001
+  # First tracking stage intentionally ignores slight arm/table overlap.  The
+  # terminal height floor remains active; restore this guard after lowering
+  # the tabletop in the manipulation scene.
+  enforce_whole_arm_table_clearance: false
+  maximum_tip_orientation_error_degrees: 180.0
+  tip_orientation_penalty_scale: 0.0
+  tip_orientation_violation_penalty: 0.0
+  terminate_on_tip_orientation_violation: false
+  entry_bank_path: data/processed/manisoft_table_ground015_high_entry_v1/entry_bank.npz
+  entry_sampling_weights: [1.0]
+
+  min_desired_speed: 0.006
+  max_desired_speed: 0.012
+  requested_rate_penalty_scale: 0.001
+  policy_action_penalty_scale: 0.050
+  endpoint_progress_scale: 0.0
+  terminal_precision_scale: 3.0
+  terminal_distance_penalty_scale: 2.0
+  table_violation_penalty: 300.0
+  terminal_settle_steps: 800
+  terminal_timeout_penalty: 100.0
+
+sac:
+  learning_rate: 0.00003
+  buffer_size: 1000000
+  learning_starts: 30000
+  batch_size: 2048
+  tau: 0.005
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 8
+  ent_coef: 0.001
+  target_entropy: -9.0
+  net_arch: [256, 256, 256]
+
+training:
+  total_timesteps: 2000000
+  num_envs: 16
+  checkpoint_freq: 50000
+  eval_freq: 50000
+  eval_episodes: 32
+  save_replay_buffer: false

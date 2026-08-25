@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -16,6 +16,7 @@ CURRICULUM_STAGES = (
     "table_point",  # compatibility alias for the corrected entry stage
     "table_local_line",
     "table_waypoint_polyline",
+    "table_long_waypoints",
     "table_local",
     "entry_local",
     "path",
@@ -31,6 +32,10 @@ class WaypointWorkspace:
     low: np.ndarray
     high: np.ndarray
     max_reach: float = 0.90
+    xy_hull_equations: np.ndarray | None = None
+    xy_triangulation: Any | None = None
+    xy_valid_simplices: np.ndarray | None = None
+    interpolation_dimensions: int = 2
 
     @classmethod
     def from_bounds(
@@ -38,6 +43,10 @@ class WaypointWorkspace:
         low: Sequence[float] = (-0.30, 0.50, 0.445),
         high: Sequence[float] = (0.30, 0.80, 0.54),
         max_reach: float = 0.90,
+        xy_hull_equations: np.ndarray | None = None,
+        xy_triangulation: Any | None = None,
+        xy_valid_simplices: np.ndarray | None = None,
+        interpolation_dimensions: int = 2,
     ) -> "WaypointWorkspace":
         low_array = np.asarray(low, dtype=np.float64)
         high_array = np.asarray(high, dtype=np.float64)
@@ -47,7 +56,49 @@ class WaypointWorkspace:
             raise ValueError("workspace low bounds must be below high bounds")
         if max_reach <= 0:
             raise ValueError("max_reach must be positive")
-        return cls(low=low_array, high=high_array, max_reach=float(max_reach))
+        dimensions = int(interpolation_dimensions)
+        if dimensions not in {2, 3}:
+            raise ValueError("interpolation_dimensions must be two or three")
+        equations = (
+            None
+            if xy_hull_equations is None
+            else np.asarray(xy_hull_equations, dtype=np.float64)
+        )
+        if equations is not None and (
+            equations.ndim != 2
+            or equations.shape[1] != dimensions + 1
+            or len(equations) < dimensions + 1
+            or not np.isfinite(equations).all()
+        ):
+            raise ValueError(
+                "hull equations must have shape "
+                f"[N, {dimensions + 1}]"
+            )
+        valid_simplices = (
+            None
+            if xy_valid_simplices is None
+            else np.asarray(xy_valid_simplices, dtype=bool)
+        )
+        if (xy_triangulation is None) != (valid_simplices is None):
+            raise ValueError(
+                "xy triangulation and valid-simplex mask must be provided together"
+            )
+        if valid_simplices is not None and (
+            valid_simplices.ndim != 1
+            or not hasattr(xy_triangulation, "simplices")
+            or len(valid_simplices) != len(xy_triangulation.simplices)
+            or int(getattr(xy_triangulation, "ndim", -1)) != dimensions
+        ):
+            raise ValueError("xy valid-simplex mask does not match triangulation")
+        return cls(
+            low=low_array,
+            high=high_array,
+            max_reach=float(max_reach),
+            xy_hull_equations=equations,
+            xy_triangulation=xy_triangulation,
+            xy_valid_simplices=valid_simplices,
+            interpolation_dimensions=dimensions,
+        )
 
     def contains(self, points: np.ndarray, *, tolerance: float = 1e-7) -> np.ndarray:
         values = np.asarray(points, dtype=np.float64)
@@ -56,7 +107,53 @@ class WaypointWorkspace:
             axis=-1,
         )
         reachable = np.linalg.norm(values, axis=-1) <= self.max_reach + tolerance
-        return bounded & reachable
+        if self.xy_hull_equations is None:
+            inside_hull = True
+        else:
+            dimensions = self.interpolation_dimensions
+            inside_hull = np.all(
+                values[..., :dimensions]
+                @ self.xy_hull_equations[:, :dimensions].T
+                + self.xy_hull_equations[:, dimensions]
+                <= tolerance,
+                axis=-1,
+            )
+        if self.xy_triangulation is None:
+            inside_valid_simplices = True
+        else:
+            dimensions = self.interpolation_dimensions
+            original_shape = values.shape[:-1]
+            flat_coordinates = values[..., :dimensions].reshape(-1, dimensions)
+            simplex = self.xy_triangulation.find_simplex(
+                flat_coordinates, tol=tolerance
+            )
+            inside_hull_flat = simplex >= 0
+            inside = np.zeros(len(simplex), dtype=bool)
+            inside[inside_hull_flat] = self.xy_valid_simplices[
+                simplex[inside_hull_flat]
+            ]
+            # Qhull returns only one simplex on a shared edge. If that choice
+            # is rejected, accept the point when an adjacent valid simplex
+            # contains it within tolerance. This avoids false negatives caused
+            # solely by which side of a certified boundary Qhull reports.
+            unresolved = np.flatnonzero(inside_hull_flat & ~inside)
+            if len(unresolved):
+                valid_indices = np.flatnonzero(self.xy_valid_simplices)
+                transforms = self.xy_triangulation.transform[valid_indices]
+                for point_index in unresolved:
+                    delta = (
+                        flat_coordinates[point_index]
+                        - transforms[:, dimensions]
+                    )
+                    first = np.einsum(
+                        "nij,nj->ni", transforms[:, :dimensions], delta
+                    )
+                    weights = np.column_stack((first, 1.0 - np.sum(first, axis=1)))
+                    inside[point_index] = bool(
+                        np.any(np.all(weights >= -tolerance, axis=1))
+                    )
+            inside_valid_simplices = inside.reshape(original_shape)
+        return bounded & reachable & inside_hull & inside_valid_simplices
 
     def clip(self, point: Sequence[float]) -> np.ndarray:
         clipped = np.clip(np.asarray(point, dtype=np.float64), self.low, self.high)
@@ -93,6 +190,7 @@ class ReferencePath:
     anchors: np.ndarray
     points: np.ndarray
     cumulative_length: np.ndarray
+    generation_mode: str = "direct"
 
     @classmethod
     def from_points(
@@ -100,6 +198,8 @@ class ReferencePath:
         family: str,
         anchors: np.ndarray,
         points: np.ndarray,
+        *,
+        generation_mode: str = "direct",
     ) -> "ReferencePath":
         anchors_array = np.asarray(anchors, dtype=np.float64)
         points_array = np.asarray(points, dtype=np.float64)
@@ -121,6 +221,7 @@ class ReferencePath:
             anchors=anchors_array.astype(np.float32),
             points=points_array.astype(np.float32),
             cumulative_length=cumulative.astype(np.float64),
+            generation_mode=str(generation_mode),
         )
 
     @property
@@ -144,16 +245,36 @@ class ReferencePath:
         *,
         minimum_distance: float = 0.0,
         maximum_distance: float | None = None,
+        coordinate_weights: Sequence[float] | None = None,
     ) -> tuple[float, float, np.ndarray]:
         """Project a point onto a bounded arc-length interval of the path.
 
         Bounding the interval prevents a self-near or returning path segment
-        from falsely awarding a large amount of progress.
+        from falsely awarding a large amount of progress.  Optional coordinate
+        weights change only the projection metric; returned progress remains
+        the original three-dimensional arc length.  In particular, weights
+        ``(1, 1, 0)`` let a table task advance geometrically in XY while the
+        reference height is allowed to vary inside a separate tolerance band.
         """
 
         query = np.asarray(point, dtype=np.float64)
         if query.shape != (3,) or not np.isfinite(query).all():
             raise ValueError("projection point must be a finite 3-D value")
+        weights = (
+            np.ones(3, dtype=np.float64)
+            if coordinate_weights is None
+            else np.asarray(coordinate_weights, dtype=np.float64)
+        )
+        if (
+            weights.shape != (3,)
+            or not np.isfinite(weights).all()
+            or np.any(weights < 0)
+            or not np.any(weights > 0)
+        ):
+            raise ValueError(
+                "coordinate_weights must be a finite non-negative 3-D value "
+                "with at least one positive entry"
+            )
         lower = float(np.clip(minimum_distance, 0.0, self.length))
         upper = self.length if maximum_distance is None else float(
             np.clip(maximum_distance, lower, self.length)
@@ -171,9 +292,16 @@ class ReferencePath:
         candidate_starts = starts[indices]
         candidate_vectors = vectors[indices]
         candidate_lengths = lengths[indices]
+        weighted_vectors = candidate_vectors * weights[None, :]
+        weighted_offsets = (
+            query[None, :] - candidate_starts
+        ) * weights[None, :]
+        weighted_squared_lengths = np.sum(
+            np.square(weighted_vectors), axis=1
+        )
         fractions = np.sum(
-            (query[None, :] - candidate_starts) * candidate_vectors, axis=1
-        ) / np.maximum(candidate_lengths**2, 1e-18)
+            weighted_offsets * weighted_vectors, axis=1
+        ) / np.maximum(weighted_squared_lengths, 1e-18)
         arc_low = np.maximum(
             0.0, (lower - segment_start[indices]) / candidate_lengths
         )
@@ -182,7 +310,9 @@ class ReferencePath:
         )
         fractions = np.clip(fractions, arc_low, arc_high)
         projected_points = candidate_starts + fractions[:, None] * candidate_vectors
-        distances = np.linalg.norm(projected_points - query[None, :], axis=1)
+        distances = np.linalg.norm(
+            (projected_points - query[None, :]) * weights[None, :], axis=1
+        )
         chosen = int(np.argmin(distances))
         distance_along_path = float(
             segment_start[indices[chosen]]
@@ -215,8 +345,12 @@ class WaypointPathGenerator:
         waypoint_segment_count_range: Sequence[int] = (2, 4),
         waypoint_segment_count_probabilities: Sequence[float] | None = None,
         waypoint_segment_length_range: Sequence[float] = (0.015, 0.030),
+        waypoint_first_segment_length_range: Sequence[float] | None = None,
         waypoint_maximum_extent: float = 0.045,
+        waypoint_minimum_turn_degrees: float = 0.0,
         waypoint_maximum_turn_degrees: float = 135.0,
+        waypoint_hard_turn_probability: float = 0.0,
+        waypoint_hard_turn_range_degrees: Sequence[float] = (120.0, 175.0),
         waypoint_vertical_delta_range: Sequence[float] = (0.0, 0.0),
         waypoint_single_line_probability: float = 0.0,
     ) -> None:
@@ -226,7 +360,17 @@ class WaypointPathGenerator:
         self.dense_spacing = float(dense_spacing)
         counts = np.asarray(waypoint_segment_count_range, dtype=np.int64)
         lengths = np.asarray(waypoint_segment_length_range, dtype=np.float64)
+        first_lengths = (
+            lengths.copy()
+            if waypoint_first_segment_length_range is None
+            else np.asarray(
+                waypoint_first_segment_length_range, dtype=np.float64
+            )
+        )
         vertical = np.asarray(waypoint_vertical_delta_range, dtype=np.float64)
+        hard_turns = np.asarray(
+            waypoint_hard_turn_range_degrees, dtype=np.float64
+        )
         if counts.shape != (2,) or counts[0] < 1 or counts[0] > counts[1]:
             raise ValueError(
                 "waypoint_segment_count_range must be an increasing positive pair"
@@ -234,6 +378,15 @@ class WaypointPathGenerator:
         if lengths.shape != (2,) or lengths[0] <= 0 or lengths[0] > lengths[1]:
             raise ValueError(
                 "waypoint_segment_length_range must be an increasing positive pair"
+            )
+        if (
+            first_lengths.shape != (2,)
+            or first_lengths[0] <= 0
+            or first_lengths[0] > first_lengths[1]
+        ):
+            raise ValueError(
+                "waypoint_first_segment_length_range must be an increasing "
+                "positive pair"
             )
         if vertical.shape != (2,) or vertical[0] > vertical[1]:
             raise ValueError(
@@ -243,9 +396,31 @@ class WaypointPathGenerator:
             raise ValueError(
                 "waypoint_maximum_extent must cover the minimum segment length"
             )
+        if not 0.0 <= waypoint_minimum_turn_degrees <= 180.0:
+            raise ValueError(
+                "waypoint_minimum_turn_degrees must lie in [0, 180]"
+            )
         if not 0.0 < waypoint_maximum_turn_degrees <= 180.0:
             raise ValueError(
                 "waypoint_maximum_turn_degrees must lie in (0, 180]"
+            )
+        if waypoint_minimum_turn_degrees > waypoint_maximum_turn_degrees:
+            raise ValueError(
+                "minimum waypoint turn cannot exceed the maximum"
+            )
+        if not 0.0 <= waypoint_hard_turn_probability <= 1.0:
+            raise ValueError(
+                "waypoint_hard_turn_probability must lie in [0, 1]"
+            )
+        if (
+            hard_turns.shape != (2,)
+            or hard_turns[0] < 0.0
+            or hard_turns[0] > hard_turns[1]
+            or hard_turns[1] > 180.0
+        ):
+            raise ValueError(
+                "waypoint_hard_turn_range_degrees must be an increasing pair "
+                "inside [0, 180]"
             )
         if not 0.0 <= waypoint_single_line_probability <= 1.0:
             raise ValueError(
@@ -276,9 +451,23 @@ class WaypointPathGenerator:
             float(lengths[0]),
             float(lengths[1]),
         )
+        self.waypoint_first_segment_length_range = (
+            float(first_lengths[0]),
+            float(first_lengths[1]),
+        )
         self.waypoint_maximum_extent = float(waypoint_maximum_extent)
+        self.waypoint_minimum_turn_degrees = float(
+            waypoint_minimum_turn_degrees
+        )
         self.waypoint_maximum_turn_degrees = float(
             waypoint_maximum_turn_degrees
+        )
+        self.waypoint_hard_turn_probability = float(
+            waypoint_hard_turn_probability
+        )
+        self.waypoint_hard_turn_range_degrees = (
+            float(hard_turns[0]),
+            float(hard_turns[1]),
         )
         self.waypoint_vertical_delta_range = (
             float(vertical[0]),
@@ -287,6 +476,21 @@ class WaypointPathGenerator:
         self.waypoint_single_line_probability = float(
             waypoint_single_line_probability
         )
+        self.last_generation_mode = "direct"
+
+    def _segment_inside_workspace(
+        self, start: np.ndarray, end: np.ndarray
+    ) -> bool:
+        """Check a straight segment in a potentially non-convex workspace."""
+
+        distance = float(np.linalg.norm(end - start))
+        # Pose-map triangles can form sub-millimetre slivers along a rejected
+        # hole. A one-millimetre probe previously skipped a 0.45 mm invalid
+        # interval and allowed a worker to fail only after training started.
+        validation_spacing = min(self.dense_spacing, 0.0001)
+        count = max(2, int(np.ceil(distance / validation_spacing)) + 1)
+        points = np.linspace(start, end, count, endpoint=True)
+        return bool(np.all(self.workspace.contains(points)))
 
     def _sample_separated(
         self,
@@ -340,7 +544,10 @@ class WaypointPathGenerator:
             else:
                 target = self.workspace.clip(candidate)
             distance = float(np.linalg.norm(target - origin))
-            if minimum <= distance <= maximum + 1e-8:
+            if (
+                minimum <= distance <= maximum + 1e-8
+                and self._segment_inside_workspace(origin, target)
+            ):
                 return target
         raise RuntimeError("could not sample a local table waypoint")
 
@@ -391,8 +598,23 @@ class WaypointPathGenerator:
             )
         )
         minimum_length, maximum_length = self.waypoint_segment_length_range
-        maximum_turn = np.deg2rad(self.waypoint_maximum_turn_degrees)
-        minimum_revisit = min(0.008, 0.45 * minimum_length)
+        first_minimum_length, first_maximum_length = (
+            self.waypoint_first_segment_length_range
+        )
+        hard_turn_episode = bool(
+            self.waypoint_hard_turn_probability > 0
+            and rng.random() < self.waypoint_hard_turn_probability
+        )
+        if hard_turn_episode:
+            minimum_turn, maximum_turn = np.deg2rad(
+                self.waypoint_hard_turn_range_degrees
+            )
+        else:
+            maximum_turn = np.deg2rad(self.waypoint_maximum_turn_degrees)
+            minimum_turn = np.deg2rad(self.waypoint_minimum_turn_degrees)
+        minimum_revisit = min(
+            0.008, 0.45 * min(minimum_length, first_minimum_length)
+        )
 
         # Random paths preserve distribution diversity, but a geometrically
         # tight request must reach the deterministic fallback quickly rather
@@ -403,12 +625,19 @@ class WaypointPathGenerator:
             for _segment in range(segment_count):
                 accepted = False
                 for _ in range(48):
-                    proposed_heading = (
-                        rng.uniform(-np.pi, np.pi)
-                        if heading is None
-                        else heading + rng.uniform(-maximum_turn, maximum_turn)
+                    if heading is None:
+                        proposed_heading = rng.uniform(-np.pi, np.pi)
+                    else:
+                        proposed_heading = heading + rng.choice((-1.0, 1.0)) * rng.uniform(
+                            minimum_turn, maximum_turn
+                        )
+                    segment_minimum = (
+                        first_minimum_length if _segment == 0 else minimum_length
                     )
-                    distance = rng.uniform(minimum_length, maximum_length)
+                    segment_maximum = (
+                        first_maximum_length if _segment == 0 else maximum_length
+                    )
+                    distance = rng.uniform(segment_minimum, segment_maximum)
                     vertical_delta = rng.uniform(
                         self.waypoint_vertical_delta_range[0],
                         self.waypoint_vertical_delta_range[1],
@@ -421,6 +650,8 @@ class WaypointPathGenerator:
                         ]
                     )
                     if not bool(self.workspace.contains(candidate)):
+                        continue
+                    if not self._segment_inside_workspace(rows[-1], candidate):
                         continue
                     if np.linalg.norm(candidate - start) > (
                         self.waypoint_maximum_extent + 1e-9
@@ -437,26 +668,50 @@ class WaypointPathGenerator:
                 if not accepted:
                     break
             if len(rows) == segment_count + 1:
+                self.last_generation_mode = "random"
                 return np.asarray(rows, dtype=np.float64)
+        if minimum_length >= 0.08:
+            workspace_fallback = self._workspace_chord_polyline_fallback(
+                rng=rng,
+                start=np.asarray(start, dtype=np.float64),
+                segment_count=segment_count,
+                minimum_turn=minimum_turn,
+                maximum_turn=maximum_turn,
+                minimum_length=minimum_length,
+                maximum_length=maximum_length,
+                first_minimum_length=first_minimum_length,
+                first_maximum_length=first_maximum_length,
+                minimum_revisit=minimum_revisit,
+            )
+            if workspace_fallback is not None:
+                self.last_generation_mode = "workspace_chord_fallback"
+                return workspace_fallback
         curved_fallback = self._randomized_curved_polyline_fallback(
             rng=rng,
             start=np.asarray(start, dtype=np.float64),
             segment_count=segment_count,
+            minimum_turn=minimum_turn,
             maximum_turn=maximum_turn,
             minimum_length=minimum_length,
             maximum_length=maximum_length,
+            first_minimum_length=first_minimum_length,
+            first_maximum_length=first_maximum_length,
             minimum_revisit=minimum_revisit,
         )
         if curved_fallback is not None:
+            self.last_generation_mode = "curved_fallback"
             return curved_fallback
         fallback = self._minimum_length_polyline_fallback(
             start=np.asarray(start, dtype=np.float64),
             segment_count=segment_count,
+            minimum_turn=minimum_turn,
             maximum_turn=maximum_turn,
             minimum_length=minimum_length,
+            first_minimum_length=first_minimum_length,
             minimum_revisit=minimum_revisit,
         )
         if fallback is not None:
+            self.last_generation_mode = "deterministic_fallback"
             return fallback
         raise RuntimeError(
             "could not sample a feasible short waypoint polyline after random "
@@ -464,15 +719,105 @@ class WaypointPathGenerator:
             "extent, workspace, and reach constraints"
         )
 
+    def _workspace_chord_polyline_fallback(
+        self,
+        *,
+        rng: np.random.Generator,
+        start: np.ndarray,
+        segment_count: int,
+        minimum_turn: float,
+        maximum_turn: float,
+        minimum_length: float,
+        maximum_length: float,
+        first_minimum_length: float,
+        first_maximum_length: float,
+        minimum_revisit: float,
+    ) -> np.ndarray | None:
+        """Sample long chords directly inside a bounded certified workspace.
+
+        Direction-first rejection is efficient for centimetre-scale local
+        steps, but not when a requested chord is comparable to the workspace
+        diameter: most headings leave the convex hull. Sampling the endpoint
+        first conditions on the certified hull and then enforces distance and
+        turn limits. Multiple restarts provide lightweight stochastic
+        backtracking for long out-and-back polylines.
+        """
+
+        vertical_low, vertical_high = self.waypoint_vertical_delta_range
+        for _ in range(128):
+            rows = [start.copy()]
+            previous_heading: float | None = None
+            for _segment in range(segment_count):
+                accepted = False
+                for _ in range(256):
+                    candidate = self.workspace.sample(rng)
+                    candidate[2] = rows[-1][2] + rng.uniform(
+                        vertical_low, vertical_high
+                    )
+                    if not bool(self.workspace.contains(candidate)):
+                        continue
+                    if not self._segment_inside_workspace(rows[-1], candidate):
+                        continue
+                    displacement = candidate - rows[-1]
+                    distance = float(np.linalg.norm(displacement))
+                    segment_minimum = (
+                        first_minimum_length if _segment == 0 else minimum_length
+                    )
+                    segment_maximum = (
+                        first_maximum_length if _segment == 0 else maximum_length
+                    )
+                    if not (
+                        segment_minimum - 1e-9
+                        <= distance
+                        <= segment_maximum + 1e-9
+                    ):
+                        continue
+                    if np.linalg.norm(candidate - start) > (
+                        self.waypoint_maximum_extent + 1e-9
+                    ):
+                        continue
+                    heading = float(np.arctan2(displacement[1], displacement[0]))
+                    if previous_heading is not None:
+                        turn = abs(
+                            float(
+                                np.arctan2(
+                                    np.sin(heading - previous_heading),
+                                    np.cos(heading - previous_heading),
+                                )
+                            )
+                        )
+                        if not (
+                            minimum_turn - 1e-9
+                            <= turn
+                            <= maximum_turn + 1e-9
+                        ):
+                            continue
+                    if len(rows) > 1 and np.min(
+                        np.linalg.norm(np.asarray(rows[:-1]) - candidate, axis=1)
+                    ) < minimum_revisit:
+                        continue
+                    rows.append(candidate)
+                    previous_heading = heading
+                    accepted = True
+                    break
+                if not accepted:
+                    break
+            if len(rows) == segment_count + 1:
+                return np.asarray(rows, dtype=np.float64)
+        return None
+
     def _randomized_curved_polyline_fallback(
         self,
         *,
         rng: np.random.Generator,
         start: np.ndarray,
         segment_count: int,
+        minimum_turn: float,
         maximum_turn: float,
         minimum_length: float,
         maximum_length: float,
+        first_minimum_length: float,
+        first_maximum_length: float,
         minimum_revisit: float,
     ) -> np.ndarray | None:
         """Sample diverse short arcs before using a deterministic fallback.
@@ -497,7 +842,7 @@ class WaypointPathGenerator:
             )
             turn_sign = float(rng.choice((-1.0, 1.0)))
             turns = turn_sign * rng.uniform(
-                0.55 * maximum_turn,
+                max(minimum_turn, 0.55 * maximum_turn),
                 maximum_turn,
                 size=max(segment_count - 1, 0),
             )
@@ -511,6 +856,9 @@ class WaypointPathGenerator:
                 5.0,
                 size=segment_count,
             )
+            lengths[0] = first_minimum_length + (
+                first_maximum_length - first_minimum_length
+            ) * rng.beta(1.0, 5.0)
             vertical_deltas = rng.uniform(
                 vertical_low,
                 vertical_high,
@@ -530,6 +878,9 @@ class WaypointPathGenerator:
                     dtype=np.float64,
                 )
                 if not bool(self.workspace.contains(candidate)):
+                    feasible = False
+                    break
+                if not self._segment_inside_workspace(rows[-1], candidate):
                     feasible = False
                     break
                 if np.linalg.norm(candidate - start) > (
@@ -552,9 +903,11 @@ class WaypointPathGenerator:
         *,
         start: np.ndarray,
         segment_count: int,
+        minimum_turn: float,
         maximum_turn: float,
         minimum_length: float,
         minimum_revisit: float,
+        first_minimum_length: float | None = None,
     ) -> np.ndarray | None:
         """Construct a conservative path when rejection sampling is unlucky.
 
@@ -578,8 +931,10 @@ class WaypointPathGenerator:
                 0.5 * maximum_turn,
                 0.25 * maximum_turn,
             )
-            if value > 1e-9
+            if value >= minimum_turn - 1e-9 and value > 1e-9
         )
+        if not turn_magnitudes and minimum_turn <= maximum_turn:
+            turn_magnitudes = (minimum_turn,)
         vertical_delta = float(
             np.clip(
                 0.0,
@@ -598,15 +953,27 @@ class WaypointPathGenerator:
                         if segment_index > 0:
                             sign = 1.0 if turn_mask & (1 << (segment_index - 1)) else -1.0
                             heading += sign * turn_magnitude
+                        segment_length = (
+                            (
+                                minimum_length
+                                if first_minimum_length is None
+                                else first_minimum_length
+                            )
+                            if segment_index == 0
+                            else minimum_length
+                        )
                         candidate = rows[-1] + np.asarray(
                             [
-                                minimum_length * np.cos(heading),
-                                minimum_length * np.sin(heading),
+                                segment_length * np.cos(heading),
+                                segment_length * np.sin(heading),
                                 vertical_delta,
                             ],
                             dtype=np.float64,
                         )
                         if not bool(self.workspace.contains(candidate)):
+                            feasible = False
+                            break
+                        if not self._segment_inside_workspace(rows[-1], candidate):
                             feasible = False
                             break
                         if np.linalg.norm(candidate - start) > (
@@ -688,10 +1055,25 @@ class WaypointPathGenerator:
                 raise ValueError("anchors must have shape [N, 3]")
             if not np.all(self.workspace.contains(supplied)):
                 raise ValueError("all supplied anchors must lie in the workspace")
-            if np.linalg.norm(supplied[0] - start_array) > 1e-8:
+            # Simulator-derived anchor banks can differ from the restored
+            # float32 tip by sub-micrometre roundoff. Treat that as the same
+            # start; prepending a near-duplicate would create a spurious gate.
+            if np.linalg.norm(supplied[0] - start_array) > 1e-5:
                 supplied = np.vstack((start_array, supplied))
+            else:
+                supplied = supplied.copy()
+                supplied[0] = start_array
             points = _densify_polyline(supplied, self.dense_spacing)
-            return ReferencePath.from_points("custom", supplied, points)
+            if (
+                self.workspace.xy_triangulation is not None
+                and not np.all(self.workspace.contains(points))
+            ):
+                raise ValueError(
+                    "supplied anchor segments leave the certified workspace"
+                )
+            return ReferencePath.from_points(
+                "custom", supplied, points, generation_mode="custom"
+            )
 
         local_table = curriculum in {
             "table_local_line",
@@ -741,10 +1123,12 @@ class WaypointPathGenerator:
                 )
 
         if family == "point":
+            generation_mode = "point"
             target = self._local_point(rng, start_array)
             path_anchors = np.stack((start_array, target))
             points = _densify_polyline(path_anchors, self.dense_spacing)
         elif family == "line":
+            generation_mode = "line"
             if curriculum in {"table_local_line", "table_waypoint_polyline"}:
                 target = self._sample_table_local(
                     rng,
@@ -775,7 +1159,9 @@ class WaypointPathGenerator:
                 path_anchors = self._short_waypoint_polyline(rng, start_array)
                 points = _densify_polyline(path_anchors, self.dense_spacing)
                 family = "waypoint_polyline"
+                generation_mode = self.last_generation_mode
             else:
+                generation_mode = "polyline"
                 count = int(rng.integers(3, 6) if local_table else rng.integers(4, 9))
                 rows = [start_array]
                 # Legacy paths may begin with a long descent. Physical curricula
@@ -796,6 +1182,7 @@ class WaypointPathGenerator:
                 path_anchors = np.asarray(rows)
                 points = _densify_polyline(path_anchors, self.dense_spacing)
         elif family == "bezier":
+            generation_mode = "bezier"
             if local_table:
                 end = self._sample_table_local(
                     rng, start_array, 0.035, local_limit
@@ -817,6 +1204,7 @@ class WaypointPathGenerator:
             else:
                 path_anchors, points = self._bezier(rng, start_array)
         elif family == "s_curve":
+            generation_mode = "s_curve"
             if local_table:
                 end = self._sample_table_local(
                     rng, start_array, 0.040, min(0.070, local_limit)
@@ -836,6 +1224,7 @@ class WaypointPathGenerator:
             else:
                 path_anchors, points = self._s_curve(rng, start_array)
         elif family == "reverse":
+            generation_mode = "reverse"
             outward = (
                 self._sample_table_local(
                     rng, start_array, 0.040, local_limit
@@ -853,4 +1242,9 @@ class WaypointPathGenerator:
         else:
             raise ValueError(f"unknown path family: {family}")
 
-        return ReferencePath.from_points(family, path_anchors, points)
+        return ReferencePath.from_points(
+            family,
+            path_anchors,
+            points,
+            generation_mode=generation_mode,
+        )

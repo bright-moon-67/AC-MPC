@@ -1,0 +1,74 @@
+environment:
+  curriculum: table_waypoint_polyline
+  episode_steps: 1600
+  absolute_action_limit: 0.60
+  max_action_delta: 0.01
+  action_mode: absolute
+  observation_mode: legacy70
+  workspace_low: [0.18, 0.285, 0.420]
+  workspace_high: [0.54, 0.65, 0.490]
+  max_reach: 1.20
+  # Three to five total anchors, including the restored starting point.
+  waypoint_segment_count_range: [2, 4]
+  waypoint_segment_count_probabilities: [0.25, 0.45, 0.30]
+  waypoint_segment_length_range: [0.075, 0.125]
+  waypoint_maximum_extent: 0.30
+  waypoint_minimum_turn_degrees: 60.0
+  waypoint_maximum_turn_degrees: 120.0
+  waypoint_vertical_delta_range: [0.0, 0.0]
+  waypoint_single_line_probability: 0.0
+  tracking_guard: 0.04
+  lookahead_distance: 0.03
+  success_threshold: 0.012
+  success_streak: 8
+  terminal_capture_radius: 0.022
+  table_surface_z: 0.36
+  minimum_tip_z: 0.410
+  table_x_bounds: [0.15, 0.65]
+  table_y_bounds: [0.28, 0.72]
+  arm_radius: 0.050
+  table_safety_margin: 0.005
+  enforce_whole_arm_table_clearance: true
+  target_tip_tangent: [0.0, 0.0, -1.0]
+  tip_orientation_penalty_scale: 0.30
+  maximum_tip_orientation_error_degrees: 35.0
+  tip_orientation_violation_penalty: 50.0
+  terminate_on_tip_orientation_violation: true
+  entry_bank_path: data/processed/manisoft_table_arch_entry_v1/entry_bank.npz
+  entry_sampling_weights: [1.0]
+  min_desired_speed: 0.012
+  max_desired_speed: 0.035
+  internal_waypoint_capture_radius: 0.015
+  internal_waypoint_bonus: 1.0
+  internal_waypoint_progress_scale: 0.25
+  internal_waypoint_distance_penalty_scale: 0.10
+  waypoint_stall_steps: 1000
+  waypoint_stall_distance_epsilon: 0.0003
+  target_lead_distance: 0.015
+  maximum_projection_advance: 0.025
+  projection_backtrack: 0.005
+  stall_grace_steps: 250
+  stall_window_steps: 1200
+  stall_progress_epsilon: 0.0004
+  terminal_settle_steps: 400
+
+sac:
+  learning_rate: 0.0001
+  buffer_size: 500000
+  learning_starts: 10000
+  batch_size: 1024
+  tau: 0.005
+  gamma: 0.998
+  train_freq: 1
+  gradient_steps: 4
+  ent_coef: auto_0.03
+  target_entropy: -1.0
+  net_arch: [256, 256, 256]
+
+training:
+  total_timesteps: 300000
+  num_envs: 24
+  checkpoint_freq: 50000
+  eval_freq: 25000
+  eval_episodes: 48
+  save_replay_buffer: false

@@ -1,0 +1,39 @@
+# Search-only continuation origin.  The known downward arch is translated to
+# the z=0.25 m mounting height, where its tip lies below the real tabletop.
+# A far-away dummy table lets pose optimization lift the tip before the final
+# candidate is regenerated from upright and certified against the real table.
+table:
+  x_bounds: [10.0, 11.0]
+  y_bounds: [10.0, 11.0]
+  surface_z: 0.36
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+workspace:
+  low: [-1.0, -1.0, -0.10]
+  high: [1.0, 1.0, 0.10]
+  max_reach: 2.0
+
+motion:
+  ramp_steps: 600
+  hold_steps: 1000
+  stability_tail_steps: 300
+  absolute_action_limit: 0.60
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.002
+  maximum_replay_tip_error: 0.00002
+  maximum_tip_downward_angle_degrees: 15.0
+  minimum_arch_height: 0.40
+
+seeds:
+  - name: lowbase_below_table_continuation_origin
+    source: raised_base_multipoint_arch_candidate_903_translated
+    align_rotation_degrees: 0.0
+    rotation_offset_degrees: 0.0
+    action:
+      [-0.38453150, -0.12239190, 0.01874209,
+       -0.00091051, 0.20629361, 0.02883022,
+       -0.44712114, 0.19186105, 0.35809398,
+       -0.32091162, 0.44131029, -0.33244604,
+       -0.40166423, 0.36627483, -0.12105833,
+       -0.60000000, 0.60000000, 0.00297290]

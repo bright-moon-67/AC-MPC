@@ -1,0 +1,94 @@
+environment:
+  curriculum: table_waypoint_polyline
+  # Twelve 20 cm segments need a long horizon even under perfect tracking.
+  episode_steps: 18000
+  absolute_action_limit: 0.60
+  max_action_delta: 0.003
+  action_mode: table_pose_residual
+  # Preserve the original 45-D physical state and the established 70-D policy
+  # observation. No simulator-state dimension or index is changed here.
+  observation_mode: legacy70
+  table_pose_map_path: data/processed/manisoft_table_arch_base070_pose_map_angle30_gapfill2_flat11mm_v1/pose_map.npz
+  # Reject Delaunay bridges across uncalibrated holes and require every dense
+  # point on every straight segment to stay in a locally supported simplex.
+  pose_map_maximum_simplex_edge: 0.040
+  equilibrium_path_prior_weight: 1.0
+  # The certified prior alone passes 6/8 held-out final paths. SAC starts at
+  # exactly zero residual and receives enough authority to correct unsafe
+  # dynamic transitions without replacing the geometric controller.
+  equilibrium_path_residual_scale: 0.030
+  workspace_low: [0.198, 0.192, 0.440]
+  workspace_high: [0.528, 0.555, 0.451]
+  max_reach: 1.20
+  waypoint_segment_count_range: [8, 12]
+  waypoint_segment_count_probabilities: [0.10, 0.20, 0.40, 0.20, 0.10]
+  waypoint_segment_length_range: [0.100, 0.200]
+  waypoint_maximum_extent: 0.250
+  waypoint_minimum_turn_degrees: 0.0
+  waypoint_maximum_turn_degrees: 175.0
+  waypoint_vertical_delta_range: [0.0, 0.0]
+  waypoint_single_line_probability: 0.0
+  internal_waypoint_capture_radius: 0.010
+  internal_waypoint_bonus: 2.0
+  internal_waypoint_progress_scale: 0.50
+  internal_waypoint_distance_penalty_scale: 0.25
+  waypoint_stall_steps: 4800
+  waypoint_stall_distance_epsilon: 0.0002
+  tracking_guard: 0.020
+  cross_track_penalty_scale: 0.20
+  tracking_distance_penalty_scale: 0.10
+  target_lead_distance: 0.008
+  lookahead_distance: 0.018
+  maximum_projection_advance: 0.020
+  projection_backtrack: 0.004
+  success_threshold: 0.010
+  success_streak: 8
+  terminal_capture_radius: 0.020
+  stall_grace_steps: 800
+  stall_window_steps: 5200
+  stall_progress_epsilon: 0.0002
+  table_surface_z: 0.36
+  minimum_tip_z: 0.405
+  table_x_bounds: [0.15, 0.65]
+  table_y_bounds: [0.18, 0.72]
+  arm_radius: 0.050
+  table_safety_margin: 0.005
+  enforce_whole_arm_table_clearance: true
+  target_tip_tangent: [0.0, 0.0, -1.0]
+  tip_orientation_penalty_scale: 0.30
+  maximum_tip_orientation_error_degrees: 30.0
+  tip_orientation_violation_penalty: 100.0
+  terminate_on_tip_orientation_violation: true
+  entry_bank_path: data/processed/manisoft_table_arch_base070_plane_entry_v1/entry_bank.npz
+  entry_sampling_weights: [1.0]
+  min_desired_speed: 0.006
+  max_desired_speed: 0.015
+  requested_rate_penalty_scale: 0.001
+  policy_action_penalty_scale: 0.050
+  endpoint_progress_scale: 0.0
+  terminal_precision_scale: 3.0
+  terminal_distance_penalty_scale: 2.0
+  table_violation_penalty: 300.0
+  terminal_settle_steps: 1000
+  terminal_timeout_penalty: 100.0
+
+sac:
+  learning_rate: 0.00001
+  buffer_size: 1000000
+  learning_starts: 30000
+  batch_size: 2048
+  tau: 0.005
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 4
+  ent_coef: 0.001
+  target_entropy: -9.0
+  net_arch: [256, 256, 256]
+
+training:
+  total_timesteps: 500000
+  num_envs: 16
+  checkpoint_freq: 50000
+  eval_freq: 50000
+  eval_episodes: 8
+  save_replay_buffer: false
