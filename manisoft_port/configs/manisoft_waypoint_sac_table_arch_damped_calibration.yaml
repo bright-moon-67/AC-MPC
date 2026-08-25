@@ -1,0 +1,64 @@
+environment:
+  curriculum: table_waypoint_polyline
+  episode_steps: 240
+  absolute_action_limit: 0.60
+  max_action_delta: 0.003
+  action_mode: absolute
+  observation_mode: legacy70
+  workspace_low: [0.18, 0.285, 0.420]
+  workspace_high: [0.54, 0.65, 0.490]
+  max_reach: 1.20
+  waypoint_segment_count_range: [2, 4]
+  waypoint_segment_length_range: [0.03, 0.10]
+  waypoint_maximum_extent: 0.085
+  waypoint_minimum_turn_degrees: 25.0
+  waypoint_maximum_turn_degrees: 155.0
+  waypoint_vertical_delta_range: [0.0, 0.0]
+  tracking_guard: 0.03
+  target_lead_distance: 0.008
+  lookahead_distance: 0.018
+  maximum_projection_advance: 0.020
+  projection_backtrack: 0.004
+  success_threshold: 0.010
+  success_streak: 8
+  terminal_capture_radius: 0.020
+  table_surface_z: 0.36
+  minimum_tip_z: 0.405
+  table_x_bounds: [0.15, 0.65]
+  table_y_bounds: [0.28, 0.72]
+  arm_radius: 0.050
+  table_safety_margin: 0.005
+  enforce_whole_arm_table_clearance: true
+  target_tip_tangent: [0.0, 0.0, -1.0]
+  maximum_tip_orientation_error_degrees: 20.0
+  terminate_on_tip_orientation_violation: true
+  entry_bank_path: data/processed/manisoft_table_arch_multipoint_entry_damped_v1/entry_bank.npz
+  entry_sampling_weights: [1.0]
+  min_desired_speed: 0.008
+  max_desired_speed: 0.020
+  internal_waypoint_capture_radius: 0.010
+  internal_waypoint_bonus: 1.0
+  waypoint_stall_steps: 0
+  stall_grace_steps: 220
+  stall_window_steps: 220
+
+sac:
+  learning_rate: 0.00003
+  buffer_size: 1000
+  learning_starts: 100
+  batch_size: 64
+  tau: 0.005
+  gamma: 0.998
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: 0.001
+  target_entropy: -1.0
+  net_arch: [64, 64]
+
+training:
+  total_timesteps: 1000
+  num_envs: 1
+  checkpoint_freq: 1000
+  eval_freq: 0
+  eval_episodes: 1
+  save_replay_buffer: false

@@ -22,7 +22,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=865000)
     parser.add_argument("--proportional-gain", type=float, default=20.0)
     parser.add_argument("--feedforward-scale", type=float, default=1.0)
+    parser.add_argument("--waypoint-segment-count-range", default="3,3")
+    parser.add_argument("--waypoint-segment-length-range", default=None)
+    parser.add_argument("--waypoint-maximum-extent", type=float, default=None)
+    parser.add_argument("--waypoint-minimum-turn-degrees", type=float, default=None)
     parser.add_argument("--waypoint-maximum-turn-degrees", type=float, default=60.0)
+    parser.add_argument("--episode-steps", type=int, default=None)
+    parser.add_argument(
+        "--environment-prior",
+        action="store_true",
+        help="Drive with the environment's Cartesian prior and zero SAC residual.",
+    )
     return parser.parse_args()
 
 
@@ -40,18 +50,46 @@ def main() -> None:
             if not path.is_absolute():
                 path = (config_path.parent.parent / path).resolve()
             environment_config[key] = str(path)
+    count_range = [
+        int(value)
+        for value in args.waypoint_segment_count_range.split(",")
+        if value.strip()
+    ]
+    if len(count_range) != 2 or count_range[0] < 1 or count_range[0] > count_range[1]:
+        raise ValueError("waypoint-segment-count-range must be an increasing pair")
     environment_config.update(
         {
             "curriculum": "table_waypoint_polyline",
-            "waypoint_segment_count_range": [3, 3],
+            "waypoint_segment_count_range": count_range,
             "waypoint_maximum_turn_degrees": float(
                 args.waypoint_maximum_turn_degrees
             ),
-            "waypoint_maximum_extent": 0.035,
             "waypoint_single_line_probability": 0.0,
             "internal_waypoint_capture_radius": 0.010,
         }
     )
+    if args.waypoint_segment_length_range is not None:
+        length_range = [
+            float(value)
+            for value in args.waypoint_segment_length_range.split(",")
+            if value.strip()
+        ]
+        if len(length_range) != 2 or length_range[0] <= 0 or length_range[0] > length_range[1]:
+            raise ValueError("waypoint-segment-length-range must be an increasing pair")
+        environment_config["waypoint_segment_length_range"] = length_range
+    if args.waypoint_maximum_extent is not None:
+        environment_config["waypoint_maximum_extent"] = float(
+            args.waypoint_maximum_extent
+        )
+    if args.waypoint_minimum_turn_degrees is not None:
+        environment_config["waypoint_minimum_turn_degrees"] = float(
+            args.waypoint_minimum_turn_degrees
+        )
+    if args.episode_steps is not None:
+        environment_config["episode_steps"] = int(args.episode_steps)
+    if args.environment_prior:
+        environment_config["cartesian_prior_weight"] = 1.0
+        environment_config["cartesian_prior_residual_scale"] = 0.0
     environment_config.pop("waypoint_segment_count_probabilities", None)
     environment_config.pop("entry_sampling_weights", None)
     env = ManiSoftWaypointSACEnv(args.scenario, **environment_config)
@@ -85,11 +123,15 @@ def main() -> None:
                 target = np.asarray(env.current_target, dtype=np.float64)
                 feedforward = (target[:2] - start_tip[:2]) / steady_displacement
                 feedback = args.proportional_gain * (target[:2] - tip[:2])
-                action = np.clip(
-                    args.feedforward_scale * feedforward + feedback,
-                    -1.0,
-                    1.0,
-                ).astype(np.float32)
+                action = (
+                    np.zeros(2, dtype=np.float32)
+                    if args.environment_prior
+                    else np.clip(
+                        args.feedforward_scale * feedforward + feedback,
+                        -1.0,
+                        1.0,
+                    ).astype(np.float32)
+                )
                 _, reward, terminated, truncated, terminal_info = env.step(action)
                 episode_return += float(reward)
                 distances.append(float(terminal_info["distance"]))

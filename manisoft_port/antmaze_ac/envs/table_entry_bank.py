@@ -85,6 +85,7 @@ class TableEntryTrajectoryBank:
     table_surface_z: float
     arm_radius: float
     safety_margin: float
+    absolute_action_limit: float
 
     @property
     def trajectory_count(self) -> int:
@@ -138,6 +139,11 @@ def load_table_entry_trajectory_bank(
         table_surface_z = _scalar(archive, "table_surface_z", float)
         arm_radius = _scalar(archive, "arm_radius", float)
         safety_margin = _scalar(archive, "safety_margin", float)
+        absolute_action_limit = (
+            _scalar(archive, "absolute_action_limit", float)
+            if "absolute_action_limit" in archive
+            else 0.30
+        )
 
     if not names or len(set(names)) != len(names):
         raise ValueError("table-entry trajectory names must be nonempty and unique")
@@ -194,8 +200,12 @@ def load_table_entry_trajectory_bank(
         )
     ):
         raise ValueError("table-entry bank contains NaN or Inf")
-    if np.max(np.abs(actions)) > 0.30 + 1e-6:
-        raise ValueError("table-entry bank exceeds the 0.30 activation limit")
+    if absolute_action_limit <= 0:
+        raise ValueError("stored activation limit must be positive")
+    if np.max(np.abs(actions)) > absolute_action_limit + 1e-6:
+        raise ValueError(
+            "table-entry bank exceeds its stored activation limit"
+        )
     if not np.allclose(
         states[..., KOOPMAN_TIP_POSITION_SLICE], nodes[..., -1, :], atol=2e-5
     ):
@@ -226,4 +236,5 @@ def load_table_entry_trajectory_bank(
         table_surface_z=table_surface_z,
         arm_radius=arm_radius,
         safety_margin=safety_margin,
+        absolute_action_limit=absolute_action_limit,
     )

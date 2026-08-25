@@ -1,0 +1,102 @@
+environment:
+  curriculum: table_waypoint_polyline
+  # A 12-segment path can approach 2.4 m. At the 0.8 cm/s curriculum floor,
+  # 6500 steps is physically too short even for perfect tracking.
+  episode_steps: 18000
+  absolute_action_limit: 0.60
+  max_action_delta: 0.003
+  action_mode: table_pose_residual
+  observation_mode: legacy70
+  table_pose_map_path: data/processed/manisoft_table_arch_pose_map_damped_flat10mm_wide_v1/pose_map.npz
+  equilibrium_path_prior_weight: 1.0
+  # The retained certified poses are within 10 mm of the requested
+  # plane. Keep learned authority small so a failing critic cannot destroy the
+  # safe geometric prior while still permitting millimetre-scale correction.
+  equilibrium_path_residual_scale: 0.010
+  workspace_low: [0.260, 0.280, 0.440]
+  workspace_high: [0.447, 0.436, 0.467]
+  max_reach: 1.20
+  # Eight to twelve segments means 9--13 points including the restored start.
+  waypoint_segment_count_range: [8, 12]
+  waypoint_segment_count_probabilities: [0.10, 0.20, 0.40, 0.20, 0.10]
+  waypoint_segment_length_range: [0.100, 0.200]
+  # Every sampled waypoint must also lie inside the long-hold-certified pose
+  # map hull. The expanded 18 cm entry-relative extent exposes the wide map
+  # while remaining inside the virtual tabletop bounds.
+  waypoint_maximum_extent: 0.180
+  # Cover almost the entire heading-change range.  This includes shallow
+  # corners and near reversals instead of training only conspicuous corners.
+  waypoint_minimum_turn_degrees: 0.0
+  waypoint_maximum_turn_degrees: 175.0
+  waypoint_vertical_delta_range: [0.0, 0.0]
+  waypoint_single_line_probability: 0.0
+  # Use the final acceptance tolerance during learning as well.  A 1.2 cm
+  # continuation margin was tested and rejected because it produced apparent
+  # training success while deterministic 1 cm evaluation regressed.
+  internal_waypoint_capture_radius: 0.010
+  internal_waypoint_bonus: 2.0
+  internal_waypoint_progress_scale: 0.50
+  internal_waypoint_distance_penalty_scale: 0.25
+  waypoint_stall_steps: 4800
+  waypoint_stall_distance_epsilon: 0.0002
+  tracking_guard: 0.020
+  cross_track_penalty_scale: 0.20
+  tracking_distance_penalty_scale: 0.10
+  target_lead_distance: 0.008
+  lookahead_distance: 0.018
+  maximum_projection_advance: 0.020
+  projection_backtrack: 0.004
+  success_threshold: 0.010
+  success_streak: 8
+  terminal_capture_radius: 0.020
+  stall_grace_steps: 800
+  stall_window_steps: 5200
+  stall_progress_epsilon: 0.0002
+  table_surface_z: 0.36
+  minimum_tip_z: 0.405
+  table_x_bounds: [0.15, 0.65]
+  table_y_bounds: [0.28, 0.72]
+  arm_radius: 0.050
+  table_safety_margin: 0.005
+  enforce_whole_arm_table_clearance: true
+  target_tip_tangent: [0.0, 0.0, -1.0]
+  tip_orientation_penalty_scale: 0.30
+  maximum_tip_orientation_error_degrees: 20.0
+  tip_orientation_violation_penalty: 100.0
+  terminate_on_tip_orientation_violation: true
+  entry_bank_path: data/processed/manisoft_table_arch_multipoint_entry_damped_v1/entry_bank.npz
+  entry_sampling_weights: [1.0]
+  min_desired_speed: 0.008
+  max_desired_speed: 0.020
+  requested_rate_penalty_scale: 0.001
+  policy_action_penalty_scale: 0.05
+  endpoint_progress_scale: 0.0
+  terminal_precision_scale: 3.0
+  terminal_distance_penalty_scale: 2.0
+  table_violation_penalty: 300.0
+  terminal_settle_steps: 1000
+  terminal_timeout_penalty: 100.0
+
+sac:
+  learning_rate: 0.00003
+  buffer_size: 1000000
+  learning_starts: 30000
+  batch_size: 2048
+  tau: 0.005
+  # The controller receives dense local tracking feedback; a 0.995 discount
+  # covers its settling horizon without the Q-scale explosion observed at
+  # 0.999 on 6500-step episodes.
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 8
+  ent_coef: 0.001
+  target_entropy: -9.0
+  net_arch: [256, 256, 256]
+
+training:
+  total_timesteps: 3000000
+  num_envs: 16
+  checkpoint_freq: 100000
+  eval_freq: 100000
+  eval_episodes: 16
+  save_replay_buffer: false

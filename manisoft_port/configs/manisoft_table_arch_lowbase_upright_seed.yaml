@@ -1,0 +1,38 @@
+table:
+  x_bounds: [0.15, 0.65]
+  y_bounds: [0.28, 0.72]
+  surface_z: 0.36
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+# This bank exists only as a deterministic, fully settled starting state for
+# the low-base pose search.  The final manipulation bank is certified against
+# the tabletop workspace separately.
+workspace:
+  low: [-0.01, -0.01, 1.24]
+  high: [0.01, 0.01, 1.26]
+  max_reach: 1.50
+
+motion:
+  ramp_steps: 100
+  hold_steps: 300
+  stability_tail_steps: 100
+  absolute_action_limit: 0.60
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.0001
+  maximum_replay_tip_error: 0.00002
+  maximum_tip_downward_angle_degrees: 180.0
+  minimum_arch_height: 0.0
+
+seeds:
+  - name: lowbase_upright_search_origin
+    source: zero_activation_settled_state
+    align_rotation_degrees: 0.0
+    rotation_offset_degrees: 0.0
+    action:
+      [0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0]

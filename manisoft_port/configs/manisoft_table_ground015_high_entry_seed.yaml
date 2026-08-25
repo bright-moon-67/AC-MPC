@@ -1,0 +1,38 @@
+# Higher-clearance version of the ground-mounted 0.15 m tabletop entry.
+# It uses 97% of the center pose's XY activation and keeps axial channels,
+# placing the tip near the upper half of the allowed 0.205--0.255 m band.
+table:
+  x_bounds: [-0.55, 0.55]
+  y_bounds: [0.42, 0.86]
+  surface_z: 0.15
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+workspace:
+  low: [-0.10, 0.64, 0.235]
+  high: [0.10, 0.74, 0.255]
+  max_reach: 1.0
+
+motion:
+  absolute_action_limit: 1.0
+  ramp_steps: 400
+  hold_steps: 200
+  stability_tail_steps: 160
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.001
+  maximum_replay_tip_error: 0.00002
+  maximum_tip_downward_angle_degrees: 180.0
+  minimum_arch_height: 0.0
+
+seeds:
+  - name: ground015_high_center
+    source: ground015_center_xy_scale_0p97
+    align_rotation_degrees: 0.0
+    rotation_offset_degrees: 0.0
+    action:
+      [0.46985792, -0.22259077, -0.26166984,
+       0.58280038,  0.42147331,  0.04257604,
+      -0.00497663,  0.40990234,  0.28103945,
+      -0.46991073,  0.44126297, -0.18830399,
+      -0.49746553, -0.06254035, -0.19841926,
+      -0.70721063, -0.52834000, -0.07802872]

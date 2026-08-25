@@ -1,0 +1,35 @@
+{
+  "kind": "manisoft_waypoint_sac_video",
+  "video": "/root/autodl-tmp/AC-MPC/SQUARE_20CM_8POINTS.mp4",
+  "preview": "/root/autodl-tmp/AC-MPC/SQUARE_20CM_8POINTS_preview.png",
+  "final_frame": "/root/autodl-tmp/AC-MPC/SQUARE_20CM_8POINTS_final.png",
+  "trajectory": "/root/autodl-tmp/AC-MPC/runs/manisoft_waypoint_arch_base070_xyz_smoke_20260824/square20cm_flat_gapfill1_step200k_rollout.npz",
+  "source_frames": 2132,
+  "video_frames": 256,
+  "simulation_seconds": 42.62,
+  "video_seconds": 8.524,
+  "playback_speed": 5.0,
+  "resolution": [
+    960,
+    720
+  ],
+  "fps": 30,
+  "success": true,
+  "point_count": 9,
+  "segment_lengths_m": [
+    0.002685461426153779,
+    0.02500000037252903,
+    0.02500000037252903,
+    0.024999981746077538,
+    0.02500000037252903,
+    0.02500002272427082,
+    0.02500000037252903,
+    0.02500000037252903,
+    0.02500000037252903
+  ],
+  "final_tip_position": [
+    0.3825880289077759,
+    0.40616342425346375,
+    0.4460830092430115
+  ]
+}

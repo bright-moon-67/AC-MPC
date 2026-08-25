@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import gymnasium as gym
+from scipy.spatial import Delaunay
 
 from antmaze_ac.envs.fixed_seed_panel import FixedSeedPanelWrapper
 from antmaze_ac.envs.frozen_base_residual import FrozenBaseResidualActionWrapper
@@ -16,6 +17,7 @@ from antmaze_ac.envs.waypoint_paths import (
     WaypointPathGenerator,
     WaypointWorkspace,
 )
+from antmaze_ac.rl.anchored_sac import AnchoredSAC
 
 
 class _ResidualInnerEnv(gym.Env):
@@ -35,6 +37,10 @@ class _ResidualInnerEnv(gym.Env):
         return observation, 2.0, False, False, {"inner": True}
 
 
+class _ResidualInner18Env(_ResidualInnerEnv):
+    action_space = gym.spaces.Box(-1.0, 1.0, shape=(18,), dtype=np.float32)
+
+
 class _ResidualNormalizer:
     def normalize_obs(self, observation):
         return np.asarray(observation, dtype=np.float32) / 2.0
@@ -48,6 +54,68 @@ class _ResidualBasePolicy:
         assert deterministic
         self.last_observation = np.asarray(observation).copy()
         return np.asarray([[0.2, -0.3]], dtype=np.float32), None
+
+
+class _ResidualBase18Policy:
+    def predict(self, observation, *, deterministic=True):
+        del observation
+        assert deterministic
+        return np.linspace(-0.4, 0.4, 18, dtype=np.float32)[None, :], None
+
+
+def test_anchored_sac_source_policy_warmup_uses_deterministic_actor() -> None:
+    env = gym.make("Pendulum-v1")
+    model = AnchoredSAC(
+        "MlpPolicy",
+        env,
+        learning_starts=16,
+        buffer_size=64,
+        batch_size=8,
+        policy_kwargs={"net_arch": [16]},
+        device="cpu",
+        seed=7,
+    )
+    model._last_obs = model.get_env().reset()
+    model.num_timesteps = 0
+    expected, _ = model.predict(model._last_obs, deterministic=True)
+    model.enable_source_policy_warmup()
+
+    action, buffer_action = model._sample_action(16, n_envs=1)
+
+    np.testing.assert_allclose(action, expected, atol=1e-7)
+    np.testing.assert_allclose(
+        buffer_action,
+        model.policy.scale_action(expected),
+        atol=1e-7,
+    )
+    env.close()
+
+
+def test_anchored_sac_actor_delay_keeps_source_actor_frozen() -> None:
+    env = gym.make("Pendulum-v1")
+    model = AnchoredSAC(
+        "MlpPolicy",
+        env,
+        learning_starts=0,
+        buffer_size=64,
+        batch_size=2,
+        train_freq=1,
+        gradient_steps=1,
+        policy_kwargs={"net_arch": [16]},
+        device="cpu",
+        seed=9,
+    )
+    model.enable_actor_anchor(10.0)
+    model.delay_actor_updates_until(100)
+    before = [parameter.detach().clone() for parameter in model.actor.parameters()]
+
+    model.learn(total_timesteps=4)
+
+    for expected, actual in zip(before, model.actor.parameters()):
+        np.testing.assert_allclose(
+            actual.detach().cpu().numpy(), expected.cpu().numpy(), atol=0.0
+        )
+    env.close()
 
 
 def test_frozen_base_residual_zero_action_exactly_reproduces_base() -> None:
@@ -69,6 +137,21 @@ def test_frozen_base_residual_zero_action_exactly_reproduces_base() -> None:
     assert not terminated and not truncated
 
 
+def test_frozen_base_residual_supports_eighteen_action_axes() -> None:
+    inner = _ResidualInner18Env()
+    env = FrozenBaseResidualActionWrapper(
+        inner,
+        residual_action_scale=0.02,
+        base_model=_ResidualBase18Policy(),
+        observation_normalizer=_ResidualNormalizer(),
+    )
+    env.reset(seed=8)
+    _, _, _, _, info = env.step(np.zeros(18, dtype=np.float32))
+    expected = np.linspace(-0.4, 0.4, 18, dtype=np.float32)
+    np.testing.assert_allclose(inner.last_action, expected)
+    np.testing.assert_allclose(info["combined_policy_action"], expected)
+
+
 def test_frozen_base_residual_is_scaled_clipped_and_penalized() -> None:
     inner = _ResidualInnerEnv()
     env = FrozenBaseResidualActionWrapper(
@@ -86,6 +169,30 @@ def test_frozen_base_residual_is_scaled_clipped_and_penalized() -> None:
     assert reward == pytest.approx(1.5)
 
 
+def test_frozen_residual_can_ramp_only_after_waypoint_progress_stalls() -> None:
+    inner = _ResidualInnerEnv()
+    inner.step_count = 250
+    inner.last_waypoint_improvement_step = 100
+    env = FrozenBaseResidualActionWrapper(
+        inner,
+        residual_action_scale=0.20,
+        residual_stall_activation_steps=100,
+        residual_stall_ramp_steps=100,
+        base_model=_ResidualBasePolicy(),
+        observation_normalizer=_ResidualNormalizer(),
+    )
+    env.reset()
+    _, _, _, _, info = env.step(np.asarray([1.0, -1.0]))
+    assert info["residual_activation_factor"] == pytest.approx(0.5)
+    np.testing.assert_allclose(inner.last_action, [0.3, -0.4])
+
+    inner.step_count = 150
+    inner.last_waypoint_improvement_step = 100
+    _, _, _, _, info = env.step(np.asarray([1.0, -1.0]))
+    assert info["residual_activation_factor"] == pytest.approx(0.0)
+    np.testing.assert_allclose(inner.last_action, [0.2, -0.3])
+
+
 def test_reference_path_arc_length_sampling() -> None:
     path = ReferencePath.from_points(
         "corner",
@@ -96,6 +203,171 @@ def test_reference_path_arc_length_sampling() -> None:
     np.testing.assert_allclose(path.sample(0.05), [0.05, 0.0, 0.5])
     np.testing.assert_allclose(path.sample(0.20), [0.1, 0.1, 0.5])
     np.testing.assert_allclose(path.sample(2.0), [0.1, 0.2, 0.5])
+
+
+def test_workspace_can_enforce_an_xy_convex_hull() -> None:
+    workspace = WaypointWorkspace.from_bounds(
+        [0.0, 0.0, 0.4],
+        [1.0, 1.0, 0.6],
+        max_reach=2.0,
+        xy_hull_equations=np.asarray(
+            [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 1.0, -1.0]]
+        ),
+    )
+    assert workspace.contains(np.asarray([0.2, 0.3, 0.5]))
+    assert not workspace.contains(np.asarray([0.8, 0.8, 0.5]))
+
+
+def test_workspace_can_reject_under_sampled_delaunay_simplices() -> None:
+    triangulation = Delaunay(
+        np.asarray([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    )
+    accepted_simplex, rejected_simplex = 0, 1
+    accepted_point = np.append(
+        np.mean(triangulation.points[triangulation.simplices[accepted_simplex]], axis=0),
+        0.5,
+    )
+    rejected_point = np.append(
+        np.mean(triangulation.points[triangulation.simplices[rejected_simplex]], axis=0),
+        0.5,
+    )
+    valid = np.zeros(len(triangulation.simplices), dtype=bool)
+    valid[accepted_simplex] = True
+    workspace = WaypointWorkspace.from_bounds(
+        [0.0, 0.0, 0.4],
+        [1.0, 1.0, 0.6],
+        max_reach=2.0,
+        xy_triangulation=triangulation,
+        xy_valid_simplices=valid,
+    )
+    assert workspace.contains(accepted_point)
+    assert not workspace.contains(rejected_point)
+
+
+def test_workspace_can_enforce_a_three_dimensional_pose_hull() -> None:
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.4],
+            [1.0, 0.0, 0.4],
+            [0.0, 1.0, 0.4],
+            [0.0, 0.0, 0.6],
+        ]
+    )
+    triangulation = Delaunay(points)
+    workspace = WaypointWorkspace.from_bounds(
+        [0.0, 0.0, 0.4],
+        [1.0, 1.0, 0.6],
+        max_reach=2.0,
+        xy_triangulation=triangulation,
+        xy_valid_simplices=np.ones(len(triangulation.simplices), dtype=bool),
+        interpolation_dimensions=3,
+    )
+    assert workspace.contains(np.asarray([0.2, 0.2, 0.5]))
+    assert not workspace.contains(np.asarray([0.6, 0.6, 0.5]))
+
+
+def test_pose_map_action_can_interpolate_xyz_without_changing_state_shape() -> None:
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.4],
+            [1.0, 0.0, 0.4],
+            [0.0, 1.0, 0.4],
+            [0.0, 0.0, 0.6],
+        ],
+        dtype=np.float64,
+    )
+    env = ManiSoftWaypointSACEnv.__new__(ManiSoftWaypointSACEnv)
+    env.pose_map_interpolation_dimensions = 3
+    env.pose_map_triangulation = Delaunay(points)
+    env.pose_map_valid_simplices = np.ones(
+        len(env.pose_map_triangulation.simplices), dtype=bool
+    )
+    env.pose_map_policy_actions = np.zeros((len(points), 18), dtype=np.float32)
+    env.pose_map_policy_actions[:, :3] = points
+    query = np.asarray([0.2, 0.1, 0.48])
+
+    action = env._pose_map_action(query)
+
+    np.testing.assert_allclose(action[:3], query, atol=1e-7)
+    assert action.shape == (18,)
+
+
+def test_long_waypoint_chords_respect_ten_to_twenty_centimetres() -> None:
+    workspace = WaypointWorkspace.from_bounds(
+        [0.0, 0.0, 0.44],
+        [0.24, 0.24, 0.47],
+        max_reach=1.0,
+    )
+    generator = WaypointPathGenerator(
+        workspace,
+        waypoint_segment_count_range=(10, 10),
+        waypoint_segment_count_probabilities=(1.0,),
+        waypoint_segment_length_range=(0.10, 0.20),
+        waypoint_maximum_extent=0.24,
+        waypoint_minimum_turn_degrees=0.0,
+        waypoint_maximum_turn_degrees=175.0,
+        waypoint_vertical_delta_range=(0.0, 0.0),
+    )
+    start = np.asarray([0.12, 0.04, 0.455])
+    path = generator.generate(
+        np.random.default_rng(20260895),
+        start,
+        curriculum="table_waypoint_polyline",
+        family="waypoint_polyline",
+    )
+    lengths = np.linalg.norm(np.diff(path.anchors, axis=0), axis=1)
+    assert len(lengths) == 10
+    assert np.all(lengths >= 0.10 - 1e-6)
+    assert np.all(lengths <= 0.20 + 1e-6)
+    assert np.all(workspace.contains(path.anchors))
+
+
+def test_waypoint_polyline_can_use_a_short_entry_segment_before_long_chords() -> None:
+    workspace = WaypointWorkspace.from_bounds(
+        [0.0, 0.0, 0.44],
+        [0.30, 0.30, 0.49],
+        max_reach=1.0,
+    )
+    generator = WaypointPathGenerator(
+        workspace,
+        waypoint_segment_count_range=(8, 8),
+        waypoint_segment_count_probabilities=(1.0,),
+        waypoint_segment_length_range=(0.10, 0.20),
+        waypoint_first_segment_length_range=(0.03, 0.08),
+        waypoint_maximum_extent=0.30,
+        waypoint_maximum_turn_degrees=175.0,
+        waypoint_vertical_delta_range=(-0.01, 0.01),
+    )
+    path = generator.generate(
+        np.random.default_rng(20261071),
+        np.asarray([0.15, 0.05, 0.465]),
+        curriculum="table_waypoint_polyline",
+        family="waypoint_polyline",
+    )
+    lengths = np.linalg.norm(np.diff(path.anchors, axis=0), axis=1)
+    assert 0.03 - 1e-6 <= lengths[0] <= 0.081
+    assert np.all(lengths[1:] >= 0.10 - 1e-6)
+    assert np.all(lengths[1:] <= 0.201)
+    assert np.all(workspace.contains(path.anchors))
+
+
+def test_custom_path_does_not_prepend_a_roundoff_duplicate_start() -> None:
+    generator = WaypointPathGenerator()
+    start = np.asarray([0.13752586, 0.72552967, 0.50559115])
+    anchors = np.asarray(
+        [
+            start + np.asarray([2e-7, 0.0, 0.0]),
+            start + np.asarray([-0.10, 0.01, 0.0]),
+        ]
+    )
+    path = generator.generate(
+        np.random.default_rng(1),
+        start,
+        curriculum="table_long_waypoints",
+        anchors=anchors,
+    )
+    assert len(path.anchors) == 2
+    np.testing.assert_allclose(path.anchors[0], start)
 
 
 def test_reference_path_projection_is_geometric_and_window_bounded() -> None:
@@ -112,6 +384,43 @@ def test_reference_path_projection_is_geometric_and_window_bounded() -> None:
     np.testing.assert_allclose(projected, [0.05, 0.0, 0.5])
     # The identical returning segment is outside the permitted forward window.
     assert progress < 0.10
+
+
+def test_reference_path_projection_can_ignore_vertical_error() -> None:
+    path = ReferencePath.from_points(
+        "rising_line",
+        np.asarray([[0.0, 0.0, 0.44], [0.2, 0.0, 0.49]]),
+        np.asarray([[0.0, 0.0, 0.44], [0.2, 0.0, 0.49]]),
+    )
+    progress, distance, projected = path.project(
+        [0.1, 0.01, 0.44],
+        coordinate_weights=(1.0, 1.0, 0.0),
+    )
+    assert progress == pytest.approx(0.5 * path.length)
+    assert distance == pytest.approx(0.01)
+    np.testing.assert_allclose(projected, [0.1, 0.0, 0.465])
+
+
+def test_vertical_tolerance_relaxes_z_without_changing_xy_capture() -> None:
+    env = ManiSoftWaypointSACEnv.__new__(ManiSoftWaypointSACEnv)
+    env.tracking_vertical_tolerance = 0.025
+    target = np.asarray([0.30, 0.40, 0.45])
+
+    assert env._task_space_distance(
+        target + np.asarray([0.01, 0.0, 0.020]), target
+    ) == pytest.approx(0.01)
+    assert env._within_task_tolerance(
+        target + np.asarray([0.009, 0.0, 0.024]), target, 0.010
+    )
+    assert not env._within_task_tolerance(
+        target + np.asarray([0.011, 0.0, 0.0]), target, 0.010
+    )
+    assert not env._within_task_tolerance(
+        target + np.asarray([0.0, 0.0, 0.026]), target, 0.010
+    )
+    assert env._task_space_distance(
+        target + np.asarray([0.0, 0.0, 0.035]), target
+    ) == pytest.approx(0.010)
 
 
 @pytest.mark.parametrize(
@@ -307,6 +616,41 @@ def test_segment_count_probabilities_control_multipoint_curriculum() -> None:
     )
 
 
+def test_hard_turn_episode_mixture_can_oversample_reversal_paths() -> None:
+    generator = WaypointPathGenerator(
+        WaypointWorkspace.from_bounds(
+            low=(-0.25, -0.25, 0.44),
+            high=(0.25, 0.25, 0.48),
+            max_reach=1.0,
+        ),
+        waypoint_segment_count_range=(4, 4),
+        waypoint_segment_count_probabilities=(1.0,),
+        waypoint_segment_length_range=(0.02, 0.03),
+        waypoint_maximum_extent=0.12,
+        waypoint_minimum_turn_degrees=0.0,
+        waypoint_maximum_turn_degrees=175.0,
+        waypoint_hard_turn_probability=1.0,
+        waypoint_hard_turn_range_degrees=(120.0, 150.0),
+    )
+    path = generator.generate(
+        np.random.default_rng(20268103),
+        np.asarray([0.0, 0.0, 0.46]),
+        curriculum="table_waypoint_polyline",
+        family="waypoint_polyline",
+    )
+    vectors = np.diff(path.anchors[:, :2], axis=0)
+    headings = np.arctan2(vectors[:, 1], vectors[:, 0])
+    turns = np.abs(
+        np.rad2deg(
+            np.arctan2(
+                np.sin(np.diff(headings)), np.cos(np.diff(headings))
+            )
+        )
+    )
+    assert np.all(turns >= 120.0 - 1e-6)
+    assert np.all(turns <= 150.0 + 1e-6)
+
+
 def test_tight_turn_polyline_has_deterministic_feasible_fallback() -> None:
     generator = WaypointPathGenerator(
         waypoint_segment_count_range=(3, 3),
@@ -319,6 +663,7 @@ def test_tight_turn_polyline_has_deterministic_feasible_fallback() -> None:
     anchors = generator._minimum_length_polyline_fallback(
         start=start,
         segment_count=3,
+        minimum_turn=0.0,
         maximum_turn=np.deg2rad(30.0),
         minimum_length=0.012,
         minimum_revisit=0.0054,
@@ -367,6 +712,28 @@ def test_tight_turn_polyline_fallback_preserves_path_diversity() -> None:
         assert np.max(turns) <= 30.0001
         assert np.max(np.linalg.norm(anchors - start, axis=1)) <= 0.0350001
         assert np.all(generator.workspace.contains(anchors))
+
+
+def test_waypoint_generation_mode_reports_random_or_fallback() -> None:
+    generator = WaypointPathGenerator(
+        waypoint_segment_count_range=(3, 3),
+        waypoint_segment_length_range=(0.012, 0.022),
+        waypoint_maximum_extent=0.035,
+        waypoint_maximum_turn_degrees=30.0,
+        waypoint_vertical_delta_range=(0.0, 0.0),
+    )
+    start = np.asarray([0.2694103, 0.6911209, 0.4974925])
+    modes = {
+        generator.generate(
+            np.random.default_rng(seed),
+            start,
+            curriculum="table_waypoint_polyline",
+            family="waypoint_polyline",
+        ).generation_mode
+        for seed in range(30)
+    }
+    assert modes <= {"random", "curved_fallback", "deterministic_fallback"}
+    assert modes
 
 
 def test_fixed_seed_panel_cycles_and_rewinds() -> None:
@@ -481,12 +848,64 @@ def test_reference_target_stops_at_uncaptured_internal_waypoint() -> None:
     assert env.current_target[1] > 0.0
 
 
-def test_internal_waypoint_bonus_requires_capture_radius(tmp_path) -> None:
+def test_reference_action_does_not_extrapolate_beyond_path_end() -> None:
+    path = ReferencePath.from_points(
+        "waypoint_polyline",
+        np.asarray(
+            [
+                [0.0, 0.0, 0.5],
+                [0.1, 0.0, 0.5],
+                [0.2, 0.0, 0.5],
+            ]
+        ),
+        np.asarray(
+            [
+                [0.0, 0.0, 0.5],
+                [0.1, 0.0, 0.5],
+                [0.2, 0.0, 0.5],
+            ]
+        ),
+    )
+    env = ManiSoftWaypointSACEnv.__new__(ManiSoftWaypointSACEnv)
+    env.path = path
+    env.internal_waypoint_capture_radius = 0.0
+    env.target_lead_distance = 0.05
+    env.lookahead_distance = 0.02
+    env.path_progress = path.length - 0.01
+    env.path_anchor_policy_actions = np.asarray(
+        [[0.0, 0.0], [0.5, 0.25], [1.0, 0.75]], dtype=np.float32
+    )
+    env.action_space = gym.spaces.Box(
+        low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+    )
+    env._initialize_internal_waypoint_gate()
+
+    env._update_reference_targets()
+
+    np.testing.assert_allclose(env.current_target, path.anchors[-1], atol=1e-8)
+    np.testing.assert_allclose(
+        env.reference_policy_action,
+        env.path_anchor_policy_actions[-1],
+        atol=1e-8,
+    )
+
+
+@pytest.mark.parametrize(
+    "setting",
+    (
+        {"internal_waypoint_bonus": 1.0},
+        {"internal_waypoint_progress_scale": 1.0},
+        {"internal_waypoint_distance_penalty_scale": 1.0},
+    ),
+)
+def test_internal_waypoint_rewards_require_capture_radius(
+    tmp_path, setting
+) -> None:
     with pytest.raises(ValueError, match="requires a positive capture radius"):
         ManiSoftWaypointSACEnv(
             _scenario(tmp_path),
             internal_waypoint_capture_radius=0.0,
-            internal_waypoint_bonus=1.0,
+            **setting,
         )
 
 
@@ -527,6 +946,17 @@ class _FakeMuscle:
 
 
 class _FakeSimulation:
+    def __init__(self) -> None:
+        class SoftRobotState:
+            element_positions = np.asarray(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 0.9]], dtype=np.float64
+            )
+
+        class Backend:
+            softrobot_state = SoftRobotState()
+
+        self._backend = Backend()
+
     def step_with_torque_callback(self, callback) -> None:
         callback(np.ones(20))
 
@@ -639,6 +1069,115 @@ def test_environment_observation_and_action_rate_limit(monkeypatch, tmp_path) ->
     np.testing.assert_allclose(next_observation[45:63], 0.01, atol=1e-7)
 
 
+def test_gate74_appends_features_without_changing_physical_state(
+    monkeypatch, tmp_path
+) -> None:
+    state = np.zeros(45, dtype=np.float32)
+    state[30:33] = [0.0, 0.0, 0.94]
+
+    def fake_reset(self, *, seed=None, options=None):
+        self._np_random = np.random.default_rng(seed)
+        self.sim = _FakeSimulation()
+        self.muscle = _FakeMuscle()
+        return state.copy(), {}
+
+    monkeypatch.setattr(ManiSoftTipTrackingEnv, "reset", fake_reset)
+    env = ManiSoftWaypointSACEnv(
+        _scenario(tmp_path),
+        curriculum="point",
+        action_mode="table_equilibrium",
+        observation_mode="gate74",
+    )
+    observation, _ = env.reset(seed=16)
+    assert observation.shape == (74,)
+    np.testing.assert_allclose(observation[:45], state)
+    np.testing.assert_allclose(observation[70:72], 0.0)
+    assert observation[72] == pytest.approx(0.0)
+
+
+def test_internal_waypoint_potential_preserves_original_45_state(
+    monkeypatch, tmp_path
+) -> None:
+    reset_state = np.zeros(45, dtype=np.float32)
+    reset_state[30:33] = [0.0, 0.0, 0.94]
+    moved_state = reset_state.copy()
+    moved_state[30:33] = [0.005, 0.0, 0.94]
+
+    def fake_reset(self, *, seed=None, options=None):
+        self._np_random = np.random.default_rng(seed)
+        self.sim = _FakeSimulation()
+        self.muscle = _FakeMuscle()
+        return reset_state.copy(), {}
+
+    monkeypatch.setattr(ManiSoftTipTrackingEnv, "reset", fake_reset)
+    env = ManiSoftWaypointSACEnv(
+        _scenario(tmp_path),
+        curriculum="point",
+        internal_waypoint_capture_radius=0.010,
+        internal_waypoint_progress_scale=0.25,
+        internal_waypoint_distance_penalty_scale=0.10,
+    )
+    env.reset(seed=13)
+    anchors = np.asarray(
+        [[0.0, 0.0, 0.94], [0.02, 0.0, 0.94], [0.02, 0.02, 0.94]]
+    )
+    env.path = ReferencePath.from_points("potential_test", anchors, anchors)
+    env.path_progress = 0.0
+    env.desired_speed = 0.02
+    env._initialize_internal_waypoint_gate()
+    env._update_reference_targets()
+    monkeypatch.setattr(env, "_physical_state", lambda: moved_state.copy())
+
+    observation, _, terminated, truncated, info = env.step(np.zeros(18))
+    assert not terminated and not truncated
+    assert info["internal_waypoint_distance_delta"] == pytest.approx(0.005)
+    assert info["normalized_internal_waypoint_progress"] == pytest.approx(2.0)
+    assert info["normalized_internal_waypoint_capture_error"] == pytest.approx(0.5)
+    np.testing.assert_allclose(observation[:45], moved_state)
+    assert observation.shape == (70,)
+
+
+def test_active_waypoint_distance_stall_has_dedicated_truncation(
+    monkeypatch, tmp_path
+) -> None:
+    state = np.zeros(45, dtype=np.float32)
+    state[30:33] = [0.0, 0.0, 0.94]
+
+    def fake_reset(self, *, seed=None, options=None):
+        self._np_random = np.random.default_rng(seed)
+        self.sim = _FakeSimulation()
+        self.muscle = _FakeMuscle()
+        return state.copy(), {}
+
+    monkeypatch.setattr(ManiSoftTipTrackingEnv, "reset", fake_reset)
+    env = ManiSoftWaypointSACEnv(
+        _scenario(tmp_path),
+        curriculum="point",
+        internal_waypoint_capture_radius=0.010,
+        waypoint_stall_steps=2,
+        stall_grace_steps=100,
+        stall_window_steps=100,
+    )
+    env.reset(seed=14)
+    anchors = np.asarray(
+        [[0.0, 0.0, 0.94], [0.02, 0.0, 0.94], [0.02, 0.02, 0.94]]
+    )
+    env.path = ReferencePath.from_points("waypoint_stall_test", anchors, anchors)
+    env.path_progress = 0.0
+    env._initialize_internal_waypoint_gate()
+    env._update_reference_targets()
+    monkeypatch.setattr(env, "_physical_state", lambda: state.copy())
+
+    _, _, terminated, truncated, info = env.step(np.zeros(18))
+    assert not terminated and not truncated
+    _, reward, terminated, truncated, info = env.step(np.zeros(18))
+    assert not terminated and truncated
+    assert info["waypoint_stalled"]
+    assert not info["path_progress_stalled"]
+    assert info["stalled"]
+    assert reward < -1.0
+
+
 def test_table_equilibrium_action_maps_two_dimensions_to_physical_action(
     tmp_path,
 ) -> None:
@@ -693,6 +1232,7 @@ def test_cartesian_prior_blends_policy_with_target_feedback() -> None:
     env.action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
     env.action_mode = "table_cartesian_delta"
     env.cartesian_prior_weight = 0.60
+    env.cartesian_prior_internal_waypoints_only = False
     env.cartesian_prior_proportional_gain = 20.0
     env.cartesian_prior_feedforward_scale = 1.0
     env.cartesian_command_distance = 0.01
@@ -717,6 +1257,94 @@ def test_cartesian_prior_blends_policy_with_target_feedback() -> None:
     np.testing.assert_allclose(env.last_raw_policy_action, raw)
     np.testing.assert_allclose(env.last_controller_prior_action, expected_prior)
     np.testing.assert_allclose(blended, expected)
+
+
+def test_cartesian_prior_can_switch_off_after_internal_waypoints() -> None:
+    env = ManiSoftWaypointSACEnv.__new__(ManiSoftWaypointSACEnv)
+    env.action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+    env.action_mode = "table_cartesian_delta"
+    env.cartesian_prior_weight = 0.50
+    env.cartesian_prior_internal_waypoints_only = True
+    env.path = ReferencePath.from_points(
+        "waypoint_polyline",
+        np.asarray([[0.0, 0.0, 0.5], [0.02, 0.0, 0.5], [0.04, 0.0, 0.5]]),
+        np.asarray([[0.0, 0.0, 0.5], [0.02, 0.0, 0.5], [0.04, 0.0, 0.5]]),
+    )
+    env.next_internal_waypoint_index = 2
+    raw = np.asarray([0.3, -0.2], dtype=np.float32)
+    np.testing.assert_allclose(env._blend_cartesian_prior(raw), raw)
+    np.testing.assert_allclose(env.last_controller_prior_action, 0.0)
+
+
+def test_equilibrium_path_prior_adds_bounded_sac_residual() -> None:
+    env = ManiSoftWaypointSACEnv.__new__(ManiSoftWaypointSACEnv)
+    env.action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+    env.cartesian_prior_weight = 0.0
+    env.cartesian_prior_internal_waypoints_only = False
+    env.equilibrium_path_prior_weight = 1.0
+    env.equilibrium_path_residual_scale = 0.03
+    env.reference_policy_action = np.asarray([0.25, 0.0], dtype=np.float32)
+    raw = np.asarray([0.50, -0.50], dtype=np.float32)
+    blended = env._blend_cartesian_prior(raw)
+    np.testing.assert_allclose(blended, [0.265, -0.015], atol=1e-7)
+    np.testing.assert_allclose(env.last_controller_prior_action, [0.25, 0.0])
+
+
+def test_cartesian_prior_adds_bounded_sac_residual() -> None:
+    env = ManiSoftWaypointSACEnv.__new__(ManiSoftWaypointSACEnv)
+    env.action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+    env.action_mode = "table_cartesian_delta"
+    env.cartesian_prior_weight = 1.0
+    env.cartesian_prior_residual_scale = 0.10
+    env.cartesian_prior_internal_waypoints_only = False
+    env.equilibrium_path_prior_weight = 0.0
+    env.equilibrium_path_residual_scale = 0.0
+    env.last_physical_state = np.zeros(45, dtype=np.float32)
+    env._cartesian_prior_action = lambda _: np.asarray([0.25, -0.10])
+
+    blended = env._blend_cartesian_prior(np.asarray([0.50, -0.50]))
+
+    np.testing.assert_allclose(blended, [0.30, -0.15], atol=1e-7)
+
+
+def test_certified_long_path_samples_three_to_five_commanded_points() -> None:
+    class Generator:
+        waypoint_segment_count_range = (3, 5)
+        waypoint_segment_count_probabilities = np.asarray([0.2, 0.3, 0.5])
+        dense_spacing = 0.005
+
+    env = ManiSoftWaypointSACEnv.__new__(ManiSoftWaypointSACEnv)
+    env.equilibrium_path_entry_index = 1
+    env.equilibrium_path_tip_positions = np.column_stack(
+        (
+            np.arange(5, dtype=np.float32) * -0.10,
+            np.full(5, 0.72, dtype=np.float32),
+            np.full(5, 0.505, dtype=np.float32),
+        )
+    )
+    env.equilibrium_path_policy_actions = np.column_stack(
+        (np.linspace(0.0, 1.0, 5, dtype=np.float32), np.zeros(5))
+    )
+    env.path_generator = Generator()
+    env._np_random = np.random.default_rng(8)
+    commanded_point_counts = {
+        len(env._table_equilibrium_long_path(1).anchors) - 1 for _ in range(100)
+    }
+    assert commanded_point_counts == {3, 4, 5}
+    five_target_path = None
+    for _ in range(100):
+        candidate = env._table_equilibrium_long_path(1)
+        if len(candidate.anchors) == 6:
+            five_target_path = candidate
+            break
+    assert five_target_path is not None
+    np.testing.assert_allclose(
+        five_target_path.anchors[:, 0],
+        [0.0, -0.1, -0.2, -0.3, -0.4, -0.3],
+        atol=1e-7,
+    )
+    with pytest.raises(ValueError, match="not covered"):
+        env._table_equilibrium_long_path(0)
 
 
 def test_stationary_policy_is_truncated_as_stalled(monkeypatch, tmp_path) -> None:
@@ -768,6 +1396,34 @@ def test_environment_terminates_below_virtual_table(monkeypatch, tmp_path) -> No
     assert terminated and not truncated
     assert info["table_violation"]
     assert reward < -299.0
+
+
+def test_environment_can_log_table_violation_without_terminating(
+    monkeypatch, tmp_path
+) -> None:
+    reset_state = np.zeros(45, dtype=np.float32)
+    reset_state[30:33] = [0.0, 0.0, 0.94]
+    below_table = reset_state.copy()
+    below_table[30:33] = [0.0, 0.4, 0.39]
+
+    def fake_reset(self, *, seed=None, options=None):
+        self._np_random = np.random.default_rng(seed)
+        self.sim = _FakeSimulation()
+        self.muscle = _FakeMuscle()
+        return reset_state.copy(), {}
+
+    monkeypatch.setattr(ManiSoftTipTrackingEnv, "reset", fake_reset)
+    env = ManiSoftWaypointSACEnv(
+        _scenario(tmp_path),
+        curriculum="point",
+        table_violation_penalty=0.0,
+        terminate_on_table_violation=False,
+    )
+    env.reset(seed=7)
+    monkeypatch.setattr(env, "_physical_state", lambda: below_table.copy())
+    _, _, terminated, truncated, info = env.step(np.zeros(18))
+    assert not terminated and not truncated
+    assert info["table_violation"]
 
 
 def test_environment_bounds_terminal_precision_attempt(monkeypatch, tmp_path) -> None:
@@ -843,3 +1499,46 @@ def test_projection_end_outside_capture_radius_does_not_start_terminal_timeout(
         assert info["geometric_path_end"]
         assert not info["terminal_capture"]
         assert not info["terminal_timeout"]
+
+
+def test_terminal_timeout_requires_consecutive_capture_dwell(
+    monkeypatch, tmp_path
+) -> None:
+    reset_state = np.zeros(45, dtype=np.float32)
+    reset_state[30:33] = [0.0, 0.0, 0.94]
+    inside = reset_state.copy()
+    inside[30:33] = [0.02, 0.015, 0.94]
+    outside = reset_state.copy()
+    outside[30:33] = [0.02, 0.030, 0.94]
+
+    def fake_reset(self, *, seed=None, options=None):
+        self._np_random = np.random.default_rng(seed)
+        self.sim = _FakeSimulation()
+        self.muscle = _FakeMuscle()
+        return reset_state.copy(), {}
+
+    monkeypatch.setattr(ManiSoftTipTrackingEnv, "reset", fake_reset)
+    env = ManiSoftWaypointSACEnv(
+        _scenario(tmp_path),
+        curriculum="point",
+        success_threshold=0.010,
+        terminal_capture_radius=0.020,
+        terminal_settle_steps=2,
+    )
+    env.reset(seed=15)
+    points = np.asarray([[0.0, 0.0, 0.94], [0.02, 0.0, 0.94]])
+    env.path = ReferencePath.from_points("terminal_dwell_test", points, points)
+    env.path_progress = 0.0
+    env._initialize_internal_waypoint_gate()
+    env._update_reference_targets()
+    states = iter((inside, outside, inside))
+    monkeypatch.setattr(env, "_physical_state", lambda: next(states).copy())
+
+    env.step(np.zeros(18))
+    assert env.terminal_entry_step == 1
+    env.step(np.zeros(18))
+    assert env.terminal_entry_step is None
+    _, _, terminated, truncated, info = env.step(np.zeros(18))
+    assert not terminated and not truncated
+    assert env.terminal_entry_step == 3
+    assert not info["terminal_timeout"]

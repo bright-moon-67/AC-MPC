@@ -44,7 +44,9 @@ def _minimum_jerk(fraction: float) -> float:
     return value**3 * (10.0 - 15.0 * value + 6.0 * value**2)
 
 
-def _rotated_action(seed: dict[str, Any]) -> np.ndarray:
+def _rotated_action(
+    seed: dict[str, Any], *, action_limit: float = 0.30
+) -> np.ndarray:
     action = np.asarray(seed["action"], dtype=np.float64).reshape(6, 3)
     angle = np.deg2rad(
         float(seed["align_rotation_degrees"])
@@ -55,7 +57,9 @@ def _rotated_action(seed: dict[str, Any]) -> np.ndarray:
     )
     result = action.copy()
     result[:, :2] = action[:, :2] @ rotation.T
-    return np.clip(result.reshape(-1), -0.30, 0.30).astype(np.float32)
+    return np.clip(result.reshape(-1), -action_limit, action_limit).astype(
+        np.float32
+    )
 
 
 def _table_clearance(
@@ -83,6 +87,7 @@ def _rollout(
     ramp_steps: int,
     hold_steps: int,
     seed: int,
+    action_limit: float,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -95,7 +100,7 @@ def _rollout(
     env = ManiSoftTipTrackingEnv(
         scenario,
         target_tip=(0.0, 0.0, 0.5),
-        absolute_action_limit=0.30,
+        absolute_action_limit=action_limit,
     )
     state, _ = env.reset(seed=seed)
     states = [np.asarray(state, dtype=np.float32)]
@@ -163,10 +168,24 @@ def main() -> None:
     safety_margin = float(table["safety_margin"])
     ramp_steps = int(motion["ramp_steps"])
     hold_steps = int(motion["hold_steps"])
+    stability_tail_steps = int(
+        motion.get("stability_tail_steps", hold_steps)
+    )
+    if not 1 <= stability_tail_steps <= hold_steps:
+        raise ValueError(
+            "motion.stability_tail_steps must lie in [1, hold_steps]"
+        )
     max_delta = float(motion["maximum_action_delta"])
     max_hold_span = float(motion["maximum_hold_tip_span"])
     max_replay_error = float(motion["maximum_replay_tip_error"])
     max_reach = float(workspace["max_reach"])
+    action_limit = float(motion.get("absolute_action_limit", 0.30))
+    maximum_tip_downward_angle = float(
+        motion.get("maximum_tip_downward_angle_degrees", 180.0)
+    )
+    minimum_arch_height = float(motion.get("minimum_arch_height", 0.0))
+    if action_limit <= 0:
+        raise ValueError("motion.absolute_action_limit must be positive")
 
     names: list[str] = []
     state_rows: list[np.ndarray] = []
@@ -179,13 +198,16 @@ def main() -> None:
     reports: list[dict[str, Any]] = []
     for index, seed_config in enumerate(payload["seeds"]):
         name = str(seed_config["name"])
-        target_action = _rotated_action(seed_config)
+        target_action = _rotated_action(
+            seed_config, action_limit=action_limit
+        )
         states, actions, nodes, velocities, directors, omegas, internal_states = _rollout(
             scenario,
             target_action,
             ramp_steps=ramp_steps,
             hold_steps=hold_steps,
             seed=args.seed + index,
+            action_limit=action_limit,
         )
         (
             replay_states,
@@ -201,10 +223,21 @@ def main() -> None:
             ramp_steps=ramp_steps,
             hold_steps=hold_steps,
             seed=args.seed + 10_000 + index,
+            action_limit=action_limit,
         )
         tip = states[-1, 30:33]
+        tip_tangent = nodes[-1, -1] - nodes[-1, -2]
+        tip_tangent /= max(float(np.linalg.norm(tip_tangent)), 1e-12)
+        tip_downward_angle = float(
+            np.rad2deg(
+                np.arccos(np.clip(-tip_tangent[2], -1.0, 1.0))
+            )
+        )
+        arch_height = float(np.max(nodes[-1, :, 2]) - tip[2])
         action_delta = float(np.max(np.abs(np.diff(actions, axis=0))))
-        hold_span = np.ptp(states[-hold_steps:, 30:33], axis=0)
+        hold_span = np.ptp(
+            states[-stability_tail_steps:, 30:33], axis=0
+        )
         replay_error = max(
             float(np.max(np.abs(states - replay_states))),
             float(np.max(np.abs(velocities - replay_velocities))),
@@ -232,6 +265,10 @@ def main() -> None:
             "action_delta": action_delta <= max_delta + 1e-8,
             "deterministic_replay": max(replay_error, replay_node_error)
             <= max_replay_error,
+            "tip_points_downward": (
+                tip_downward_angle <= maximum_tip_downward_angle
+            ),
+            "arch_height": arch_height >= minimum_arch_height,
         }
         report = {
             "name": name,
@@ -245,6 +282,9 @@ def main() -> None:
             "maximum_hold_tip_span": float(np.max(hold_span)),
             "maximum_replay_state_error": replay_error,
             "maximum_replay_node_error": replay_node_error,
+            "tip_tangent": tip_tangent.tolist(),
+            "tip_downward_angle_degrees": tip_downward_angle,
+            "arch_height_above_tip": arch_height,
             "checks": checks,
         }
         print(json.dumps(report, sort_keys=True), flush=True)
@@ -287,6 +327,7 @@ def main() -> None:
             table_surface_z=np.asarray(surface_z, dtype=np.float64),
             arm_radius=np.asarray(arm_radius, dtype=np.float64),
             safety_margin=np.asarray(safety_margin, dtype=np.float64),
+            absolute_action_limit=np.asarray(action_limit, dtype=np.float64),
         )
     temporary.replace(output)
     manifest = {

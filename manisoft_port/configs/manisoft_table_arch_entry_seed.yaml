@@ -1,0 +1,34 @@
+table:
+  x_bounds: [0.15, 0.65]
+  y_bounds: [0.28, 0.72]
+  surface_z: 0.36
+  arm_radius: 0.05
+  safety_margin: 0.005
+
+workspace:
+  low: [0.20, 0.29, 0.415]
+  high: [0.52, 0.62, 0.56]
+  max_reach: 1.20
+
+motion:
+  ramp_steps: 600
+  hold_steps: 100
+  absolute_action_limit: 0.60
+  maximum_action_delta: 0.01
+  maximum_hold_tip_span: 0.002
+  maximum_replay_tip_error: 0.00002
+  maximum_tip_downward_angle_degrees: 10.0
+  minimum_arch_height: 0.40
+
+seeds:
+  - name: vertical_arch_entry
+    source: search_entry5_limit060_relz_n006_round3_best
+    align_rotation_degrees: 0.0
+    rotation_offset_degrees: 0.0
+    action:
+      [-0.37192288, -0.06605808, 0.04447515,
+       0.05043528, 0.18718332, 0.00921005,
+       -0.35567880, 0.12437660, 0.33418784,
+       -0.29220536, 0.49099493, -0.29975772,
+       -0.48328331, 0.43711323, -0.03978154,
+       -0.60000000, 0.60000000, 0.10962552]

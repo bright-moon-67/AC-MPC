@@ -41,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-distance", type=float, default=0.020)
     parser.add_argument("--settle-steps", type=int, default=100)
     parser.add_argument("--regularization", type=float, default=1e-6)
+    parser.add_argument("--orientation-weight", type=float, default=0.15)
+    parser.add_argument(
+        "--maximum-calibration-action-delta", type=float, default=0.04
+    )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=887000)
     return parser.parse_args()
@@ -58,11 +62,15 @@ def _initialize_worker(
 def _rollout(task: tuple[int, int, float, int]) -> dict[str, Any]:
     entry_index, action_index, offset, seed = task
     env = ManiSoftWaypointSACEnv(_SCENARIO, **_ENVIRONMENT)
+    calibration_speed = float(
+        np.clip(0.025, env.min_desired_speed, env.max_desired_speed)
+    )
     _, reset_info = env.reset(
         seed=seed,
-        options={"entry_index": entry_index, "desired_speed": 0.025},
+        options={"entry_index": entry_index, "desired_speed": calibration_speed},
     )
     start_tip = np.asarray(reset_info["tip_position"], dtype=np.float64)
+    start_tangent = np.asarray(reset_info["tip_tangent"], dtype=np.float64)
     equilibrium = np.asarray(reset_info["applied_action"], dtype=np.float64)
     requested = equilibrium.copy()
     requested[action_index] = np.clip(
@@ -78,8 +86,15 @@ def _rollout(task: tuple[int, int, float, int]) -> dict[str, Any]:
         minimum_clearance = min(
             minimum_clearance, float(info["whole_arm_table_clearance"])
         )
-        violation |= bool(info["table_violation"] or info["dynamics_violation"])
+        violation |= bool(
+            info["table_violation"]
+            or info["dynamics_violation"]
+            or info["tip_orientation_violation"]
+        )
     response = np.asarray(info["tip_position"], dtype=np.float64) - start_tip
+    tangent_response = (
+        np.asarray(info["tip_tangent"], dtype=np.float64) - start_tangent
+    )
     actual_offset = float(requested[action_index] - equilibrium[action_index])
     env.close()
     return {
@@ -87,6 +102,10 @@ def _rollout(task: tuple[int, int, float, int]) -> dict[str, Any]:
         "action_index": action_index,
         "actual_offset": actual_offset,
         "response": response,
+        "tangent_response": tangent_response,
+        "orientation_error_degrees": float(
+            info["tip_orientation_error_degrees"]
+        ),
         "minimum_clearance": minimum_clearance,
         "violation": violation,
     }
@@ -95,9 +114,12 @@ def _rollout(task: tuple[int, int, float, int]) -> dict[str, Any]:
 def _validate_action(task: tuple[int, int, int, np.ndarray, int]) -> dict[str, Any]:
     entry_index, axis, sign, requested, seed = task
     env = ManiSoftWaypointSACEnv(_SCENARIO, **_ENVIRONMENT)
+    calibration_speed = float(
+        np.clip(0.025, env.min_desired_speed, env.max_desired_speed)
+    )
     _, reset_info = env.reset(
         seed=seed,
-        options={"entry_index": entry_index, "desired_speed": 0.025},
+        options={"entry_index": entry_index, "desired_speed": calibration_speed},
     )
     start_tip = np.asarray(reset_info["tip_position"], dtype=np.float64)
     minimum_clearance = float(reset_info["whole_arm_table_clearance"])
@@ -108,7 +130,11 @@ def _validate_action(task: tuple[int, int, int, np.ndarray, int]) -> dict[str, A
         minimum_clearance = min(
             minimum_clearance, float(info["whole_arm_table_clearance"])
         )
-        violation |= bool(info["table_violation"] or info["dynamics_violation"])
+        violation |= bool(
+            info["table_violation"]
+            or info["dynamics_violation"]
+            or info["tip_orientation_violation"]
+        )
     response = np.asarray(info["tip_position"], dtype=np.float64) - start_tip
     env.close()
     return {
@@ -116,6 +142,10 @@ def _validate_action(task: tuple[int, int, int, np.ndarray, int]) -> dict[str, A
         "axis": axis,
         "sign": sign,
         "response": response,
+        "tip_tangent": np.asarray(info["tip_tangent"], dtype=np.float64),
+        "orientation_error_degrees": float(
+            info["tip_orientation_error_degrees"]
+        ),
         "minimum_clearance": minimum_clearance,
         "violation": violation,
     }
@@ -123,8 +153,14 @@ def _validate_action(task: tuple[int, int, int, np.ndarray, int]) -> dict[str, A
 
 def main() -> None:
     args = parse_args()
-    if min(args.perturbation, args.command_distance) <= 0:
+    if min(
+        args.perturbation,
+        args.command_distance,
+        args.maximum_calibration_action_delta,
+    ) <= 0:
         raise ValueError("perturbation and command distance must be positive")
+    if args.orientation_weight < 0:
+        raise ValueError("orientation-weight must be non-negative")
     if min(args.settle_steps, args.workers) < 1:
         raise ValueError("settle steps and workers must be positive")
     scenario = Path(args.scenario).expanduser().resolve()
@@ -166,6 +202,7 @@ def main() -> None:
         measurements = pool.map(_rollout, tasks)
 
     jacobians = np.zeros((bank.trajectory_count, 3, 18), dtype=np.float64)
+    tangent_jacobians = np.zeros_like(jacobians)
     calibration_clearance = np.full(bank.trajectory_count, np.inf)
     calibration_violations = np.zeros(bank.trajectory_count, dtype=bool)
     for entry in range(bank.trajectory_count):
@@ -180,6 +217,10 @@ def main() -> None:
                 jacobians[entry, :, action] = sum(
                     row["actual_offset"] * row["response"] for row in rows
                 ) / denominator
+                tangent_jacobians[entry, :, action] = sum(
+                    row["actual_offset"] * row["tangent_response"]
+                    for row in rows
+                ) / denominator
         entry_rows = [row for row in measurements if row["entry_index"] == entry]
         calibration_clearance[entry] = min(
             row["minimum_clearance"] for row in entry_rows
@@ -190,13 +231,23 @@ def main() -> None:
     negative_deltas = np.zeros_like(positive_deltas)
     predicted = np.zeros((bank.trajectory_count, 2, 2, 3), dtype=np.float64)
     action_limit = float(environment["absolute_action_limit"])
-    for entry, (jacobian, equilibrium) in enumerate(
-        zip(jacobians, equilibrium_actions)
+    for entry, (jacobian, tangent_jacobian, equilibrium) in enumerate(
+        zip(jacobians, tangent_jacobians, equilibrium_actions)
     ):
-        lower = -action_limit - equilibrium
-        upper = action_limit - equilibrium
+        lower = np.maximum(
+            -action_limit - equilibrium,
+            -args.maximum_calibration_action_delta,
+        )
+        upper = np.minimum(
+            action_limit - equilibrium,
+            args.maximum_calibration_action_delta,
+        )
         augmented = np.vstack(
-            (jacobian, np.sqrt(args.regularization) * np.eye(18))
+            (
+                jacobian,
+                args.orientation_weight * tangent_jacobian,
+                np.sqrt(args.regularization) * np.eye(18),
+            )
         )
         for axis in range(2):
             for sign_index, sign in enumerate((1, -1)):
@@ -204,7 +255,7 @@ def main() -> None:
                 target[axis] = sign * args.command_distance
                 result = lsq_linear(
                     augmented,
-                    np.concatenate((target, np.zeros(18))),
+                    np.concatenate((target, np.zeros(3), np.zeros(18))),
                     bounds=(lower, upper),
                     tol=1e-10,
                     lsmr_tol=1e-10,
@@ -245,6 +296,9 @@ def main() -> None:
     achieved = np.zeros_like(predicted)
     validation_clearance = np.full(bank.trajectory_count, np.inf)
     validation_violations = np.zeros(bank.trajectory_count, dtype=bool)
+    validation_orientation_errors = np.zeros(
+        (bank.trajectory_count, 2, 2), dtype=np.float64
+    )
     for row in validations:
         sign_index = 0 if row["sign"] > 0 else 1
         achieved[row["entry_index"], row["axis"], sign_index] = row["response"]
@@ -252,6 +306,9 @@ def main() -> None:
             validation_clearance[row["entry_index"]], row["minimum_clearance"]
         )
         validation_violations[row["entry_index"]] |= row["violation"]
+        validation_orientation_errors[
+            row["entry_index"], row["axis"], sign_index
+        ] = row["orientation_error_degrees"]
 
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -264,6 +321,7 @@ def main() -> None:
             entry_names=np.asarray(bank.names),
             equilibrium_actions=equilibrium_actions.astype(np.float32),
             tip_jacobians=jacobians.astype(np.float32),
+            tip_tangent_jacobians=tangent_jacobians.astype(np.float32),
             positive_action_deltas=positive_deltas.astype(np.float32),
             negative_action_deltas=negative_deltas.astype(np.float32),
             predicted_displacements=predicted.astype(np.float32),
@@ -271,6 +329,15 @@ def main() -> None:
             command_distance=np.asarray(args.command_distance, dtype=np.float32),
             perturbation=np.asarray(args.perturbation, dtype=np.float32),
             settle_steps=np.asarray(args.settle_steps, dtype=np.int64),
+            orientation_weight=np.asarray(
+                args.orientation_weight, dtype=np.float32
+            ),
+            maximum_calibration_action_delta=np.asarray(
+                args.maximum_calibration_action_delta, dtype=np.float32
+            ),
+            validation_orientation_errors_degrees=(
+                validation_orientation_errors.astype(np.float32)
+            ),
             scenario_sha256=np.asarray(hashlib.sha256(scenario.read_bytes()).hexdigest()),
             entry_bank_sha256=np.asarray(hashlib.sha256(bank_path.read_bytes()).hexdigest()),
             calibration_minimum_clearance=calibration_clearance.astype(np.float32),
@@ -283,11 +350,20 @@ def main() -> None:
         "output": str(output),
         "entries": bank.trajectory_count,
         "command_distance": args.command_distance,
+        "maximum_calibration_action_delta": (
+            args.maximum_calibration_action_delta
+        ),
         "singular_values": [
             np.linalg.svd(jacobian, compute_uv=False).tolist()
             for jacobian in jacobians
         ],
         "achieved_displacements": achieved.tolist(),
+        "validation_orientation_errors_degrees": (
+            validation_orientation_errors.tolist()
+        ),
+        "maximum_validation_orientation_error_degrees": float(
+            np.max(validation_orientation_errors)
+        ),
         "minimum_clearance": float(
             min(calibration_clearance.min(), validation_clearance.min())
         ),
