@@ -307,15 +307,143 @@ class DMCAdapter:
         self._env.close()
 
 
+class ActionRepeatDMCAdapter(DMCAdapter):
+    """DMC adapter with a fixed outer action-repeat protocol.
+
+    The Hopper TD-MPC2 archives contain 25 Hz transitions: one action is held
+    for two native 20 ms DMC steps, the observation is taken after the second
+    step, and the two rewards are accumulated.  Keeping this wrapper explicit
+    prevents those data from being mixed with the native 50 Hz protocol.
+    """
+
+    def __init__(self, task_name: str, *, action_repeat: int = 2, **kwargs: Any):
+        if action_repeat < 2:
+            raise ValueError("Action-repeat adapter requires repeat >= 2")
+        super().__init__(task_name, **kwargs)
+        if self.step_limit % action_repeat:
+            raise ValueError("Native step limit must divide evenly by action_repeat")
+        self._action_repeat = int(action_repeat)
+        self._native_step_limit = self._step_limit
+        self._step_limit //= self._action_repeat
+        self._effective_control_timestep *= self._action_repeat
+        self._effective_time_limit = self._step_limit * self._effective_control_timestep
+
+    def reset(self, seed: Optional[int] = None) -> np.ndarray:
+        # Recreate the native environment at its native control timestep; the
+        # outer timestep is represented by this wrapper, not dm_control.
+        if seed is not None:
+            self._seed = int(seed)
+        self._env.close()
+        self._env = self._spec.env_factory(
+            random=self._seed,
+            control_timestep=self._spec.native_control_dt,
+            time_limit=self._spec.native_time_limit,
+        )
+        self._step_count = 0
+        time_step = self._env.reset()
+        self._last_obs = self._flatten(time_step.observation)
+        self._last_reward = 0.0
+        self._last_done = False
+        self._last_discount = None if time_step.discount is None else float(time_step.discount)
+        self._last_requested_action = None
+        self._last_applied_action = None
+        self._last_info = {}
+        return self._last_obs.copy()
+
+    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
+        requested_action = np.asarray(action, dtype=np.float64).reshape(-1)
+        if requested_action.shape != (self.action_dim,):
+            raise ValueError(f"Expected action shape ({self.action_dim},), got {requested_action.shape}")
+        if np.any(~np.isfinite(requested_action)):
+            raise FloatingPointError("Action contains NaN or Inf")
+        applied_action = np.clip(requested_action, self.action_low, self.action_high)
+        reward = 0.0
+        time_step = None
+        for _ in range(self._action_repeat):
+            time_step = self._env.step(applied_action)
+            reward += float(time_step.reward)
+            if time_step.last():
+                break
+        assert time_step is not None
+        self._step_count += 1
+        self._last_obs = self._flatten(time_step.observation)
+        self._last_reward = reward
+        self._last_done = bool(time_step.last()) or self._step_count >= self._step_limit
+        self._last_discount = None if time_step.discount is None else float(time_step.discount)
+        self._last_requested_action = requested_action.astype(np.float32, copy=True)
+        self._last_applied_action = applied_action.astype(np.float32, copy=True)
+        truncated = self._last_done and self._step_count >= self._step_limit
+        step_type = getattr(time_step.step_type, "name", str(time_step.step_type))
+        self._last_info = {
+            "step_count": self._step_count,
+            "step_type": step_type,
+            "discount": self._last_discount,
+            "action_repeat": self._action_repeat,
+            "native_steps": self._action_repeat,
+            "terminated": bool(self._last_done and not truncated),
+            "truncated": bool(truncated),
+            "requested_action": self._last_requested_action.copy(),
+            "applied_action": self._last_applied_action.copy(),
+            "reward_components": self.get_reward_components(),
+            "contact": self.get_contact_diagnostics(),
+        }
+        return self._last_obs.copy(), self._last_reward, self._last_done, self.get_last_info()
+
+    @property
+    def control_dt(self) -> float:
+        return float(self._effective_control_timestep)
+
+    @property
+    def n_substeps(self) -> int:
+        return int(self._action_repeat * round(self._env.control_timestep() / self.physics_dt))
+
+    def protocol_metadata(self) -> dict[str, Any]:
+        result = super().protocol_metadata()
+        result.update(
+            {
+                "protocol_name": "tdmpc2_action_repeat2_v1",
+                "action_repeat": self._action_repeat,
+                "reward_semantics": "sum_of_native_substep_rewards",
+                "observation_semantics": "final_native_substep_observation",
+            }
+        )
+        return result
+
+
 def make_dmc_adapter(
     task_name: str,
     seed: int = 0,
     control_timestep: Optional[float] = None,
     time_limit: Optional[float] = None,
+    action_repeat: Optional[int] = None,
 ) -> DMCAdapter:
-    return DMCAdapter(
+    """Build one adapter, optionally pinning the outer action-repeat protocol.
+
+    ``None`` preserves the historical task default (AR2 for Hopper Stand and
+    native control for every other task).  Formal Hopper Hop O2O callers pass
+    ``action_repeat=2`` explicitly because their TD-MPC2 dataset is recorded
+    at 25 Hz.  Keeping that choice explicit avoids silently changing native
+    50 Hz Hopper Hop experiments elsewhere in the repository.
+    """
+
+    if action_repeat is None:
+        resolved_action_repeat = 2 if task_name == "hopper_stand" else 1
+    else:
+        if isinstance(action_repeat, bool) or not isinstance(action_repeat, int):
+            raise TypeError("action_repeat must be an integer or None")
+        if action_repeat not in {1, 2}:
+            raise ValueError("action_repeat must currently be 1 or 2")
+        resolved_action_repeat = int(action_repeat)
+
+    common = {
+        "seed": seed,
+        "control_timestep": control_timestep,
+        "time_limit": time_limit,
+    }
+    if resolved_action_repeat == 1:
+        return DMCAdapter(task_name, **common)
+    return ActionRepeatDMCAdapter(
         task_name,
-        seed=seed,
-        control_timestep=control_timestep,
-        time_limit=time_limit,
+        action_repeat=resolved_action_repeat,
+        **common,
     )

@@ -10,7 +10,35 @@
 
 Walker 通过后，默认增加用户指定的 `humanoid_run_pure_state`（55D）高维压力测试。`humanoid_run`（67D 标准 observation）保留为需另行确认的公开 benchmark 对照。
 
-所有主结果使用 [DeepMind Control Suite](https://github.com/google-deepmind/dm_control) 的 `dmc_native_v1`：`dm_control==1.0.44`、native control timestep、action repeat 1、官方 state observation/reward、1000 control steps/episode。任何 action-repeat 复现必须另建具名 config，不能与主结果混报。
+除 Hopper Stand 的历史 AR2 适配外，PPO benchmark 路线使用 [DeepMind Control Suite](https://github.com/google-deepmind/dm_control) 的 `dmc_native_v1`：`dm_control==1.0.44`、native control timestep、action repeat 1、官方 state observation/reward、1000 control steps/episode。
+
+Formal offline-to-online（O2O）实验有两套互斥协议：Cartpole Swingup 使用上述 native 协议；Hopper Stand/Hop 使用 TD-MPC2 数据对应的具名 `tdmpc2_action_repeat2_v1`，即每个 outer action 保持两个 20 ms native steps、reward 求和、outer observation 取第二步之后的状态，共 500 outer steps/episode。dataset、训练环境、checkpoint 和 evaluator 的协议必须逐字段一致，否则启动或恢复会直接失败。
+
+## Formal O2O 实验
+
+本分支包含 Cartpole Swingup、Hopper Stand 和 Hopper Hop 的正式七方法矩阵：
+
+`Cal-RLPD-KMPC / Cal-RLPD / Cal-RLPD-Lift / Cal-QL / RLPD / AWAC / IQL`
+
+| 任务 | Offline RL 数据 | Offline/online 预算 | 环境协议 | Koopman / KMPC / MPVE horizon |
+|---|---:|---:|---|---:|
+| Cartpole Swingup | 100k | 50k updates / 20k transitions | native 100 Hz，1000 steps | 50 / 20 / 10 |
+| Hopper Stand | 200k | 50k updates / 20k transitions | AR2 25 Hz，500 steps | 20 / 8 / 4 |
+| Hopper Hop | 200k | 50k updates / 20k transitions | AR2 25 Hz，500 steps | 20 / 8 / 4 |
+
+正式训练 seeds 为 `20260851..20260855`。RLPD 没有 offline gradient phase，其余方法执行 50k offline updates；诊断评估每 5k offline updates、每 2.5k online transitions 运行 10 episodes。paper-level boundary 固定为 online step 0/20k 的 10 evaluation seeds × 10 episodes。
+
+Hopper 的 frozen Koopman 使用独立于 200k RL buffer 的 400k Hop+Stand quality-balanced corpus；每个 training seed 对应独立 Koopman 初始化。`Cal-RLPD-KMPC` 和 `Cal-RLPD-Lift` 的 offline actor/critic LR 为 `1e-4`，online 恢复为 `3e-4`。
+
+稳定入口如下：
+
+- `formal_cartpole_dataset.py`、`formal_cartpole_koopman.py`、`formal_cartpole.py`：Cartpole 数据、模型和单 seed/method 正式训练；
+- `download_tdmpc2_task.py`、`convert_tdmpc2.py`：Hopper TD-MPC2 数据获取与确定性转换；
+- `formal_hopper_koopman.py`、`formal_hopper.py`、`formal_hopper_hop.py`：Hopper 模型与单 seed/method 正式训练；
+- `archive_checkpoints.py`：完成后的 10×10 boundary evaluation 与 checkpoint ZIP 归档；
+- `formal_cartpole_results.py`、`summarize_hopper_stand.py`：正式结果校验、汇总与作图。
+
+所有入口在写入 optimizer state 前校验任务、dataset hash/selection、Koopman identity、seed、维度、horizon 和环境时间协议。运行产物中的 `run.json`、`protocol.json`、dataset/Koopman manifests 与 SHA256 是最终复现依据；源码不包含机器本地 `runs/` 结果或一次性提交队列。
 
 ## 五种方法
 

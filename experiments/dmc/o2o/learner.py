@@ -274,12 +274,15 @@ class O2OLearner:
         self.log_temperature = nn.Parameter(
             torch.tensor(math.log(config.initial_temperature), device=device)
         )
+        initial_phase = "offline" if config.uses_offline_pretraining else "online"
         self.actor_optimizer = _optimizer(
-            self.actor.parameters(), config.actor_learning_rate, config.gradient_clip_norm
+            self.actor.parameters(),
+            config.learning_rate_for_phase("actor", initial_phase),
+            config.gradient_clip_norm,
         )
         self.critic_optimizer = _optimizer(
             self.critic.parameters(),
-            config.critic_learning_rate,
+            config.learning_rate_for_phase("critic", initial_phase),
             config.gradient_clip_norm,
         )
         self.temperature_optimizer = _optimizer(
@@ -296,11 +299,26 @@ class O2OLearner:
                 self.value = ValueNetwork(self.state_dim, config.hidden_dim).to(device)
             self.value_optimizer = _optimizer(
                 self.value.parameters(),
-                config.critic_learning_rate,
+                config.learning_rate_for_phase("critic", initial_phase),
                 config.gradient_clip_norm,
             )
         self.gradient_updates = 0
         self.actor_updates = 0
+
+    def set_phase_learning_rates(
+        self, phase: Literal["offline", "online"]
+    ) -> None:
+        """Select phase-specific rates without resetting Adam moments."""
+
+        actor_rate = self.config.learning_rate_for_phase("actor", phase)
+        critic_rate = self.config.learning_rate_for_phase("critic", phase)
+        for group in self.actor_optimizer.param_groups:
+            group["lr"] = actor_rate
+        for group in self.critic_optimizer.param_groups:
+            group["lr"] = critic_rate
+        if self.value_optimizer is not None:
+            for group in self.value_optimizer.param_groups:
+                group["lr"] = critic_rate
 
     @property
     def temperature(self) -> torch.Tensor:

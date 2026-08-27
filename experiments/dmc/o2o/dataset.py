@@ -21,6 +21,7 @@ from experiments.dmc.tasks.registry import get_task_spec
 
 DATASET_KIND = "acmpc_exorl_cartpole_transitions_v1"
 WALKER_DATASET_KIND = "acmpc_exorl_walker_run_transitions_v1"
+TDMPC2_DATASET_KIND = "acmpc_tdmpc2_dmc_transitions_v1"
 DATASET_KEYS = (
     "observation",
     "action",
@@ -679,9 +680,14 @@ class OfflineDataset:
                     episode_end & ~terminated
                 ).astype(np.bool_, copy=False)
         task = str(metadata.get("task", "cartpole_swingup"))
-        expected_kind = (
-            DATASET_KIND if task == "cartpole_swingup" else WALKER_DATASET_KIND
-        )
+        expected_kind = {
+            "cartpole_swingup": DATASET_KIND,
+            "walker_run": WALKER_DATASET_KIND,
+            "hopper_stand": TDMPC2_DATASET_KIND,
+            "hopper_hop": TDMPC2_DATASET_KIND,
+        }.get(task)
+        if expected_kind is None:
+            raise ValueError(f"Unsupported offline dataset task {task!r}")
         if metadata.get("kind") != expected_kind:
             raise ValueError("Unsupported offline dataset kind")
         gamma = float(metadata.get("gamma_for_mc_return", float("nan")))
@@ -957,7 +963,7 @@ def main() -> None:
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--task", choices=("cartpole_swingup", "walker_run"), default="cartpole_swingup"
+        "--task", choices=("cartpole_swingup", "walker_run", "hopper_stand", "hopper_hop"), default="cartpole_swingup"
     )
     parser.add_argument(
         "--reward-source", choices=("oracle", "recorded", "zero"), default="oracle",

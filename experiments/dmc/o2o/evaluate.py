@@ -481,6 +481,7 @@ def evaluate_checkpoint(
     )
 
     expected_protocol = validated.checkpoint["environment_protocol"]
+    action_repeat = expected_protocol.get("action_repeat")
     action_dim = get_task_spec(validated.config.task).action_dim
     returns: list[float] = []
     lengths: list[int] = []
@@ -495,7 +496,10 @@ def evaluate_checkpoint(
                 + episode_index
             )
             episode_seeds.append(reset_seed)
-            env = make_dmc_adapter(validated.config.task, seed=reset_seed)
+            env_kwargs: dict[str, Any] = {"seed": reset_seed}
+            if action_repeat is not None:
+                env_kwargs["action_repeat"] = int(action_repeat)
+            env = make_dmc_adapter(validated.config.task, **env_kwargs)
             try:
                 runtime_protocol = env.protocol_metadata()
                 if runtime_protocol != expected_protocol:

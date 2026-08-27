@@ -73,6 +73,18 @@ TASKS: dict[str, PlaygroundTask] = {
         kmpc_horizon_steps=10,
         mpve_horizon_steps=5,
     ),
+    "HopperStand": PlaygroundTask(
+        "HopperStand",
+        15,
+        4,
+        0.04,
+        0.005,
+        episode_steps=500,
+        koopman_lift_dim=48,
+        koopman_horizon_steps=20,
+        kmpc_horizon_steps=8,
+        mpve_horizon_steps=4,
+    ),
     "WalkerRun": PlaygroundTask(
         "WalkerRun",
         24,

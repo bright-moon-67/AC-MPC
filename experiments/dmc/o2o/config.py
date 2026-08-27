@@ -17,7 +17,9 @@ from typing import Any, Literal
 from experiments.dmc.tasks.registry import get_task_spec
 
 
-SUPPORTED_O2O_TASKS = frozenset({"cartpole_swingup", "walker_run"})
+SUPPORTED_O2O_TASKS = frozenset(
+    {"cartpole_swingup", "walker_run", "hopper_stand", "hopper_hop"}
+)
 
 
 Representation = Literal["raw", "koopman_lifted"]
@@ -350,6 +352,12 @@ class O2OConfig:
     target_tau: float | None = None
     actor_learning_rate: float | None = None
     critic_learning_rate: float | None = None
+    # Optional phase-specific overrides.  ``None`` preserves the historical
+    # single-rate contract (and is omitted from serialization for backward
+    # checkpoint compatibility).  When set, offline pretraining uses these
+    # values and online fine-tuning returns to the base rates above.
+    offline_actor_learning_rate: float | None = None
+    offline_critic_learning_rate: float | None = None
     temperature_learning_rate: float | None = None
     initial_temperature: float = 1.0
     target_entropy: float | None = None
@@ -499,6 +507,13 @@ class O2OConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        for name in (
+            "offline_actor_learning_rate",
+            "offline_critic_learning_rate",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(float(value)) or value <= 0):
+                raise ValueError(f"{name} must be finite and positive when set")
         if not 0 < self.discount <= 1:
             raise ValueError("discount must lie in (0, 1]")
         if not 0 < float(self.target_tau) <= 1:
@@ -614,7 +629,29 @@ class O2OConfig:
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
-        return dataclasses.asdict(self)
+        serialized = dataclasses.asdict(self)
+        # Old checkpoints predate phase-specific rates.  Omitting unset
+        # overrides keeps their config dictionaries and fingerprints valid.
+        for name in (
+            "offline_actor_learning_rate",
+            "offline_critic_learning_rate",
+        ):
+            if serialized[name] is None:
+                serialized.pop(name)
+        return serialized
+
+    def learning_rate_for_phase(
+        self, optimizer: Literal["actor", "critic"], phase: Literal["offline", "online"]
+    ) -> float:
+        if optimizer not in ("actor", "critic"):
+            raise ValueError("optimizer must be exactly 'actor' or 'critic'")
+        if phase not in ("offline", "online"):
+            raise ValueError("phase must be exactly 'offline' or 'online'")
+        base = float(getattr(self, f"{optimizer}_learning_rate"))
+        if phase == "online" or not self.uses_offline_pretraining:
+            return base
+        override = getattr(self, f"offline_{optimizer}_learning_rate")
+        return base if override is None else float(override)
 
     @property
     def fingerprint(self) -> str:

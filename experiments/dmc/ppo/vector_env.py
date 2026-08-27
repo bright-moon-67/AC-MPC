@@ -81,6 +81,7 @@ class SyncDMCVectorEnv:
         *,
         control_timestep: float | None = None,
         time_limit: float | None = None,
+        action_repeat: int | None = None,
         env_factory: EnvFactory | None = None,
         _seed_stride: int | None = None,
         _index_offset: int = 0,
@@ -101,6 +102,7 @@ class SyncDMCVectorEnv:
         self.seed = int(seed)
         self.requested_control_timestep = control_timestep
         self.requested_time_limit = time_limit
+        self.requested_action_repeat = action_repeat
         self._seed_stride = int(_seed_stride or num_envs)
         self._index_offset = int(_index_offset)
         if self._seed_stride < self.num_envs or self._index_offset < 0:
@@ -115,13 +117,15 @@ class SyncDMCVectorEnv:
 
         try:
             for index in range(self.num_envs):
+                env_kwargs = {
+                    "seed": self.seed + self._index_offset + index,
+                    "control_timestep": control_timestep,
+                    "time_limit": time_limit,
+                }
+                if action_repeat is not None:
+                    env_kwargs["action_repeat"] = action_repeat
                 self._envs.append(
-                    env_factory(
-                        self.task_name,
-                        seed=self.seed + self._index_offset + index,
-                        control_timestep=control_timestep,
-                        time_limit=time_limit,
-                    )
+                    env_factory(self.task_name, **env_kwargs)
                 )
             self._initialize_contract()
         except BaseException:
@@ -376,6 +380,7 @@ def _worker_main(
     index_offset: int,
     control_timestep: float | None,
     time_limit: float | None,
+    action_repeat: int | None,
 ) -> None:
     """Own one environment shard and serve reset/step requests."""
 
@@ -391,6 +396,7 @@ def _worker_main(
             seed,
             control_timestep=control_timestep,
             time_limit=time_limit,
+            action_repeat=action_repeat,
             _seed_stride=global_envs,
             _index_offset=index_offset,
         )
@@ -452,6 +458,7 @@ class ProcessDMCVectorEnv:
         workers: int,
         control_timestep: float | None = None,
         time_limit: float | None = None,
+        action_repeat: int | None = None,
         start_method: str = "spawn",
     ) -> None:
         if num_envs < 1:
@@ -486,6 +493,7 @@ class ProcessDMCVectorEnv:
                         offset,
                         control_timestep,
                         time_limit,
+                        action_repeat,
                     ),
                     daemon=False,
                 )
@@ -650,6 +658,7 @@ def make_dmc_vector_env(
     workers: int | None = None,
     control_timestep: float | None = None,
     time_limit: float | None = None,
+    action_repeat: int | None = None,
     env_factory: EnvFactory | None = None,
 ) -> SyncDMCVectorEnv | ProcessDMCVectorEnv:
     """Build the reference or multi-process runner behind one stable contract."""
@@ -666,6 +675,7 @@ def make_dmc_vector_env(
             seed,
             control_timestep=control_timestep,
             time_limit=time_limit,
+            action_repeat=action_repeat,
             env_factory=env_factory,
         )
     if env_factory is not None:
@@ -677,4 +687,5 @@ def make_dmc_vector_env(
         workers=resolved_workers,
         control_timestep=control_timestep,
         time_limit=time_limit,
+        action_repeat=action_repeat,
     )

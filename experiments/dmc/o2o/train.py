@@ -35,8 +35,71 @@ from experiments.dmc.tasks.adapter import make_dmc_adapter
 from experiments.dmc.tasks.registry import get_task_spec
 
 
+RECORDED_REWARD_O2O_TASKS = frozenset({"hopper_stand", "hopper_hop"})
+
+
 DIAGNOSTIC_EVAL_SEED_BASE = 9_000_000
 from experiments.dmc.ppo.vector_env import make_dmc_vector_env
+
+
+def _dataset_action_repeat(task: str, dataset: OfflineDataset) -> int | None:
+    """Resolve an explicit outer-rate contract for recorded Hopper data."""
+
+    if task != "hopper_hop":
+        return None
+    expected = {
+        "action_repeat": 2,
+        "control_dt": 0.04,
+        "transitions_per_episode": 500,
+    }
+    mismatches = {
+        key: {"dataset": dataset.metadata.get(key), "expected": value}
+        for key, value in expected.items()
+        if dataset.metadata.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "Hopper Hop O2O requires the TD-MPC2 AR2 dataset contract: "
+            f"{mismatches}"
+        )
+    return 2
+
+
+def _validate_dataset_environment_protocol(
+    task: str,
+    dataset: OfflineDataset,
+    protocol: dict[str, Any],
+) -> None:
+    """Fail before training if recorded transitions and live timing differ."""
+
+    if task != "hopper_hop":
+        return
+    expected = {
+        "protocol_name": "tdmpc2_action_repeat2_v1",
+        "action_repeat": 2,
+        "control_dt": 0.04,
+        "step_limit": 500,
+    }
+    mismatches = {
+        key: {"runtime": protocol.get(key), "expected": value}
+        for key, value in expected.items()
+        if protocol.get(key) != value
+    }
+    if protocol.get("control_dt") != dataset.metadata.get("control_dt"):
+        mismatches["dataset_control_dt"] = {
+            "runtime": protocol.get("control_dt"),
+            "dataset": dataset.metadata.get("control_dt"),
+        }
+    if protocol.get("action_repeat") != dataset.metadata.get("action_repeat"):
+        mismatches["dataset_action_repeat"] = {
+            "runtime": protocol.get("action_repeat"),
+            "dataset": dataset.metadata.get("action_repeat"),
+        }
+    if mismatches:
+        raise ValueError(
+            "Hopper Hop dataset/environment protocol mismatch: "
+            f"{mismatches}"
+        )
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -254,6 +317,7 @@ def evaluate(
     *,
     episodes: int,
     seed_base: int,
+    action_repeat: int | None = None,
 ) -> dict[str, Any]:
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes < 1:
         raise ValueError("Evaluation episodes must be a positive integer")
@@ -262,7 +326,15 @@ def evaluate(
     # GPU planner calls per control step are pure launch overhead.  A single
     # in-process vector worker avoids process-spawn cost at every 5k checkpoint.
     task = getattr(getattr(learner, "config", None), "task", "cartpole_swingup")
-    env = make_dmc_vector_env(task, episodes, seed=seed_base, workers=1)
+    vector_kwargs: dict[str, Any] = {"workers": 1}
+    if action_repeat is not None:
+        vector_kwargs["action_repeat"] = action_repeat
+    env = make_dmc_vector_env(
+        task,
+        episodes,
+        seed=seed_base,
+        **vector_kwargs,
+    )
     try:
         observation = env.reset()
         totals = np.zeros(episodes, dtype=np.float64)
@@ -856,17 +928,21 @@ def run(
     output.mkdir(parents=True, exist_ok=True)
     metrics_path = output / "metrics.jsonl"
     dataset = OfflineDataset.load(dataset_path)
+    environment_action_repeat = _dataset_action_repeat(config.task, dataset)
     dataset_task = dataset.metadata.get("task")
     if dataset_task is not None and dataset_task != config.task:
         raise ValueError(
             f"Dataset task {dataset_task!r} does not match "
             f"training task {config.task!r}"
         )
-    if dataset.metadata.get("reward_source", "oracle") != "oracle":
+    reward_source = dataset.metadata.get("reward_source", "oracle")
+    if reward_source != "oracle" and config.task not in RECORDED_REWARD_O2O_TASKS:
         raise ValueError(
-            "Offline O2O training requires an oracle reward dataset; "
+            "Offline O2O training requires an oracle reward dataset for this task; "
             "reward-free Koopman data is not a valid offline-RL target"
         )
+    if reward_source not in {"oracle", "recorded"}:
+        raise ValueError("Offline O2O training does not accept zero-reward data")
     if config.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but no CUDA device is available")
     device = torch.device(config.device)
@@ -893,9 +969,15 @@ def run(
         observation_normalizer = FrozenObservationNormalizer.from_offline_observations(
             dataset.arrays["observation"], dataset_sha256=dataset.sha256
         )
-    protocol_env = make_dmc_adapter(config.task, seed=config.seed)
+    protocol_kwargs: dict[str, Any] = {"seed": config.seed}
+    if environment_action_repeat is not None:
+        protocol_kwargs["action_repeat"] = environment_action_repeat
+    protocol_env = make_dmc_adapter(config.task, **protocol_kwargs)
     environment_protocol = protocol_env.protocol_metadata()
     protocol_env.close()
+    _validate_dataset_environment_protocol(
+        config.task, dataset, environment_protocol
+    )
 
     latest_path = output / "latest.pt"
     best_path = output / "best.pt"
@@ -1092,6 +1174,17 @@ def run(
         },
         "initialization": initialization,
         "online_extension": extension_metadata,
+        "learning_rate_schedule": {
+            "offline": {
+                "actor": config.learning_rate_for_phase("actor", "offline"),
+                "critic": config.learning_rate_for_phase("critic", "offline"),
+            },
+            "online": {
+                "actor": config.learning_rate_for_phase("actor", "online"),
+                "critic": config.learning_rate_for_phase("critic", "online"),
+            },
+            "transition": "preserve_adam_state_and_update_param_group_lr",
+        },
         "mpve": {
             "enabled": config.uses_mpve,
             "scope": config.method_spec.mpve_scope,
@@ -1255,7 +1348,10 @@ def run(
                 "Cannot reconstruct a missing step-zero evaluation after training"
             )
         initial_eval = evaluate(
-            learner, episodes=config.eval_episodes, seed_base=DIAGNOSTIC_EVAL_SEED_BASE
+            learner,
+            episodes=config.eval_episodes,
+            seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
+            action_repeat=environment_action_repeat,
         )
         if initial_eval["return_mean"] > best_return:
             best_return = float(initial_eval["return_mean"])
@@ -1323,6 +1419,7 @@ def run(
                 learner,
                 episodes=config.eval_episodes,
                 seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
+                action_repeat=environment_action_repeat,
             )
             save_milestone_checkpoint("offline")
             if diagnostic["return_mean"] > best_return:
@@ -1428,6 +1525,7 @@ def run(
                 learner,
                 episodes=config.eval_episodes,
                 seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
+                action_repeat=environment_action_repeat,
             )
             if offline_eval["return_mean"] > best_return:
                 best_return = float(offline_eval["return_mean"])
@@ -1557,6 +1655,11 @@ def run(
         _atomic_json(output / "run.json", run_metadata)
         return
 
+    # Offline-only overrides end at the exact pre-online boundary.  Retain
+    # learned parameters and Adam moments, but restore the method's original
+    # online actor/critic rates before the first environment transition.
+    learner.set_phase_learning_rates("online")
+
     if online_step % config.num_envs:
         raise ValueError("Resume online_step is not aligned to the vector width")
     if online_episode % config.num_envs:
@@ -1576,11 +1679,14 @@ def run(
         )
         _atomic_json(output / "run.json", run_metadata)
         return
+    online_env_kwargs: dict[str, Any] = {"workers": config.env_workers}
+    if environment_action_repeat is not None:
+        online_env_kwargs["action_repeat"] = environment_action_repeat
     env = make_dmc_vector_env(
         config.task,
         config.num_envs,
         seed=config.seed + 100_000 + online_episode,
-        workers=config.env_workers,
+        **online_env_kwargs,
     )
     if env.protocol != environment_protocol:
         env.close()
@@ -1732,6 +1838,7 @@ def run(
                     learner,
                     episodes=config.eval_episodes,
                     seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
+                    action_repeat=environment_action_repeat,
                 )
                 row = {
                     "phase": "online_evaluation",
@@ -1818,6 +1925,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int)
     parser.add_argument("--env-workers", type=int)
     parser.add_argument("--cql-weight", type=float, default=0.01)
+    parser.add_argument("--offline-actor-learning-rate", type=float)
+    parser.add_argument("--offline-critic-learning-rate", type=float)
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument(
         "--offline-eval-interval-updates", type=int, default=5_000
@@ -1882,6 +1991,8 @@ def main() -> None:
         num_envs=num_envs,
         env_workers=env_workers,
         cql_weight=args.cql_weight,
+        offline_actor_learning_rate=args.offline_actor_learning_rate,
+        offline_critic_learning_rate=args.offline_critic_learning_rate,
         eval_interval_online_steps=(
             smoke_online_steps
             if args.smoke

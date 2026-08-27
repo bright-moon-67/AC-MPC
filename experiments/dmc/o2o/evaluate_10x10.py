@@ -45,13 +45,17 @@ def _evaluate_seed_group(
     """Evaluate one ten-episode group; safe to run in one worker process."""
 
     expected_protocol = validated.checkpoint["environment_protocol"]
+    action_repeat = expected_protocol.get("action_repeat")
     action_dim = get_task_spec(validated.config.task).action_dim
     evaluation_seed = int(seed_base + seed_index * seed_group_stride)
     seed_returns: list[float] = []
     seed_lengths: list[int] = []
     for episode_index in range(episodes_per_seed):
         reset_seed = int(evaluation_seed + episode_index)
-        env = make_dmc_adapter(validated.config.task, seed=reset_seed)
+        env_kwargs: dict[str, Any] = {"seed": reset_seed}
+        if action_repeat is not None:
+            env_kwargs["action_repeat"] = int(action_repeat)
+        env = make_dmc_adapter(validated.config.task, **env_kwargs)
         try:
             if env.protocol_metadata() != expected_protocol:
                 raise ValueError("Live DMC protocol differs from checkpoint")

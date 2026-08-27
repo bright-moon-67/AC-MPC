@@ -262,6 +262,10 @@ def _hopper_task(module, random):
     return module.Hopper(hopping=True, random=random)
 
 
+def _hopper_stand_task(module, random):
+    return module.Hopper(hopping=False, random=random)
+
+
 def _walker_task(module, random):
     return module.PlanarWalker(move_speed=8.0, random=random)
 
@@ -344,6 +348,30 @@ TASK_SPECS: dict[str, TaskSpec] = {
         description=(
             "single-leg contact; obs/reward 1:1 aligned with MS-HopperHop-v1; "
             "near drop-in from the validated MuJoCo branch"
+        ),
+    ),
+    "hopper_stand": TaskSpec(
+        name="hopper_stand",
+        domain="hopper",
+        task="stand",
+        obs_layout=(("position", 6), ("velocity", 7), ("touch", 2)),
+        action_dim=4,
+        native_control_dt=0.02,
+        native_physics_dt=0.005,
+        native_time_limit=20.0,
+        report_groups=(
+            ("qpos", (0, 6)),
+            ("qvel", (6, 13)),
+            ("touch", (13, 15)),
+            ("all", (0, 15)),
+        ),
+        reward_probe=_probe_hopper,
+        env_factory=_make_env("hopper", _hopper_stand_task, 0.02, 20.0),
+        lift_dim=48,
+        k_step=20,  # 0.8 s at the TD-MPC2 outer rate (25 Hz)
+        description=(
+            "Hopper stand with the TD-MPC2 two-substep protocol: actions are "
+            "held for two native 20 ms control steps and rewards are summed."
         ),
     ),
     "walker_run": TaskSpec(
