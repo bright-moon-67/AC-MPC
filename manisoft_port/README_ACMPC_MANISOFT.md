@@ -1620,8 +1620,9 @@ loader 或 checkpoint 格式的修改，必须至少重新运行全套测试，�
 - AC-MPC 代码位于 `manisoft-port` commit
   `89dbf0596fb368630845ca6994fb070c606923ec`；
 - 本任务源码、配置和测试已进入该 commit；
-- `data/experiments/` 中的教师、模型、轨迹和视频仍是本地 artifact，受
-  `.gitignore` 排除，普通 `git clone` 不会获得；
+- `data/experiments/` 中的教师、模型、轨迹和视频受 `.gitignore` 排除，普通
+  `git clone` 不会获得，但第 12.9 节给出了已发布 Release 的下载、校验和解压
+  命令；
 - 实验 artifact 的 `run_config.json` 记录的生成时 Git HEAD 为 `b132742`，因为
   artifact 在源文件正式提交前生成；文件 SHA256 是核验 artifact 的权威依据。
 
@@ -2018,9 +2019,64 @@ cd "$ACMPC_ROOT"
 5. 对应 `run_config.json` 和 `selected_12k_upright_replay.json`；
 6. 如需展示，再附标准回放或最终写实视频。
 
-这些 artifact 总量远小于本地 23 GB 的完整实验目录。当前尚未发布专门的 GitHub
-Release；仅克隆 commit `89dbf05` 无法运行已训练策略。后续正式交接应仿照
-1.6 节为这六类文件生成独立压缩包、记录整包 SHA256，并发布 Release asset。
+这些 artifact 总量远小于本地 23 GB 的完整实验目录。它们已经打包为以下公开
+Release；Release 仓库使用交接分支的 fork，是因为当前账号对上游
+`yuej0422-dev/AC-MPC` 只有读取权限：
+
+- Release：[`wall-bypass-sac-artifacts-20260828`](https://github.com/bright-moon-67/AC-MPC/releases/tag/wall-bypass-sac-artifacts-20260828)
+- asset：`acmpc-manisoft-wall-bypass-minimal-20260828.tar.gz`
+- 大小：`27,772,548` bytes
+- 整包 SHA256：
+  `431e94f59f3758febea1187f8ebc65f9600ff5041cab6c25c90b3925118a5803`
+
+从上游仓库克隆代码并建立隔离布局：
+
+```bash
+cd /root/autodl-tmp
+git clone --recurse-submodules https://github.com/yuej0422-dev/AC-MPC.git
+bash AC-MPC/manisoft_port/scripts/bootstrap_isolated_layout.sh
+```
+
+在 PR 合并前做评审或复现时，应改为直接克隆包含本章代码的交接分支：
+
+```bash
+cd /root/autodl-tmp
+git clone --branch manisoft-wall-handoff --recurse-submodules \
+  https://github.com/bright-moon-67/AC-MPC.git AC-MPC
+bash AC-MPC/manisoft_port/scripts/bootstrap_isolated_layout.sh
+```
+
+下载、校验并在 AC-MPC 仓库根目录解压 artifact：
+
+```bash
+export WORKSPACE=/root/autodl-tmp
+export ACMPC_REPO="$WORKSPACE/AC-MPC"
+export WALL_RELEASE_TAG=wall-bypass-sac-artifacts-20260828
+export WALL_RELEASE_ASSET=acmpc-manisoft-wall-bypass-minimal-20260828.tar.gz
+export WALL_ARTIFACT="$WORKSPACE/$WALL_RELEASE_ASSET"
+
+curl --fail --location \
+  --output "$WALL_ARTIFACT" \
+  "https://github.com/bright-moon-67/AC-MPC/releases/download/$WALL_RELEASE_TAG/$WALL_RELEASE_ASSET"
+
+echo "431e94f59f3758febea1187f8ebc65f9600ff5041cab6c25c90b3925118a5803  $WALL_ARTIFACT" \
+  | sha256sum --check
+tar -xzf "$WALL_ARTIFACT" -C "$ACMPC_REPO"
+
+cd "$ACMPC_REPO"
+sha256sum --check WALL_BYPASS_SHA256SUMS.txt
+```
+
+压缩包保持 `data/experiments/...` 的仓库相对路径，并内含教师 NPZ、12k SAC
+checkpoint、对应 VecNormalize、运行/评测 JSON、标准回放视频和最终写实展示视频。
+`bootstrap_isolated_layout.sh` 建立 `manisoft_port/data -> ../data` 后，第 12.8 节的
+`$TEACHER`、`$RUN` 路径可以直接使用。配置 YAML 和评测/渲染脚本属于 Git
+版本控制，不在 artifact 包内重复存放。
+
+> [!WARNING]
+> Release 只能与本章的强弯曲配置一起使用：半径 `45 mm`、杨氏模量 `2 MPa`、
+> 阻尼 `7`、驱动力矩缩放 `45`、绝对激活上限 `±0.60`。不要与旧
+> `demo_elastica_fast.yaml` 的 Koopman 模型或数据混用。
 
 ### 12.10 已知限制与下一步
 
@@ -2037,6 +2093,6 @@ Release；仅克隆 commit `89dbf05` 无法运行已训练策略。后续正式�
 - **旧 Koopman 不匹配。** 若要回到 AC-MPC 预测控制主线，应先在当前强弯曲
   参数下重新采集系统辨识数据，而不是直接复用 `demo_elastica_fast.yaml` 模型。
 
-最合理的后续顺序是：先固定当前教师和 12k checkpoint 的 Release artifact；
-然后在小范围初态/墙位扰动上做确定性与随机评估；最后再决定是训练墙/目标条件化
+当前教师和 12k checkpoint 已通过第 12.9 节的 Release 固定。最合理的后续顺序
+是：先在小范围初态/墙位扰动上做确定性与随机评估；然后再决定是训练墙/目标条件化
 策略，还是加入真实 MuJoCo/软体杆接触与方块动力学，把视觉推块升级为物理推块。
