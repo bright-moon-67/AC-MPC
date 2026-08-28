@@ -129,7 +129,7 @@ max_delta = 0.0125
 export WORKSPACE=/path/to/workspace
 export ACMPC_REPO="$WORKSPACE/AC-MPC"
 export ACMPC_ROOT="$ACMPC_REPO/manisoft_port"
-export MANISOFT_ROOT="$WORKSPACE/ManiSoft"
+export MANISOFT_ROOT="$ACMPC_REPO/ManiSoft"
 export AC_MPC_PYTHON=/path/to/conda/env/bin/python
 cd "$ACMPC_ROOT"
 ```
@@ -189,8 +189,8 @@ d6e44fe6027a55753ee731c0a7e2bf3e1803090e8b066c051f0de9821e6281cd  v2 waypoint ba
 - 代码基线：AC-MPC `manisoft-port` commit
   `8dba696c5caf79bfd6c90aa41801e16b6508cdf7`
 
-由于下方说明的 v15e 绝对路径限制，当前开箱即用方式是先把两个仓库
-放到 `/root/autodl-tmp/AC-MPC` 和 `/root/autodl-tmp/ManiSoft`，再执行：
+由于下方说明的 v15e 绝对路径限制，当前开箱即用方式是把 AC-MPC 放到
+`/root/autodl-tmp/AC-MPC`，并递归初始化其中固定的 ManiSoft submodule，再执行：
 
 ```bash
 export WORKSPACE=/root/autodl-tmp
@@ -239,23 +239,23 @@ bank 路径，不受这一限制。
   `>=3.10,<3.13`，已在 3.11 上验证）；
 - 训练推荐使用支持 CUDA 的 NVIDIA GPU，数据生成和小规模测试可使用 CPU。
 
-隔离项目依赖本项目修改后的 ManiSoft 仿真环境。AC-MPC 与 ManiSoft 应放在
-同一父目录下，不要用原生 ManiSoft 仓库替代 `acmpc-integration` 分支。
+隔离项目依赖本项目修改后的 ManiSoft 仿真环境。该依赖作为固定 submodule
+放在 AC-MPC 内部；不要用原生 ManiSoft 仓库替代它。
 
 ```text
 workspace/
 ├── AC-MPC/                         # yuej0422-dev 最新主项目
+│   ├── ManiSoft/                   # 固定到 0096f23 的递归 submodule
 │   ├── manisoft_port/              # 本项目的全部受控代码
 │   ├── data/                       # artifact 解压后生成
 │   ├── runs/                       # artifact 解压后生成
 │   └── work_dirs/                  # artifact 解压后生成
-└── ManiSoft/
 ```
 
 当前服务器上已完成上述搭建，接手时无需重复：
 
 - 仓库：`/root/autodl-tmp/AC-MPC/manisoft_port`（隔离项目）与
-  `/root/autodl-tmp/ManiSoft`（`acmpc-integration` 分支）；
+  `/root/autodl-tmp/AC-MPC/ManiSoft`（固定 submodule）；
 - Python 环境：名为 `manisoft`（`/root/miniconda3/envs/manisoft`，Python 3.11）；
 - GPU：NVIDIA RTX 4090 24 GB（CUDA 12.6），适合训练；数据生成只依赖 CPU。
 
@@ -265,34 +265,33 @@ workspace/
 mkdir -p /root/autodl-tmp
 cd /root/autodl-tmp
 
-git clone https://github.com/yuej0422-dev/AC-MPC.git
-
-git clone --branch acmpc-integration --recurse-submodules \
-  https://github.com/bright-moon-67/ManiSoft.git
-
-git -C ManiSoft checkout 4e02bb87962604c6ab6abf06f3f273a1c49c1270
-git -C ManiSoft submodule update --init --recursive
+git clone --recurse-submodules https://github.com/yuej0422-dev/AC-MPC.git
 
 bash AC-MPC/manisoft_port/scripts/bootstrap_isolated_layout.sh
 ```
 
-若克隆 ManiSoft 时未加 `--recurse-submodules`，需补充执行：
+若克隆 AC-MPC 时未加 `--recurse-submodules`，需补充执行：
 
 ```bash
-git -C ManiSoft submodule update --init --recursive
+git -C AC-MPC submodule update --init --recursive
 ```
 
-PR 合并前审阅者可改为克隆 `bright-moon-67/AC-MPC` 的
-`manisoft-port-isolated` 分支；PR 合并后使用上面的目标仓库默认分支即可。
-ManiSoft 必须固定到上述兼容提交，版本不对时接口可能无法工作。初始化脚本
-只建立运行时链接，不复制或改写外层 AC-MPC 的任何源文件。
+PR 合并前审阅者可改为克隆 `bright-moon-67/AC-MPC` 的本 PR 分支：
+
+```bash
+git clone --branch manisoft-wall-handoff --recurse-submodules \
+  https://github.com/bright-moon-67/AC-MPC.git
+```
+
+PR 合并后使用目标仓库默认分支即可。ManiSoft 必须保持在 Git 记录的固定提交；
+初始化脚本会核验版本并建立 artifact 兼容链接，不改写外层 AC-MPC 的源文件。
 
 本文最后核对时的兼容基线为：
 
-- AC-MPC `manisoft-port`：
-  `89dbf0596fb368630845ca6994fb070c606923ec`；
-- ManiSoft `acmpc-integration`：
-  `b52124c208ce599b7fffd60728d3526f3ca5a9d4`；
+- AC-MPC 墙体任务源归档 `manisoft-port`：
+  `ce8f1a8286e0ea86c20e8c21a3f4d6a5094415f3`；
+- 本 PR 固定的 ManiSoft `acmpc-integration`：
+  `0096f2358d2605b9d382480a7abd30e5c2292495`；
 - ManiSoft 固定的 PyElastica submodule：
   `4084bdaf0438c85b60d4127c287d24d14e80be11`。
 
@@ -310,10 +309,10 @@ conda create -n acmpc-manisoft python=3.11 -y
 conda activate acmpc-manisoft
 python -m pip install --upgrade pip
 
-python -m pip install -e /root/autodl-tmp/ManiSoft
+python -m pip install -e /root/autodl-tmp/AC-MPC/ManiSoft
 python -m pip install --no-deps \
-  -e /root/autodl-tmp/ManiSoft/third_party/pyelastica \
-  -e /root/autodl-tmp/ManiSoft/third_party/liegroups
+  -e /root/autodl-tmp/AC-MPC/ManiSoft/third_party/pyelastica \
+  -e /root/autodl-tmp/AC-MPC/ManiSoft/third_party/liegroups
 
 python -m pip install -e \
   '/root/autodl-tmp/AC-MPC/manisoft_port[test,mpc,plots,tracking]'
@@ -336,9 +335,10 @@ PyElastica commit 时才可能需要手动应用，而且只能任选一份应�
 它只做检查，不修改文件：
 
 ```bash
-cmp /root/autodl-tmp/ManiSoft/patches/pyelastica_local.patch \
-  /root/autodl-tmp/ManiSoft/third_party/pyelastica.patch
-git -C /root/autodl-tmp/ManiSoft/third_party/pyelastica apply --reverse --check \
+cmp /root/autodl-tmp/AC-MPC/ManiSoft/patches/pyelastica_local.patch \
+  /root/autodl-tmp/AC-MPC/ManiSoft/third_party/pyelastica.patch
+git -C /root/autodl-tmp/AC-MPC/ManiSoft/third_party/pyelastica \
+  apply --reverse --check \
   ../../patches/pyelastica_local.patch
 ```
 
@@ -353,7 +353,7 @@ git -C /root/autodl-tmp/ManiSoft/third_party/pyelastica apply --reverse --check 
 任务时，才需要把 `assets/` 下载并解压到 ManiSoft 仓库根目录：
 
 ```bash
-cd ManiSoft
+cd AC-MPC/ManiSoft
 hf download JobsWei/ManiSoft --local-dir ./ \
   --repo-type dataset --include 'assets.tar'
 tar -xf assets.tar
@@ -376,9 +376,9 @@ README 用 `--exclude "assets.tar"` 单独下载到 `work_dirs/Datasets/`。
 ```bash
 python -c "import manisoft, antmaze_ac; print('imports: OK')"
 python -m pytest AC-MPC/manisoft_port/tests -q
-(cd ManiSoft && python -m pytest -q)
+(cd AC-MPC/ManiSoft && python -m pytest -q)
 
-export MANISOFT_ROOT="$PWD/ManiSoft"
+export MANISOFT_ROOT="$PWD/AC-MPC/ManiSoft"
 (cd AC-MPC/manisoft_port && python - <<'PY'
 import os
 from pathlib import Path
@@ -417,7 +417,7 @@ sudo apt-get install -y autoconf automake build-essential cmake \
   libxkbcommon-x11-0
 conda install ffmpeg -y
 
-(cd ManiSoft && python scripts/demo.py)
+(cd AC-MPC/ManiSoft && python scripts/demo.py)
 ```
 
 该 demo 还要求已完成 2.4 节的 `assets/` 下载。输出位于
@@ -647,8 +647,8 @@ setpoint：
 脚本以 cwd 定位两个仓库，需在 ManiSoft 根目录执行：
 
 ```bash
-cd /root/autodl-tmp/ManiSoft
-python ../AC-MPC/manisoft_port/scripts/smoke_manisoft_lqr_track_5mm.py
+cd /root/autodl-tmp/AC-MPC/ManiSoft
+python ../manisoft_port/scripts/smoke_manisoft_lqr_track_5mm.py
 ```
 
 结果直接打印在控制台：每 10 步输出 `tip_drift` 与最大动作，最后对比 LQR
@@ -675,8 +675,8 @@ python ../AC-MPC/manisoft_port/scripts/smoke_manisoft_lqr_track_5mm.py
 ```bash
 python scripts/validate_koopman_lqr_reference_abs.py \
   --checkpoint runs/koopman_45d_abs_seed42/best_validation.pt \
-  --scenario /root/autodl-tmp/ManiSoft/configs/demo_elastica_fast.yaml \
-  --reference /root/autodl-tmp/ManiSoft/work_dirs/random_reference_45d/reference.npz \
+  --scenario /root/autodl-tmp/AC-MPC/ManiSoft/configs/demo_elastica_fast.yaml \
+  --reference /root/autodl-tmp/AC-MPC/ManiSoft/work_dirs/random_reference_45d/reference.npz \
   --output runs/koopman_lqr_abs_best_default_verified \
   --steps 1000 --state-weight 0.001 --tip-state-scale 20 \
   --action-weight 0.3 --control-weight 100000 --max-delta 0.002 \
@@ -798,7 +798,7 @@ seed，收满后合并）。
 
 ```bash
 K=work_dirs/manisoft_koopman_history_h10_abs_seed42_20260809/koopman_history/best_validation.pt
-S=/root/autodl-tmp/ManiSoft/configs/demo_elastica_fast.yaml
+S=/root/autodl-tmp/AC-MPC/ManiSoft/configs/demo_elastica_fast.yaml
 W=data/processed/manisoft_waypoint_bank_v1_merged
 ```
 
@@ -1899,7 +1899,7 @@ a291e8cc3a1e5e625641fdf93402845ae0b17cca00bd8878ffc518b0baf8fcc6
 先定义公共路径：
 
 ```bash
-export ACMPC_ROOT=/root/autodl-tmp/AC-MPC
+export ACMPC_ROOT=/root/autodl-tmp/AC-MPC/manisoft_port
 export AC_MPC_PYTHON=/root/miniconda3/envs/manisoft/bin/python
 export EXP="$ACMPC_ROOT/data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1"
 export SCENARIO="$ACMPC_ROOT/configs/manisoft_strong_bend_e2mpa_r45mm_damping7.yaml"

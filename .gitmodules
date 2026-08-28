@@ -1,0 +1,4 @@
+[submodule "ManiSoft"]
+	path = ManiSoft
+	url = https://github.com/bright-moon-67/ManiSoft.git
+	branch = acmpc-integration

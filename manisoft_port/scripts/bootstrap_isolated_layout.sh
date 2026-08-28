@@ -3,16 +3,15 @@ set -euo pipefail
 
 bundle_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 repository_root=$(dirname -- "$bundle_root")
-workspace_root=$(dirname -- "$repository_root")
-manisoft_root="$workspace_root/ManiSoft"
+manisoft_root="$repository_root/ManiSoft"
 
-if [[ ! -d "$manisoft_root/.git" ]]; then
-  echo "Missing paired ManiSoft checkout: $manisoft_root" >&2
-  echo "Clone bright-moon-67/ManiSoft:acmpc-integration there first." >&2
+if ! git -C "$manisoft_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Missing pinned ManiSoft submodule: $manisoft_root" >&2
+  echo "Run: git -C $repository_root submodule update --init --recursive" >&2
   exit 1
 fi
 
-expected_manisoft_commit=4e02bb87962604c6ab6abf06f3f273a1c49c1270
+expected_manisoft_commit=0096f2358d2605b9d382480a7abd30e5c2292495
 actual_manisoft_commit=$(git -C "$manisoft_root" rev-parse HEAD)
 if [[ "$actual_manisoft_commit" != "$expected_manisoft_commit" ]]; then
   echo "Wrong ManiSoft commit: $actual_manisoft_commit" >&2
@@ -32,22 +31,6 @@ for artifact_dir in data runs work_dirs; do
     ln -s -- "../$artifact_dir" "$inner_path"
   fi
 done
-
-# The historical commands use ../ManiSoft when run inside manisoft_port/.
-compat_manisoft="$repository_root/ManiSoft"
-if [[ -e "$compat_manisoft" && ! -L "$compat_manisoft" ]]; then
-  echo "Refusing to replace existing path: $compat_manisoft" >&2
-  exit 1
-fi
-if [[ ! -L "$compat_manisoft" ]]; then
-  ln -s -- ../ManiSoft "$compat_manisoft"
-fi
-
-# Keep the runtime-only compatibility link out of the outer repository status.
-exclude_file=$(git -C "$repository_root" rev-parse --git-path info/exclude)
-if ! grep -qxF '/ManiSoft' "$exclude_file"; then
-  printf '%s\n' '/ManiSoft' >> "$exclude_file"
-fi
 
 if [[ "$repository_root" != "/root/autodl-tmp/AC-MPC" ]]; then
   echo "WARNING: v15e embeds /root/autodl-tmp/AC-MPC/work_dirs/..." >&2
