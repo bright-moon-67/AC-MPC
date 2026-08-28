@@ -5,6 +5,8 @@ import os
 
 import pytest
 
+pytest.importorskip("h5py")
+
 from experiments.maniskill_pick_visual.run_ablation import (
     ABLATION_SPECS,
     AblationConfig,

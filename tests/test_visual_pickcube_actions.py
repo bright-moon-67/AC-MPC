@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import h5py
 import numpy as np
+import pytest
+
+h5py = pytest.importorskip("h5py")
+pytest.importorskip("mani_skill")
 
 from experiments.maniskill_pick_visual.collect_visual_pickcube import _write_episode
 from experiments.maniskill_pick_visual.upgrade_applied_actions import upgrade

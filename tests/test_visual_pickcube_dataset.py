@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import pickle
 
-import h5py
 import numpy as np
 import pytest
 import torch
+
+h5py = pytest.importorskip("h5py")
 
 import experiments.maniskill_pick_visual.dataset as dataset_module
 from experiments.maniskill_pick_visual.dataset import (

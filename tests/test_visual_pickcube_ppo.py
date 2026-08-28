@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+pytest.importorskip("mani_skill")
 
 from experiments.maniskill_pick_visual.train_visual_pickcube_ppo import (
     PPOConfig,

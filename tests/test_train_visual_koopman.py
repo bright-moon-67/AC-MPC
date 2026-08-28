@@ -5,9 +5,10 @@ import json
 import sys
 from types import ModuleType
 
-import h5py
 import numpy as np
 import pytest
+
+h5py = pytest.importorskip("h5py")
 
 from antmaze_ac.koopman.checkpoint import load_checkpoint, sha256
 import experiments.maniskill_pick_visual.train_visual_koopman as training_module

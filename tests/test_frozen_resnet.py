@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 import torch
 from torch import nn
+
+pytest.importorskip("torchvision")
 from torchvision.models import ResNet18_Weights
 
 import antmaze_ac.vision.frozen_resnet as frozen_resnet_module
