@@ -1,7 +1,8 @@
 # AC-MPC + ManiSoft 项目说明
 
 本文档用于 AC-MPC + ManiSoft 工作，覆盖环境搭建、Koopman
-数据收集与训练、单点跟踪、三 waypoint PPO-KMPC、离线数据收集和 KMPC-IQL。
+数据收集与训练、单点跟踪、三 waypoint PPO-KMPC、离线数据收集、KMPC-IQL，
+以及薄墙绕行的平滑教师与统一 residual SAC 跟踪任务。
 文档同时区分当前推荐主线、仍可复现的旧实验和正在验证的研究分支。除特别
 标注外，命令均从 `AC-MPC/` 根目录执行；当前服务器上已配好的环境和数据位置
 见 2.1。
@@ -19,6 +20,8 @@ LQR。本分支把两者结合，当前主任务不是完整的 ManiSoft COLL/AL
 2. 学习 45 维软体状态的 history Koopman 动力学；
 3. 用 Koopman-LQR/KMPC 完成参考状态和连续三个 waypoint 的闭环跟踪；
 4. 比较结构化 PPO-KMPC、MLP、BC/DAgger 和离线 IQL 等学习方法。
+5. 在带虚拟薄墙与地面约束的强弯曲场景中，从直立状态绕墙、保持中段拱高，
+   再使远端回到 yz 面附近；当前还包含一个不施加物理力的末端视觉推块演示。
 
 两个仓库的职责边界为：
 
@@ -265,10 +268,17 @@ git -C ManiSoft submodule update --init --recursive
 `acmpc-integration`（`git branch --show-current`）。两个仓库必须配套
 使用，ManiSoft 分支或版本不对时，AC-MPC 中的接口将无法工作。
 
-本文最后核对时的兼容基线为 ManiSoft
-`4e02bb87962604c6ab6abf06f3f273a1c49c1270`；AC-MPC 应使用包含
-KMPC-IQL format v2 和本文档的 PR HEAD。PR 合并后建议在实验记录中同时保存
-两个仓库的 `git rev-parse HEAD`，不要只记录分支名。
+本文最后核对时的兼容基线为：
+
+- AC-MPC `manisoft-port`：
+  `89dbf0596fb368630845ca6994fb070c606923ec`；
+- ManiSoft `acmpc-integration`：
+  `b52124c208ce599b7fffd60728d3526f3ca5a9d4`；
+- ManiSoft 固定的 PyElastica submodule：
+  `4084bdaf0438c85b60d4127c287d24d14e80be11`。
+
+后续提交可能使分支 HEAD 前移，因此实验记录仍应同时保存两个仓库的
+`git rev-parse HEAD` 和配置文件 SHA256，不要只记录分支名。
 
 ### 2.3 创建环境并安装依赖
 
@@ -281,9 +291,6 @@ conda create -n acmpc-manisoft python=3.11 -y
 conda activate acmpc-manisoft
 python -m pip install --upgrade pip
 
-git -C ManiSoft/third_party/pyelastica apply \
-  ../../patches/pyelastica_local.patch
-
 python -m pip install -e ./ManiSoft
 python -m pip install --no-deps \
   -e ./ManiSoft/third_party/pyelastica \
@@ -293,22 +300,27 @@ python -m pip install -e \
   './AC-MPC[test,mpc,plots,tracking]'
 ```
 
-ManiSoft 有意保留两份内容完全相同的 PyElastica 补丁：
+固定的 PyElastica commit `4084bdaf...` **已经包含**本项目需要的两处兼容
+修改，正常克隆后不要再执行 `git apply`。否则会因为补丁已经存在而报错。
 
-- `patches/pyelastica_local.patch`：权威副本，上述安装命令使用此路径；
+ManiSoft 仍保留两份内容完全相同的历史补丁，供审计和旧 commit 恢复使用：
+
+- `patches/pyelastica_local.patch`：权威归档副本；
 - `third_party/pyelastica.patch`：兼容旧脚本和旧文档路径的镜像副本。
 
-两份文件不是两个不同补丁，必须保持逐字节一致，使用时任选其一即可，
-**不要连续应用两份**。补丁包含两处兼容修改：face normals 转为
-`float64`，以及跳过 ManiSoft 自定义 rod/mesh contact 不兼容的上游
-contact-order 检查。它只需在全新 submodule 上应用一次。如命令提示补丁
-已应用，不要重复执行（当前服务器已应用）。可用下面的命令核对两份文件：
+两份文件不是两个不同补丁，必须保持逐字节一致。补丁内容是将 face normals
+转为 `float64`，以及跳过 ManiSoft 自定义 rod/mesh contact 不兼容的上游
+contact-order 检查。只有在检出早于 `4084bdaf...`、尚未包含修复的历史
+PyElastica commit 时才可能需要手动应用，而且只能任选一份应用一次。
+
+正常安装后，下列 `--reverse --check` 应成功，表示固定 submodule 已包含补丁；
+它只做检查，不修改文件：
 
 ```bash
 cmp ManiSoft/patches/pyelastica_local.patch \
   ManiSoft/third_party/pyelastica.patch
-sha256sum ManiSoft/patches/pyelastica_local.patch \
-  ManiSoft/third_party/pyelastica.patch
+git -C ManiSoft/third_party/pyelastica apply --reverse --check \
+  ../../patches/pyelastica_local.patch
 ```
 
 ### 2.4 可选：下载完整仿真资源
@@ -367,7 +379,7 @@ PY
 )
 ```
 
-本文最后核对时，AC-MPC 应为 `109 passed`，ManiSoft 应为 `4 passed`，
+本文最后核对时，AC-MPC 应为 `206 passed`，ManiSoft 应为 `4 passed`，
 最后一行应输出 `headless ManiSoft step: OK`。这一步真正创建
 Elastica 环境、重置软体臂并执行一个 50 Hz 控制步，比只测试 import 更能
 发现子模块、补丁或数值依赖错误。
@@ -1539,9 +1551,8 @@ normalizer。v15e 的单维物理 delta 上限是 0.0125，绝对动作上限是
 ### 11.2 PR/交接前检查清单
 
 - [ ] AC-MPC 与 ManiSoft 的兼容分支或 commit 已在文档固定；
-- [ ] ManiSoft submodule 和唯一权威的 `patches/pyelastica_local.patch`
-      可从全新 clone 重建；
-- [ ] AC-MPC `109 passed`、ManiSoft `4 passed` 和 headless 单步冒烟均通过；
+- [ ] ManiSoft 固定 submodule 已内含兼容修复，正常安装不再重复 `git apply`；
+- [ ] AC-MPC `206 passed`、ManiSoft `4 passed` 和 headless 单步冒烟均通过；
 - [ ] v15e 所需 Koopman、scenario、waypoint bank 的角色和目标路径明确；
 - [ ] v15e 最小 artifact 压缩包已发布到 GitHub Release，本文已填
       Release URL、整包 SHA256 和解压命令；
@@ -1552,5 +1563,455 @@ normalizer。v15e 的单维物理 delta 上限是 0.0125，绝对动作上限是
 - [ ] IQL 若未完成 500k/闭环评估，继续标记为实验中；
 - [ ] 所有服务器硬编码路径都已替换或在交接时说明。
 
-当前代码测试基线为 109 tests。涉及策略结构、动作语义、dataset loader 或
+当前代码测试基线为 206 tests。涉及策略结构、动作语义、dataset loader 或
 checkpoint 格式的修改，必须至少重新运行全套测试，并对 v15e 做短闭环 smoke。
+
+## 12. 薄墙绕行、平滑教师与统一 SAC 归档（2026-08-28）
+
+### 12.1 当前结论与适用范围
+
+> [!IMPORTANT]
+> **本章薄墙策略使用的是专门调整过的强弯曲软体臂，不是第 3–9 章旧
+> Koopman 数据对应的 `demo_elastica_fast.yaml` 软体臂。** 当前正式物理参数为
+> 半径 `45 mm`、杨氏模量 `2 MPa`、阻尼 `7`；旧 fast 场景分别为
+> `50 mm`、`10 MPa`、`1`。同时，本任务将驱动力矩缩放提高到 `45`、绝对
+> 激活上限提高到 `±0.60`。旧 Koopman 数据、旧 Koopman 模型和当前教师/SAC
+> checkpoint 不得跨场景直接混用。完整差异和兼容边界见第 12.3 节。
+
+这一分支已经得到一条从直立初态完整执行的、可重复回放的软体臂轨迹：软体臂
+先向墙侧面偏转，越过墙的有限 x 向边缘，使 45% 的远端节点进入墙后区域；随后
+在墙附近保持超过 0.30 m 的中段拱高，并使末端以低速回到 yz 面负 x 一侧约
+2 cm。统一 residual SAC 的 12k checkpoint 在确定性直立回放中成功跟踪该教师，
+而且没有发生虚拟墙或地面碰撞。
+
+当前最后一个推块视频在上述真实 ManiSoft 软体臂动力学回放之外增加了一个
+**接触校验后的视觉平移**：末端表面碰到落地立方体后，立方体沿负 x 方向显示
+移动 5 cm。这个部分没有接触力、摩擦、质量或刚体动力学，不能作为动力学推物
+成功率或推力能力的证据。
+
+本节是独立任务归档，不替换第 6–9 章的 v15e/Koopman 三 waypoint 主线。
+截至本节归档时：
+
+- AC-MPC 代码位于 `manisoft-port` commit
+  `89dbf0596fb368630845ca6994fb070c606923ec`；
+- 本任务源码、配置和测试已进入该 commit；
+- `data/experiments/` 中的教师、模型、轨迹和视频仍是本地 artifact，受
+  `.gitignore` 排除，普通 `git clone` 不会获得；
+- 实验 artifact 的 `run_config.json` 记录的生成时 Git HEAD 为 `b132742`，因为
+  artifact 在源文件正式提交前生成；文件 SHA256 是核验 artifact 的权威依据。
+
+### 12.2 坐标、墙体和终止定义
+
+坐标原点是软体臂固定基座中心，初态中心线沿 `+z` 直立，基座与虚拟地面
+`z=0` 同高。任务配置仍保留历史目标点 `[0.0, 0.65, 0.05]`，但当前最终任务
+不要求到达这个 y/z 点；统一教师跟踪的关键空间终止量是末端到 yz 面的距离
+`|tip_x|`、墙后远端比例、中段拱高和末端速度。
+
+最终采用的基础几何为：
+
+| 项目 | 当前值 | 解释 |
+| --- | ---: | --- |
+| 基座 | `[0.00, 0.00, 0.00]` m | 固定端；初态竖直向上 |
+| 任务文件中的墙 | `x∈[-0.05,+0.05]` m | 墙的正 x 边界严格保持在 `+5 cm` |
+| 墙的 y 范围 | `[0.27,0.29]` m | 2 cm 厚，位于基座前方 |
+| 墙的 z 范围 | `[0.00,1.10]` m | 对当前 1 m 软体臂等效为竖直无限高 |
+| 软体臂碰撞半径 | `0.045` m | 碰撞按中心线线段胶囊体计算 |
+| 墙安全边距 | `0.010` m | 墙距离判定总 padding 为 55 mm |
+| 地面 | `z=0` | 除安装端豁免外，臂体不得进入地下 |
+| 地面数值容差 | `0.0005` m | 只吸收离散积分的亚毫米数值误差 |
+
+墙不是 ManiSoft 中施加接触力的实体障碍，而是每个控制步计算的虚拟安全约束：
+
+```text
+wall_clearance = min(segment_to_wall_AABB_distance)
+                 - arm_radius - wall_safety_margin
+
+ground_clearance = min(non_mount_node_z)
+                   - arm_radius - ground_surface_z
+```
+
+`wall_clearance < 0` 立即标记 `virtual_wall_collision`；
+`ground_clearance < -0.0005` 标记 `ground_violation`。因此视频中的墙是相同几何
+的可视化，安全性来自胶囊体/AABB 计算，不是 MuJoCo 接触反作用力。
+
+当前统一 SAC 的终端条件必须同时满足：教师已走完、末端误差不超过 10 mm、
+全臂节点 RMSE 不超过 25 mm、`|tip_x|≤25 mm`、远端越墙比例至少 40%、末端
+速度不超过 `0.10 m/s`，并且墙附近拱高至少 `0.30 m`。配置文件中的
+`target=[0,0.65,0.05]` 只继续用于尺度和旧 route 字段，不应误写成当前策略
+最终到达的目标坐标。
+
+### 12.3 当前软体臂动力学与旧 Koopman 场景不同（不可混用）
+
+当前场景使用
+`configs/manisoft_strong_bend_e2mpa_r45mm_damping7.yaml`：
+
+#### 软体臂物理参数
+
+| 参数 | 当前薄墙任务 | 早期 `demo_elastica_fast.yaml` |
+| --- | ---: | ---: |
+| 长度 / 单元数 | `1.0 m / 20` | 相同 |
+| 半径 | `45 mm` | `50 mm` |
+| 杨氏模量 | `2 MPa` | `10 MPa` |
+| 阻尼常数 | `7` | `1` |
+| 密度 | `1000 kg/m³` | 相同 |
+| 物理步长 / 控制频率 | `0.0002 s / 50 Hz` | 相同 |
+
+#### 驱动、动作与采集限制
+
+以下不是杆体材料参数，但会直接改变可达动作和采集分布，因此也属于模型与
+策略的兼容边界：
+
+| 参数 | 当前薄墙任务 | 早期 Koopman/控制主线 |
+| --- | ---: | ---: |
+| `muscle_torque_scale` | `45` | `30` |
+| 绝对激活上限 | `±0.60` | `±0.30` |
+| SAC 单步物理动作变化 | `±0.003` | 不适用；旧 DAgger 默认 `±0.002` |
+| 自由采集的末端速度终止 | 关闭：`maximum_tip_speed: null` | 旧数据按各自采集配置执行 |
+
+圆截面杆的近似抗弯刚度满足 `EI∝E r⁴`，因此当前弹性抗弯刚度约为旧 fast
+场景的 13.1%。同时驱动力矩缩放和动作范围都提高，当前动力学明显更软、驱动
+权限更大，并用更高阻尼控制摆动。这不是只改变奖励或障碍物几何，而是改变了
+被控动力系统本身。因此旧 824-episode Koopman 数据和由其辨识的线性动力学
+不能直接当作当前环境模型；若要重新引入 AC-MPC，应当在当前
+45 mm/2 MPa/damping-7 场景重新采集与辨识。
+
+曾做过只把半径从 45 mm 改为 50 mm 的短暂消融：几何静态余量看似足够，但
+`r⁴` 项使抗弯刚度增加约 52%，旧教师动作回放在 15.2 s 开始碰墙，终点也明显
+漂移。该 50 mm 配置和测试记录随后按要求撤销；**当前正式配置仍是 45 mm**。
+
+当前三份权威配置及 SHA256 为：
+
+```text
+920d615c5511996b2292e6a9b3feb694681142151b64a408302146a4f7b094ca  configs/manisoft_strong_bend_e2mpa_r45mm_damping7.yaml
+99092f6916c4bfd53e34bded880e7eee9edd2d07205847a225bf186103ab803e  configs/manisoft_wall_route_collection_strong_bend_e2mpa_r45mm_t45_a060_wall_y027_x010.yaml
+d689e75d829188fd161bfa392df3de42c1286d3c273851df3c3895208592c458  configs/manisoft_teacher_tracking_sac_silky_negx2cm_speed010.yaml
+```
+
+### 12.4 从低效自由采集到分阶段教师轨迹
+
+早期方案是在无障碍自由运动数据中筛选“侧绕—远端越墙—前端回弯”的完整
+episode。实践表明完整成功 episode 极稀疏，尤其是同时要求远端越墙比例、墙体
+净空、地面净空和返回 yz 面时，纯随机采集效率很低。因此实现演进为：
+
+1. 用受限平滑激励收集可安全接近和侧绕墙体的候选 episode；
+2. 从 5%–30% 越墙状态建立左右镜像 snapshot bank；
+3. 对 snapshot 主动制动，得到约 `0.066–0.125 m/s` 的低速起点；
+4. 先用阶段 SAC 学到 40% 连续远端越墙，再从墙后 snapshot 优化返回 yz 面；
+5. 将可行分段动作重放、平滑、重定时，并加入中段拱高与末端主动制动；
+6. 把最终单条完整 episode 作为统一 residual SAC 的教师，而不是部署多个阶段
+   policy 的切换器。
+
+阶段式研究中曾得到以下诊断结果，但它们不是最终选择：
+
+- 40% 越墙阶段的早期 checkpoint 在 12 个确定性 episode 中成功 2 个；
+- 一个错误的联合 reward 能让末端接近 yz 面至约 2.1 mm，但同时丢失越墙比例，
+  说明“回到 yz 面”和“保持远端越墙”必须联合约束；
+- 40% 越墙并返回 yz 面 20 cm 范围的分层策略可在两个认证 snapshot 上成功，
+  但这仍是 snapshot 起步的阶段策略；
+- 更激进的 50%/约 14 cm yz 面距离策略出现 `0.25–1.17 mm` 的墙体穿透，未被
+  选为安全策略。
+
+这些失败结果说明困难不只是墙在 x 方向有多宽，还包括杆体连续性、近端必须
+保持基座约束、远端弯折和中段拱高之间的耦合，以及动作变化率造成的响应滞后。
+
+### 12.5 最终平滑教师是一条完整可用 episode
+
+当前教师位于：
+
+```text
+data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/
+  silky_negx2cm_speed010_teacher_v1/teacher_episode.npz
+```
+
+它从直立初态开始，包含 871 个 50 Hz 控制 transition，总时长 17.42 s；每一步
+保存 45D 物理状态、21 个节点的位置/速度、20 个单元 director/omega、内部杆
+状态、18D 动作和阶段编号。阶段语义为：
+
+```text
+0  直立接近并向有限墙边侧绕
+1  平滑动作过渡
+2  增加远端越墙比例
+3  稳定墙后臂段
+4  远端回到 yz 面附近
+5  低速主动制动和终端接近
+```
+
+独立回放的关键指标为：
+
+| 指标 | 教师结果 |
+| --- | ---: |
+| 控制步数 / 时长 | `871 / 17.42 s` |
+| 最大单步动作变化 | `0.0021848` |
+| 最小墙体净空 | `16.297 mm` |
+| 最小地面净空 | `4.758 mm` |
+| 最终远端越墙比例 | `45%` |
+| 最终末端坐标 | `[-0.019823, 0.593944, 0.183425] m` |
+| 最终末端到 yz 面距离 | `19.823 mm` |
+| 最终末端速度 | `0.09208 m/s` |
+| 最终墙附近拱高 | `0.38353 m` |
+| 搜索分支最小拱高 | `0.37427 m` |
+
+这里的“平滑”指动作已经连续重定时并取消中段长时间 hold，同时末端主动制动；
+并不表示任意动力学扰动下的全局最优或完全无振荡。最大速度可以在中间阶段高于
+终端速度阈值，`0.10 m/s` 只约束最终状态；当前没有速度超限提前终止。
+
+教师文件大小约 6.9 MB，SHA256 为：
+
+```text
+b39b006a828e6876eb875993f82a933250d2c5f3210817e9ec7c56cc0ed56216
+```
+
+### 12.6 统一 residual SAC 的结构与最终结果
+
+最终策略不是直接从目标点生成全新动作，而是在完整教师动作上学习闭环残差：
+
+```text
+requested_u = teacher_u[t] + 0.01 * clip(policy_output, -1, 1)
+applied_u   = previous_u + clip(requested_u - previous_u, -0.003, 0.003)
+applied_u   = clip(applied_u, -0.60, 0.60)
+```
+
+统一策略在所有阶段复用同一个网络。139D observation 为：
+
+```text
+当前 45D 物理状态                         45
+上一步 18D 物理动作                       18
+当前教师参考误差                           45
+前视末端误差                                3
+当前教师动作                               18
+轨迹进度及剩余进度                          2
+路径侧、越墙、净空、速度等安全特征            8
+总计                                      139
+```
+
+训练使用两个环境、12k SAC timesteps，actor 网络为 `[512,512,256]`，先对 871
+个教师 observation 做 100 epoch 行为克隆，并把确定性残差均值精确置零。前 4k
+步冻结 actor 学习，随后用 `actor_anchor_coef=150` 约束其不偏离教师。随机训练
+reset 可以从教师任意 snapshot 开始，同时保留 20% 直立起步概率；正式评估始终
+从直立初态执行完整 871 步。
+
+当前选择的是：
+
+```text
+data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/
+  unified_silky_negx2cm_speed010_sac_12k_v1/checkpoints/
+    unified_teacher_sac_12000_steps.zip
+    unified_teacher_sac_vecnormalize_12000_steps.pkl
+```
+
+确定性直立回放结果为：
+
+| 指标 | 12k SAC 结果 |
+| --- | ---: |
+| 终止状态 | `teacher_terminal_success` |
+| 控制步数 | `871` |
+| 最终远端越墙比例 | `45%` |
+| 最终末端坐标 | `[-0.019817, 0.593933, 0.183530] m` |
+| 最终末端速度 | `0.09203 m/s` |
+| 轨迹中最大末端速度 | `0.22276 m/s` |
+| 最小墙体净空 | `16.382 mm` |
+| 最小地面净空 | `4.758 mm` |
+| 最大节点跟踪 RMSE | `0.0898 mm` |
+| 最大末端跟踪误差 | `0.1769 mm` |
+| 最低受约束拱高 | `0.35636 m` |
+| 最终拱高 | `0.38354 m` |
+
+模型、normalizer 和标准回放视频的 SHA256 为：
+
+```text
+f4596cf3acfb183ec38ef6fbd074148e80343d6697379e2e99bdb87317f24819  unified_teacher_sac_12000_steps.zip
+c2e965962276fec8d354529ad2153b348666086c65881cd0b4152543c60e78a0  unified_teacher_sac_vecnormalize_12000_steps.pkl
+712e1858c07d84c140f09baf810576096e043080d4e6eb5175bddc0af768dc55  selected_12k_upright_replay.mp4
+```
+
+由于策略 observation 和动作执行显式依赖 `teacher_episode.npz`，这个 checkpoint
+是**教师条件的闭环跟踪器**，还不是只给墙与目标就能自行规划新路线的通用策略。
+
+### 12.7 最终写实视觉推块场景
+
+最终归档视频为：
+
+```text
+data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/
+  unified_silky_negx2cm_speed010_sac_12k_v1/
+    fixedwall_p05_grounded_cube_anchor_corner_realistic.mp4
+```
+
+该视频使用 1× 实时回放、写实材质和地面，不再放置桌子或小物块支撑平台。
+可视墙保持正 x 边界 `+0.05 m`，并按要求只向负 x 方向额外延长 0.20 m，因此
+最终可视墙范围为：
+
+```text
+x ∈ [-0.25,+0.05] m
+y ∈ [ 0.27, 0.29] m
+z ∈ [ 0.00, 1.10] m
+```
+
+小方块是边长 0.19 m 的正方体，直接落地；初始中心为
+`[-0.11,0.67,0.095] m`，最终中心为 `[-0.16,0.67,0.095] m`。因此其
+`(+x,-y,+z)` 角从 `[-0.015,0.575,0.190] m` 沿负 x 平移到
+`[-0.065,0.575,0.190] m`，y、z 和方块尺寸保持不变。
+
+视觉任务的校验量为：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 末端表面首次接触 | 第 `839` 步，`16.78 s` |
+| 方块负 x 位移 | `0.050 m` |
+| 接触后最大表面分离 | `1.812 mm`，小于 2 mm 容差 |
+| 最小表面分离 | `-3.823 mm`（视觉几何重叠） |
+| 扩展墙最小净空 | `16.382 mm` |
+| 方块地面净空 | `0` |
+| 平台 | 无 |
+
+视频大小约 0.89 MB，SHA256 为：
+
+```text
+a291e8cc3a1e5e625641fdf93402845ae0b17cca00bd8878ffc518b0baf8fcc6
+```
+
+视觉平移的实现根据接触后的末端负 x 行程重新缩放方块 x 坐标；MuJoCo 中方块
+是 `mocap` body 且禁用碰撞。因此“接触”经过末端球面/AABB 距离验证，但“移动
+5 cm”是展示层约束，不由软体臂力矩、接触冲量或摩擦积分产生。
+
+### 12.8 复现实验、评估和视频
+
+先定义公共路径：
+
+```bash
+export ACMPC_ROOT=/root/autodl-tmp/AC-MPC
+export AC_MPC_PYTHON=/root/miniconda3/envs/manisoft/bin/python
+export EXP="$ACMPC_ROOT/data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1"
+export SCENARIO="$ACMPC_ROOT/configs/manisoft_strong_bend_e2mpa_r45mm_damping7.yaml"
+export TASK="$ACMPC_ROOT/configs/manisoft_wall_route_collection_strong_bend_e2mpa_r45mm_t45_a060_wall_y027_x010.yaml"
+export TRAIN_CFG="$ACMPC_ROOT/configs/manisoft_teacher_tracking_sac_silky_negx2cm_speed010.yaml"
+export TEACHER="$EXP/silky_negx2cm_speed010_teacher_v1/teacher_episode.npz"
+export RUN="$EXP/unified_silky_negx2cm_speed010_sac_12k_v1"
+cd "$ACMPC_ROOT"
+```
+
+从已有教师重新训练统一 SAC：
+
+```bash
+"$AC_MPC_PYTHON" scripts/train_manisoft_teacher_tracking_sac.py \
+  --scenario "$SCENARIO" \
+  --task-config "$TASK" \
+  --teacher-episode "$TEACHER" \
+  --config "$TRAIN_CFG" \
+  --output "$EXP/unified_silky_negx2cm_speed010_sac_reproduction" \
+  --device cuda
+```
+
+确定性直立评估：
+
+```bash
+"$AC_MPC_PYTHON" scripts/evaluate_manisoft_teacher_tracking_sac.py \
+  --scenario "$SCENARIO" \
+  --task-config "$TASK" \
+  --teacher-episode "$TEACHER" \
+  --config "$TRAIN_CFG" \
+  --model "$RUN/checkpoints/unified_teacher_sac_12000_steps.zip" \
+  --vecnormalize "$RUN/checkpoints/unified_teacher_sac_vecnormalize_12000_steps.pkl" \
+  --output "$RUN/reproduction_evaluation.json" \
+  --device cpu
+```
+
+渲染标准策略轨迹：
+
+```bash
+"$AC_MPC_PYTHON" scripts/render_manisoft_teacher_tracking_sac.py \
+  --scenario "$SCENARIO" \
+  --task-config "$TASK" \
+  --teacher-episode "$TEACHER" \
+  --config "$TRAIN_CFG" \
+  --model "$RUN/checkpoints/unified_teacher_sac_12000_steps.zip" \
+  --vecnormalize "$RUN/checkpoints/unified_teacher_sac_vecnormalize_12000_steps.pkl" \
+  --output "$RUN/reproduction_upright_replay.mp4" \
+  --playback-speed 1.0 --device cpu
+```
+
+重新生成无平台、落地方块、5 cm 视觉推块视频：
+
+```bash
+"$AC_MPC_PYTHON" scripts/render_manisoft_terminal_visual_push.py \
+  --scenario "$SCENARIO" \
+  --task-config "$TASK" \
+  --teacher-episode "$TEACHER" \
+  --config "$TRAIN_CFG" \
+  --model "$RUN/checkpoints/unified_teacher_sac_12000_steps.zip" \
+  --vecnormalize "$RUN/checkpoints/unified_teacher_sac_vecnormalize_12000_steps.pkl" \
+  --output "$RUN/reproduction_grounded_cube_push.mp4" \
+  --playback-speed 1.0 \
+  --wall-negative-x-extension 0.20 \
+  --platform-y-center 0.67 \
+  --cube-size 0.19 --cube-initial-x -0.11 \
+  --maximum-push-distance 0.05 --required-push-distance 0.05 \
+  --visual-push-target-distance 0.05 \
+  --no-platform --realistic-scene --clean-render --device cpu
+```
+
+输出脚本拒绝覆盖已有文件；复现时必须使用新的输出名，或在明确确认后移动旧
+文件。完整教师的生成经历多轮搜索、重定时和制动，不建议只凭最终摘要从零重做；
+交接时应直接保存教师 NPZ 并先核对 SHA256。
+
+### 12.9 代码导航、验证和 artifact 交接
+
+| 文件 | 本任务中的作用 |
+| --- | --- |
+| `antmaze_ac/data/wall_route_episodes.py` | 胶囊体墙距、地面净空、越墙比例和 episode schema |
+| `antmaze_ac/data/wall_crossing_snapshot_bank.py` | snapshot bank 校验和加载 |
+| `antmaze_ac/envs/manisoft_wall_crossing_sac_env.py` | 阶段越墙/返回 SAC 环境与安全语义 |
+| `antmaze_ac/envs/manisoft_teacher_tracking_sac_env.py` | 139D 统一教师 residual SAC 环境 |
+| `scripts/collect_manisoft_wall_route_candidates.py` | 初始候选 episode 收集 |
+| `scripts/build_manisoft_wall_crossing_snapshot_bank.py` | 从候选轨迹建立越墙 snapshot |
+| `scripts/stabilize_manisoft_wall_crossing_snapshot_bank.py` | snapshot 主动制动 |
+| `scripts/search_manisoft_arched_return.py` | 中段拱高、末端回面与低速搜索 |
+| `scripts/generate_manisoft_smooth_wall_teacher.py` | 平滑教师构建与认证 |
+| `scripts/retime_manisoft_teacher_hold.py` | 删除长 hold、重定时与动作平滑 |
+| `scripts/train_manisoft_teacher_tracking_sac.py` | BC 初始化及统一 SAC 训练 |
+| `scripts/evaluate_manisoft_teacher_tracking_sac.py` | 直立确定性验证 |
+| `scripts/render_manisoft_teacher_tracking_sac.py` | 标准策略视频 |
+| `scripts/render_manisoft_terminal_visual_push.py` | 写实墙、落地方块与视觉推块 |
+
+本次代码归档前运行了以下针对性测试：
+
+```bash
+"$AC_MPC_PYTHON" -m pytest -q \
+  tests/test_wall_route_episodes.py \
+  tests/test_manisoft_wall_crossing_sac.py \
+  tests/test_manisoft_teacher_tracking_sac.py
+```
+
+结果为 `18 passed`。这只覆盖本任务新增模块，不替代前文要求的全仓回归测试。
+
+最小 artifact 交接至少需要：
+
+1. `teacher_episode.npz`；
+2. `unified_teacher_sac_12000_steps.zip`；
+3. `unified_teacher_sac_vecnormalize_12000_steps.pkl`；
+4. 三份 SHA 固定的 YAML 配置；
+5. 对应 `run_config.json` 和 `selected_12k_upright_replay.json`；
+6. 如需展示，再附标准回放或最终写实视频。
+
+这些 artifact 总量远小于本地 23 GB 的完整实验目录。当前尚未发布专门的 GitHub
+Release；仅克隆 commit `89dbf05` 无法运行已训练策略。后续正式交接应仿照
+1.6 节为这六类文件生成独立压缩包、记录整包 SHA256，并发布 Release asset。
+
+### 12.10 已知限制与下一步
+
+- **不是通用路径规划器。** 当前 SAC 需要固定教师的逐步参考、教师动作和轨迹
+  进度；墙或目标位置变化后，需要新教师或新的条件化策略。
+- **墙体是虚拟约束。** 当前验证证明轨迹几何不穿墙，但没有模拟墙接触后的力学
+  响应；这对安全轨迹足够，对接触容错或擦墙控制不够。
+- **推块不是动力学任务。** 当前 5 cm 位移只证明末端表面可以沿现有轨迹进入
+  适合展示的接触区域，不能证明真实方块在给定摩擦和质量下会移动 5 cm。
+- **泛化尚未评估。** 目前关键结论来自一个认证教师和一次固定 seed 的确定性
+  直立回放，没有墙位置、材料参数、初态扰动或多 seed 鲁棒性统计。
+- **终端 y/z 不是目标约束。** 当前只要求末端回到 yz 面附近且位于墙后；若恢复
+  “按下指定按钮”的目标，应加入目标表面法向、接触区域、按压行程/保持时间。
+- **旧 Koopman 不匹配。** 若要回到 AC-MPC 预测控制主线，应先在当前强弯曲
+  参数下重新采集系统辨识数据，而不是直接复用 `demo_elastica_fast.yaml` 模型。
+
+最合理的后续顺序是：先固定当前教师和 12k checkpoint 的 Release artifact；
+然后在小范围初态/墙位扰动上做确定性与随机评估；最后再决定是训练墙/目标条件化
+策略，还是加入真实 MuJoCo/软体杆接触与方块动力学，把视觉推块升级为物理推块。
