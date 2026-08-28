@@ -11,7 +11,16 @@ from experiments.playground.tasks import TASKS
 
 
 def test_task_score_horizon_is_compatible_with_dmc_return_scale() -> None:
-    assert all(task.episode_steps == 1000 for task in TASKS.values())
+    assert {
+        name: task.episode_steps for name, task in TASKS.items()
+    } == {
+        "CartpoleSwingup": 1000,
+        "ReacherHard": 1000,
+        "HopperHop": 1000,
+        "HopperStand": 500,
+        "WalkerRun": 1000,
+        "HumanoidRun": 1000,
+    }
 
 
 def test_task_action_and_observation_dimensions_are_positive() -> None:

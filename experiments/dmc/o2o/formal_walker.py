@@ -61,15 +61,23 @@ def _resolve_prepared_data_path(path: str) -> Path:
     """Resolve a prepared-data path after the documented storage relocation."""
 
     candidate = Path(path).resolve()
-    if candidate.exists():
-        return candidate
+    try:
+        if candidate.exists():
+            return candidate
+    except OSError:
+        # CI and unprivileged deployments may not be allowed to stat another
+        # machine's recorded /root path.  Continue to the relocation rule.
+        pass
     old_prefix = "/root/autodl-tmp/AC-MPC/runs/o2o/data/"
     new_prefix = "/root/acmpc-o2o-nonformal-20260819/data/"
     raw = str(path)
     if raw.startswith(old_prefix):
         relocated = Path(new_prefix + raw[len(old_prefix) :]).resolve()
-        if relocated.exists():
-            return relocated
+        try:
+            if relocated.exists():
+                return relocated
+        except OSError:
+            pass
     return candidate
 
 

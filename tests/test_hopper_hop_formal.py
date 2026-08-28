@@ -76,6 +76,7 @@ def test_hopper_hop_o2o_pins_dataset_and_environment_to_ar2() -> None:
 
 
 def test_hopper_hop_explicit_ar2_matches_two_native_steps() -> None:
+    pytest.importorskip("dm_control")
     seed = 20260851
     action = np.asarray([0.2, -0.3, 0.4, -0.5], dtype=np.float32)
     native = make_dmc_adapter(TASK, seed=seed, action_repeat=1)
@@ -95,6 +96,7 @@ def test_hopper_hop_explicit_ar2_matches_two_native_steps() -> None:
 
 
 def test_hopper_hop_process_vector_runner_preserves_explicit_ar2() -> None:
+    pytest.importorskip("dm_control")
     seed = 20260851
     sync = SyncDMCVectorEnv(TASK, 2, seed, action_repeat=2)
     parallel = ProcessDMCVectorEnv(

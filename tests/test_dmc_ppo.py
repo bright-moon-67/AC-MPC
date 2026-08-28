@@ -461,6 +461,7 @@ def test_vector_env_rejects_invalid_discount_and_inconsistent_done_flags() -> No
 
 
 def test_process_vector_env_matches_sync_real_dmc() -> None:
+    pytest.importorskip("dm_control")
     sync = SyncDMCVectorEnv("cartpole_swingup", 4, 123)
     parallel = ProcessDMCVectorEnv(
         "cartpole_swingup", 4, 123, workers=2

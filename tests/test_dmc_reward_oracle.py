@@ -17,6 +17,7 @@ from experiments.dmc.tasks.adapter import make_dmc_adapter
 
 
 def test_cartpole_exact_reward_matches_live_dmc_transitions() -> None:
+    pytest.importorskip("dm_control")
     env = make_dmc_adapter("cartpole_swingup", seed=321)
     rng = np.random.default_rng(20260811)
     max_error = 0.0
@@ -38,6 +39,7 @@ def test_cartpole_exact_reward_matches_live_dmc_transitions() -> None:
 
 
 def test_walker_exact_reward_matches_live_dmc_transitions() -> None:
+    pytest.importorskip("dm_control")
     env = make_dmc_adapter("walker_run", seed=654)
     rng = np.random.default_rng(20260818)
     observations: list[np.ndarray] = []

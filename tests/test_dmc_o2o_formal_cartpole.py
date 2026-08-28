@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import json
 import zipfile
 import numpy as np
+import pytest
 
 from experiments.dmc.o2o.formal_cartpole import FORMAL_METHODS, FORMAL_TRAINING_SEEDS, training_command
 from experiments.dmc.o2o.formal_cartpole_dataset import selected_episode_indices
@@ -49,7 +50,7 @@ def test_cartpole_koopman_and_archive(tmp_path: Path) -> None:
 
 
 def test_gpu_safe_spectral_radius_estimator() -> None:
-    import jax
+    jax = pytest.importorskip("jax")
     import jax.numpy as jp
 
     matrix = jp.asarray(np.diag([0.5, 0.8, 0.97]), dtype=jp.float32)
