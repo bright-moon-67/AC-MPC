@@ -42,6 +42,30 @@ NEGATIVE_X_TEACHER = ROOT / (
     "data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/"
     "silky_negx2cm_speed018_teacher_v1/teacher_episode.npz"
 )
+POSE_REFERENCE_TEACHER = ROOT / (
+    "data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/"
+    "silky_lowtip_teacher_v2/teacher_episode.npz"
+)
+
+_REQUIRED_TEACHER_ARTIFACTS = (
+    TEACHER,
+    ARCHED_TEACHER,
+    LOW_TIP_TEACHER,
+    SILKY_LOW_TIP_TEACHER,
+    POSE_MATCHED_TEACHER,
+    NEGATIVE_X_TEACHER,
+    POSE_REFERENCE_TEACHER,
+)
+_MISSING_TEACHER_ARTIFACTS = tuple(
+    path for path in _REQUIRED_TEACHER_ARTIFACTS if not path.is_file()
+)
+pytestmark = pytest.mark.skipif(
+    bool(_MISSING_TEACHER_ARTIFACTS),
+    reason=(
+        "wall-teacher integration tests require local experiment artifacts; "
+        "see README_ACMPC_MANISOFT.md section 12.9"
+    ),
+)
 
 
 def test_teacher_episode_alignment_and_hash_metadata():
@@ -155,11 +179,7 @@ def test_silky_teacher_has_no_long_constant_action_hold():
 
 def test_pose_matched_teacher_preserves_oblique_distal_posture():
     episode = load_smooth_wall_teacher_episode(POSE_MATCHED_TEACHER)
-    reference = load_smooth_wall_teacher_episode(
-        ROOT
-        / "data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/"
-        "silky_lowtip_teacher_v2/teacher_episode.npz"
-    )
+    reference = load_smooth_wall_teacher_episode(POSE_REFERENCE_TEACHER)
     nodes = episode.node_positions[-1]
     relative = nodes[-6:] - nodes[-1]
     reference_nodes = reference.node_positions[-1]

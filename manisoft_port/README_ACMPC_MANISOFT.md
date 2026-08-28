@@ -398,8 +398,10 @@ PY
 )
 ```
 
-本文最后核对时，AC-MPC 应为 `206 passed`，ManiSoft 应为 `4 passed`，
-最后一行应输出 `headless ManiSoft step: OK`。这一步真正创建
+本文最后核对时，具备本地教师 artifact 的完整环境应为 AC-MPC `206 passed`、
+ManiSoft `4 passed`；干净 Git clone 尚未下载第 12.9 节教师 artifact 时，应为
+AC-MPC `196 passed, 10 skipped`、ManiSoft `4 passed`。最后一行应输出
+`headless ManiSoft step: OK`。这一步真正创建
 Elastica 环境、重置软体臂并执行一个 50 Hz 控制步，比只测试 import 更能
 发现子模块、补丁或数值依赖错误。
 
@@ -1572,7 +1574,8 @@ normalizer。v15e 的单维物理 delta 上限是 0.0125，绝对动作上限是
 
 - [ ] AC-MPC 与 ManiSoft 的兼容分支或 commit 已在文档固定；
 - [ ] ManiSoft 固定 submodule 已内含兼容修复，正常安装不再重复 `git apply`；
-- [ ] AC-MPC `206 passed`、ManiSoft `4 passed` 和 headless 单步冒烟均通过；
+- [ ] AC-MPC 完整 artifact 环境 `206 passed`，或干净 clone
+      `196 passed, 10 skipped`；ManiSoft `4 passed` 和 headless 单步冒烟通过；
 - [ ] v15e 所需 Koopman、scenario、waypoint bank 的角色和目标路径明确；
 - [ ] v15e 最小 artifact 压缩包已发布到 GitHub Release，本文已填
       Release URL、整包 SHA256 和解压命令；
@@ -1583,8 +1586,10 @@ normalizer。v15e 的单维物理 delta 上限是 0.0125，绝对动作上限是
 - [ ] IQL 若未完成 500k/闭环评估，继续标记为实验中；
 - [ ] 所有服务器硬编码路径都已替换或在交接时说明。
 
-当前代码测试基线为 206 tests。涉及策略结构、动作语义、dataset loader 或
-checkpoint 格式的修改，必须至少重新运行全套测试，并对 v15e 做短闭环 smoke。
+当前代码测试基线为 206 tests，其中 10 项需要 `.gitignore` 排除的本地教师
+artifact，并会在干净 clone 中明确跳过。涉及策略结构、动作语义、dataset
+loader 或 checkpoint 格式的修改，必须至少重新运行全套测试，并对 v15e 做
+短闭环 smoke。
 
 ## 12. 薄墙绕行、平滑教师与统一 SAC 归档（2026-08-28）
 
