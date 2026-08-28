@@ -1,0 +1,55 @@
+schema_version: 1
+
+# Strong-bending stage: retain at least 40% contiguous distal crossing, then
+# bring the tip back toward the yz target plane.  This stage does not yet
+# require reaching the target point in y/z or pressing a button.
+environment:
+  episode_steps: 400
+  absolute_action_limit: 0.60
+  muscle_torque_scale: 45.0
+  max_action_delta: 0.002
+  success_crossed_fraction: 0.40
+  success_streak: 5
+  maximum_tip_speed: null
+
+  snapshot_minimum_fraction: 0.20
+  snapshot_maximum_fraction: 0.30
+  snapshot_progress_bias: 10.0
+
+  # First return curriculum uses a 10 cm tube around x=0.  Once robust, this
+  # can be tightened without changing the wall-crossing state definition.
+  return_tip_x_tolerance: 0.10
+  return_reward_minimum_fraction: 0.30
+  return_progress_reward_scale: 20.0
+
+  threading_progress_reward_scale: 60.0
+  crossed_progress_reward_scale: 28.0
+  tip_progress_reward_scale: 2.0
+  collision_penalty: 30.0
+  success_bonus: 20.0
+  near_wall_clearance: 0.02
+  near_wall_penalty_scale: 1.0
+  step_penalty: 0.01
+  policy_action_penalty_scale: 0.02
+  activation_penalty_scale: 0.005
+
+training:
+  seed: 20260826
+  total_timesteps: 20000
+  num_envs: 2
+  learning_rate: 0.0001
+  buffer_size: 100000
+  learning_starts: 2000
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: 0.001
+  target_entropy: -9.0
+  net_arch: [256, 256, 256]
+  checkpoint_freq: 5000
+  status_freq: 500
+  norm_obs: true
+  norm_reward: false
+  clip_obs: 10.0

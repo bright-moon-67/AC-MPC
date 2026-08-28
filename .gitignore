@@ -15,6 +15,12 @@ dist/
 .env.*
 data/raw/
 data/processed/
+# Generated evaluation, training and rendering artifacts remain local.  They
+# include large replay buffers/checkpoints that exceed normal GitHub limits.
+data/evaluation/
+data/experiments/
+data/training/
+data/videos/
 runs/
 .cleanup_trash/
 .venv/

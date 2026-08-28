@@ -1,0 +1,56 @@
+schema_version: 1
+
+# Phase-C v2 uses 45% states that have already held the extra crossed segment
+# for 20 consecutive control steps.  Reward scales stay comparable to the
+# successful 40% curriculum to avoid a large critic-distribution shift.
+environment:
+  episode_steps: 220
+  absolute_action_limit: 0.60
+  muscle_torque_scale: 45.0
+  max_action_delta: 0.0005
+  success_crossed_fraction: 0.45
+  success_streak: 3
+  maximum_tip_speed: null
+  allowed_route_side: 1
+
+  snapshot_minimum_fraction: 0.45
+  snapshot_maximum_fraction: 0.45
+  snapshot_progress_bias: 0.0
+
+  return_tip_x_tolerance: 0.15
+  return_reward_minimum_fraction: 0.45
+  return_progress_reward_scale: 28.0
+
+  threading_progress_reward_scale: 120.0
+  crossed_progress_reward_scale: 160.0
+  crossing_deficit_penalty_scale: 20.0
+  tip_progress_reward_scale: 2.0
+  collision_penalty: 120.0
+  success_bonus: 150.0
+  near_wall_clearance: 0.020
+  near_wall_penalty_scale: 15.0
+  step_penalty: 0.002
+  policy_action_penalty_scale: 0.002
+  activation_penalty_scale: 0.001
+
+training:
+  seed: 20260911
+  total_timesteps: 7500
+  num_envs: 2
+  learning_rate: 0.00001
+  buffer_size: 100000
+  learning_starts: 300
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: 0.00015
+  target_entropy: -9.0
+  continuation_log_std_bias_delta: -0.7
+  net_arch: [256, 256, 256]
+  checkpoint_freq: 1250
+  status_freq: 500
+  norm_obs: true
+  norm_reward: false
+  clip_obs: 10.0

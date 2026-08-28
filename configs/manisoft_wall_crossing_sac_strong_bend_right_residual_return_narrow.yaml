@@ -1,0 +1,65 @@
+schema_version: 1
+
+# Narrow Phase-B feasibility curriculum.  Reset only from the two right-side
+# states on which the frozen Phase-A policy is deterministically certified.
+# Once 40% is reached the base increment policy latches off and SAC controls a
+# residual around the held activation.
+environment:
+  episode_steps: 250
+  absolute_action_limit: 0.60
+  muscle_torque_scale: 45.0
+  max_action_delta: 0.0005
+  success_crossed_fraction: 0.40
+  success_streak: 5
+  maximum_tip_speed: null
+  allowed_route_side: 1
+  allowed_snapshot_indices: [6, 7]
+
+  snapshot_minimum_fraction: 0.30
+  snapshot_maximum_fraction: 0.35
+  snapshot_progress_bias: 10.0
+
+  # Start with a 20 cm yz-plane tube; after feasibility this is tightened to
+  # the 10 cm task tolerance using the same hierarchical controller.
+  return_tip_x_tolerance: 0.20
+  return_reward_minimum_fraction: 0.40
+  return_progress_reward_scale: 12.0
+
+  base_policy_model_path: /root/autodl-tmp/AC-MPC/data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/sac_crossing_right_40pct_v1/checkpoints/wall_crossing_sac_2500_steps.zip
+  base_policy_vecnormalize_path: /root/autodl-tmp/AC-MPC/data/experiments/manisoft_strong_bend_e2mpa_r45mm_t45_a060_v1/sac_crossing_right_40pct_v1/checkpoints/wall_crossing_sac_vecnormalize_2500_steps.pkl
+  base_policy_device: cpu
+  residual_action_scale: 0.10
+  base_policy_latch_off_fraction: 0.40
+  latched_residual_action_scale: 1.0
+
+  threading_progress_reward_scale: 100.0
+  crossed_progress_reward_scale: 80.0
+  tip_progress_reward_scale: 3.0
+  collision_penalty: 40.0
+  success_bonus: 40.0
+  near_wall_clearance: 0.025
+  near_wall_penalty_scale: 2.0
+  step_penalty: 0.005
+  policy_action_penalty_scale: 0.01
+  activation_penalty_scale: 0.003
+
+training:
+  seed: 20260904
+  total_timesteps: 10000
+  num_envs: 2
+  learning_rate: 0.00005
+  buffer_size: 100000
+  learning_starts: 500
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: 0.0005
+  target_entropy: -9.0
+  net_arch: [256, 256, 256]
+  checkpoint_freq: 2500
+  status_freq: 500
+  norm_obs: true
+  norm_reward: false
+  clip_obs: 10.0

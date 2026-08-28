@@ -1,0 +1,66 @@
+schema_version: 1
+
+# A single actor covers the complete upright -> side bypass -> distal crossing
+# -> yz-plane return teacher. Random certified teacher snapshots are only a
+# reset curriculum; evaluation always starts upright and never stitches actors.
+environment:
+  episode_steps: 320
+  reset_start_mode: random_teacher_snapshot
+  upright_start_probability: 0.20
+  lookahead_steps: 15
+  absolute_action_limit: 0.60
+  muscle_torque_scale: 45.0
+  max_action_delta: 0.003
+  teacher_residual_action_scale: 0.01
+
+  tracking_reward_scale: 1.0
+  node_tracking_scale: 0.035
+  tip_tracking_scale: 0.025
+  velocity_tracking_scale: 0.20
+  velocity_tracking_weight: 0.15
+  action_imitation_penalty_scale: 0.05
+  action_rate_penalty_scale: 0.01
+
+  near_wall_clearance: 0.02
+  near_wall_penalty_scale: 0.20
+  collision_penalty: 50.0
+  lost_tracking_penalty: 20.0
+  maximum_node_tracking_error: 0.15
+  maximum_tip_tracking_error: 0.20
+
+  terminal_bonus: 50.0
+  terminal_tip_tolerance: 0.015
+  terminal_node_tolerance: 0.025
+  terminal_plane_tolerance: 0.005
+  terminal_minimum_crossed_fraction: 0.50
+  terminal_maximum_tip_speed: 0.12
+
+sac:
+  learning_rate: 0.00001
+  buffer_size: 200000
+  learning_starts: 4000
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.995
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: 0.0005
+  target_entropy: -9.0
+  net_arch: [512, 512, 256]
+
+behavior_cloning:
+  epochs: 100
+  batch_size: 256
+  exact_zero_residual_mean: true
+
+training:
+  seed: 20260865
+  total_timesteps: 100000
+  num_envs: 2
+  checkpoint_freq: 10000
+  status_freq: 1000
+  norm_obs: true
+  norm_reward: false
+  clip_obs: 10.0
+  actor_anchor_coef: 100.0
+  actor_learning_delay_steps: 4000

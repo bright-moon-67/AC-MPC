@@ -1,0 +1,29 @@
+# Smooth-teacher dynamics ablation.  Geometry, material, discretization and
+# actuation are identical to manisoft_strong_bend_e2mpa_r45mm.yaml; only the
+# ManiSoft/PyElastica damping constant changes from 1 to the standard value 7.
+backend:
+  dt: 0.0002
+  enable_damping: true
+  enable_friction: false
+  enable_gravity: true
+  fix_robot_end: true
+  type: ElasticaBackend
+environment:
+  max_step: 220000
+  update_interval: 100
+renderer: null
+softrobot:
+  asset: softrobot
+  size: [-1, -0.8]
+  damping_constant: 7
+  density: 1000
+  direction: [0, 0, 1]
+  length: 1
+  normal: [1, 0, 0]
+  num_elements: 20
+  poisson_ratio: 0.5
+  radius: 0.045
+  start: [0, 0, 0]
+  youngs_modulus: 2000000.0
+  gripper: null
+objects: []
