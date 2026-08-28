@@ -1,0 +1,63 @@
+schema_version: 1
+
+# First-stage collection only: the ManiSoft scenario must contain the bare arm
+# and no physical table, wall, target object, or button.  Geometry below is
+# evaluated analytically after each 50 Hz simulator transition.
+task:
+  base: [0.0, 0.0, 0.0]
+  # The target centre is one arm radius above the virtual z=0 ground.
+  target: [0.0, 0.65, 0.05]
+
+  # A thin wall across the direct y route.  Its top exceeds the 1 m arm reach,
+  # so a valid rollout cannot go over it; the ground rule prevents going under
+  # it.  The only valid homotopy is around either finite x end.
+  wall:
+    minimum: [-0.10, 0.32, 0.0]
+    maximum: [0.10, 0.34, 1.10]
+    arm_radius: 0.05
+    safety_margin: 0.01
+
+  ground:
+    surface_z: 0.0
+    safety_margin: 0.0
+    # Gravity shortens the first 5 cm element by roughly 0.03 mm at reset.
+    # This tolerance covers only that numerical compression, not a route below
+    # the plane.
+    violation_tolerance: 0.0005
+    # Node 0 and its attached segment are the fixed mounting collar.  Starting
+    # the physical-body check at node 1 makes the upright radius-5 cm arm
+    # tangent to z=0 instead of declaring its mount to penetrate the plane.
+    mounting_exempt_nodes: 1
+
+  route:
+    prewall_y_margin: 0.02
+    postwall_y_margin: 0.02
+    crossed_node_fraction: 0.30
+    return_x_tolerance: 0.04
+    goal_tolerance: 0.015
+    goal_speed_tolerance: 0.03
+    goal_hold_steps: 20
+
+collection:
+  episodes: 200
+  episode_steps: 1000
+  seed: 20260825
+  minimum_saved_steps: 32
+  absolute_action_limit: 0.30
+  maximum_action_delta: 0.005
+  maximum_tip_speed: 0.75
+  maximum_tip_displacement: 1.05
+
+  # Smooth low-spatial-mode action anchors.  This is the broad first pass; a
+  # later stage will extend the best phase-labelled prefixes directionally.
+  spatial_modes: 4
+  action_knot_seconds_range: [2.0, 5.0]
+  action_hold_seconds_range: [0.25, 1.0]
+  action_peak_range: [0.12, 0.30]
+  zero_anchor_probability: 0.10
+
+  stop_on_success: true
+  # Raw candidates retain all rod positions/directors and can be replayed from
+  # their actions.  The 1690-float Verlet cache is intentionally deferred to
+  # the much smaller certified trajectory bank to avoid multi-GB output.
+  save_internal_states: false

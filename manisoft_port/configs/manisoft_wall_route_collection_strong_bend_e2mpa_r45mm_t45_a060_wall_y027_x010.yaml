@@ -1,0 +1,39 @@
+schema_version: 1
+task:
+  base: [0.0, 0.0, 0.0]
+  target: [0.0, 0.65, 0.05]
+  wall:
+    minimum: [-0.05, 0.27, 0.0]
+    maximum: [0.05, 0.29, 1.10]
+    arm_radius: 0.045
+    safety_margin: 0.01
+  ground:
+    surface_z: 0.0
+    safety_margin: 0.0
+    violation_tolerance: 0.0005
+    mounting_exempt_nodes: 1
+  route:
+    prewall_y_margin: 0.02
+    postwall_y_margin: 0.02
+    crossed_node_fraction: 0.40
+    return_x_tolerance: 0.005
+    goal_tolerance: 0.015
+    goal_speed_tolerance: 0.03
+    goal_hold_steps: 20
+collection:
+  episodes: 200
+  episode_steps: 1000
+  seed: 20260826
+  minimum_saved_steps: 32
+  absolute_action_limit: 0.60
+  muscle_torque_scale: 45.0
+  maximum_action_delta: 0.005
+  maximum_tip_speed: null
+  maximum_tip_displacement: 1.05
+  spatial_modes: 4
+  action_knot_seconds_range: [2.0, 5.0]
+  action_hold_seconds_range: [0.25, 1.0]
+  action_peak_range: [0.20, 0.60]
+  zero_anchor_probability: 0.10
+  stop_on_success: true
+  save_internal_states: false

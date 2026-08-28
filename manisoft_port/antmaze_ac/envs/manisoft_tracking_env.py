@@ -198,6 +198,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
         success_threshold: float = 0.0015,
         success_streak: int = 5,
         absolute_action_limit: float = 0.30,
+        muscle_torque_scale: float = 30.0,
         progress_reward_scale: float = 1.0,
     ):
         super().__init__()
@@ -221,7 +222,12 @@ class ManiSoftTipTrackingEnv(gym.Env):
         self.success_threshold = float(success_threshold)
         self.required_success_streak = int(success_streak)
         self.absolute_action_limit = float(absolute_action_limit)
+        self.muscle_torque_scale = float(muscle_torque_scale)
         self.progress_reward_scale = float(progress_reward_scale)
+        if self.absolute_action_limit <= 0:
+            raise ValueError("absolute_action_limit必须为正")
+        if self.muscle_torque_scale <= 0:
+            raise ValueError("muscle_torque_scale必须为正")
         if self.progress_reward_scale <= 0:
             raise ValueError("progress_reward_scale必须为正")
 
@@ -283,7 +289,7 @@ class ManiSoftTipTrackingEnv(gym.Env):
             robot_length=float(np.sum(soft.element_lengths)),
             robot_num_elements=int(soft.num_elements),
             number_of_control_points=6,
-            muscle_torque_scale=30,
+            muscle_torque_scale=self.muscle_torque_scale,
         )
 
         # Settle with zero activation for 1 s at 50 Hz, matching the Koopman
